@@ -139,9 +139,12 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
       const usb_intf_desc_t *intf = (const usb_intf_desc_t *)desc;
       currentPrinter = nullptr;
 
+      // Protocol 0x00 is reserved/undefined; 0x01-0x04 are standard printer
+      // protocols and 0xFF is the USB Printer Class vendor-specific protocol.
       if (intf->bInterfaceClass == USB_CLASS_PRINTER &&
           intf->bInterfaceSubClass == USB_SUBCLASS_PRINTER &&
-          intf->bInterfaceProtocol <= 0x04) {
+          ((intf->bInterfaceProtocol >= 0x01 && intf->bInterfaceProtocol <= 0x04) ||
+           intf->bInterfaceProtocol == 0xFF)) {
         if (!out.printer.found) {
           out.printer.found = true;
           out.printer.interfaceNumber = intf->bInterfaceNumber;

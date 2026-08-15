@@ -24,7 +24,7 @@ The network side is intentionally independent from the printer-side transport. T
 
 ## Target printer: HP Smart Tank 520
 
-HP's current specifications list **no built-in wireless networking**, one Hi-Speed USB 2.0 device connection, and **HP PCL 3 GUI / HP PCLm** print languages. Therefore the ESP32-S3 must provide the wireless network service, USB Host transport, and a document path that produces a format the printer accepts. citeturn1search0turn1search19
+HP's current specifications list **no built-in wireless networking**, one Hi-Speed USB 2.0 device connection, and **HP PCL 3 GUI / HP PCLm** print languages. Therefore the ESP32-S3 must provide the wireless network service, USB Host transport, and a document path that produces a format the printer accepts.
 
 Accepting a PDF or PWG Raster job over IPP is therefore only the network-ingress half of the project. The firmware deliberately does **not** claim that a physical page printed until a printer backend reports that state.
 
@@ -53,7 +53,7 @@ Accepting a PDF or PWG Raster job over IPP is therefore only the network-ingress
 - strict HTTP request-path/content-type/content-length checks
 - no false `completed` state before a real backend reports completion
 
-The IPP behavior follows the IPP operation and job-state model in RFC 8011: Validate-Job does not create a job, Get-Jobs supports completed/not-completed selection, Cancel-Job transitions a live job to canceled, and Get-Job-Attributes exposes the retained job object. citeturn0search0turn2search0
+The IPP behavior follows the IPP operation and job-state model in RFC 8011: Validate-Job does not create a job, Get-Jobs supports completed/not-completed selection, Cancel-Job transitions a live job to canceled, and Get-Job-Attributes exposes the retained job object.
 
 ## Current boundary
 
@@ -67,7 +67,7 @@ Still required for real paper output:
 4. A backend worker that changes jobs from `pending` to `processing` and finally `completed` or `aborted` based on real USB/printer status.
 5. Hardware testing with the actual Smart Tank 520.
 
-HP documents the Smart Tank 520 as supporting PCLm, which is why PCLm is the preferred direct mobile-to-HP path. citeturn1search0
+HP documents the Smart Tank 520 as supporting PCLm, which is why PCLm is the preferred direct mobile-to-HP path.
 
 ## Configuration
 

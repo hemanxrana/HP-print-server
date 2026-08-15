@@ -1,20 +1,33 @@
 #include "mobile_print_queue.h"
+#include <Preferences.h>
+
+static constexpr const char *QUEUE_NS = "print-queue";
 
 bool MobilePrintQueue::begin() {
-  if (!LittleFS.begin(true)) {
+  // Do not auto-format a failed filesystem mount: doing so could destroy an
+  // accepted print job after a transient mount problem.
+  if (!LittleFS.begin(false)) {
     Serial.println("[Queue] LittleFS mount failed");
     return false;
   }
+
+  Preferences p;
+  if (p.begin(QUEUE_NS, true)) {
+    jobId_ = p.getUInt("nextid", 0);
+    jobFormat_ = p.getString("format", "");
+    p.end();
+  }
+
   File f = LittleFS.open(JOB_PATH, FILE_READ);
   if (!f) return true;
   jobSize_ = f.size();
   f.close();
-  // A reboot can leave a valid queued document behind. Keep it available;
-  // the next runtime can process it instead of silently discarding a job.
-  queued_ = jobSize_ > 0 && jobSize_ <= MAX_JOB_BYTES;
+
+  queued_ = jobSize_ > 0 && jobSize_ <= MAX_JOB_BYTES && !jobFormat_.isEmpty();
   if (!queued_) {
     LittleFS.remove(JOB_PATH);
     jobSize_ = 0;
+    jobFormat_ = "";
   }
   return true;
 }
@@ -23,6 +36,7 @@ bool MobilePrintQueue::enqueue(const uint8_t *data, size_t length, const String 
                                uint32_t &jobId, String &error) {
   if (!data || length == 0) { error = "Empty print document"; return false; }
   if (length > MAX_JOB_BYTES) { error = "Print job exceeds 4 MiB queue limit"; return false; }
+  if (format.isEmpty()) { error = "Missing document format"; return false; }
 
   String tmp = "/print-job.tmp";
   LittleFS.remove(tmp);
@@ -51,6 +65,19 @@ bool MobilePrintQueue::enqueue(const uint8_t *data, size_t length, const String 
   jobFormat_ = format;
   queued_ = true;
   jobId = jobId_;
+
+  Preferences p;
+  if (!p.begin(QUEUE_NS, false)) {
+    error = "Job was spooled but queue metadata could not be persisted";
+    return false;
+  }
+  bool metaOk = p.putUInt("nextid", jobId_) > 0 && p.putString("format", jobFormat_) > 0;
+  p.end();
+  if (!metaOk) {
+    error = "Job was spooled but queue metadata could not be persisted";
+    return false;
+  }
+
   return true;
 }
 
@@ -84,5 +111,11 @@ bool MobilePrintQueue::clear(String &error) {
   queued_ = false;
   jobSize_ = 0;
   jobFormat_ = "";
+
+  Preferences p;
+  if (p.begin(QUEUE_NS, false)) {
+    p.remove("format");
+    p.end();
+  }
   return true;
 }

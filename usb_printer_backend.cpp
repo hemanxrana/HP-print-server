@@ -44,9 +44,6 @@ void UsbPrinterBackend::poll() {
 }
 
 bool UsbPrinterBackend::sendJob(MobilePrintQueue &queue, uint32_t jobId, String &error) {
-  // Descriptor enumeration is now real, but data transport is intentionally
-  // not claimed yet. This prevents the state machine from reporting a print
-  // as completed until a real USB Printer Class transfer is implemented.
   (void)queue;
   (void)jobId;
   error = "USB Printer Class bulk transport is not implemented yet";
@@ -60,34 +57,9 @@ bool UsbPrinterBackend::processNext(MobilePrintQueue &queue, String &error) {
     return false;
   }
 
-  const uint32_t id = queue.firstPendingId();
-  if (!id) {
-    error = "No pending print job";
-    return false;
-  }
-
-  if (!queue.setState(id, MobilePrintQueue::STATE_PROCESSING, "printer-processing", error)) {
-    return false;
-  }
-
-  state_ = PRINTING;
-  reason_ = "printing";
-
-  if (!sendJob(queue, id, error)) {
-    String ignored;
-    queue.setState(id, MobilePrintQueue::STATE_ABORTED, "printer-transport-error", ignored);
-    state_ = ERROR;
-    reason_ = error;
-    return false;
-  }
-
-  if (!queue.setState(id, MobilePrintQueue::STATE_COMPLETED, "printer-completed", error)) {
-    state_ = ERROR;
-    reason_ = error;
-    return false;
-  }
-
-  state_ = IDLE;
-  reason_ = "printer-ready";
-  return true;
+  // Do not mutate persistent job state until a real transfer implementation
+  // exists. This prevents a future caller from turning the current transport
+  // placeholder into PROCESSING -> ABORTED churn.
+  error = "USB Printer Class bulk transport is not implemented yet";
+  return false;
 }

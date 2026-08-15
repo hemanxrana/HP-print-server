@@ -2,108 +2,111 @@
 
 Arduino IDE firmware for an ESP32-S3 print server designed primarily for **smartphone printing** to USB-connected HP printers.
 
-## Smartphone-first design
-
-The network-facing side is built around the protocols used by Android's built-in Default Print Service / Mopria-style driverless printing:
+## Smartphone-first architecture
 
 ```text
-Android phone
-    |
-    | DNS-SD discovery
-    | IPP over TCP/631
-    v
-ESP32-S3
-    |
-    | persistent print queue
-    v
-mobile document (PWG Raster / PCLm / PDF / JPEG / URF)
-    |
-    | renderer / printer backend
-    v
-USB Host -> HP printer
+Android / Mopria / Default Print Service
+        |
+        | DNS-SD _ipp._tcp
+        | IPP over TCP/631
+        v
+ESP32-S3 IPP endpoint /ipp/print
+        |
+        | persistent LittleFS job store
+        v
+ pending -> processing -> completed / canceled / aborted
+        |
+        v
+ USB Host -> HP printer backend
 ```
 
-Android's built-in printing stack uses mDNS/DNS-SD and IPP for network printer discovery, and the Android/Mopria stack supports mobile print data formats including PWG Raster, PCLm and PDF. The firmware therefore prioritizes a standards-based IPP printer interface instead of requiring an Android-specific app.
+The network side is intentionally independent from the printer-side transport. This lets the ESP32 present a standards-based IPP printer to a phone while the eventual backend handles the USB-connected HP device.
 
 ## Target printer: HP Smart Tank 520
 
-The HP Smart Tank 520 is an important special case: HP's current specifications list **no built-in wireless networking** and one Hi-Speed USB 2.0 device connection. HP specifies **HP PCL 3 GUI** and **HP PCLm** as its print languages. Therefore the ESP32-S3 is the wireless/network print server and must ultimately provide the USB-host side plus the required document rendering/translation.
+HP's current specifications list **no built-in wireless networking**, one Hi-Speed USB 2.0 device connection, and **HP PCL 3 GUI / HP PCLm** print languages. Therefore the ESP32-S3 must provide the wireless network service, USB Host transport, and a document path that produces a format the printer accepts. citeturn1search0turn1search19
 
-That means accepting a PDF over IPP is **not sufficient**. The final backend must turn the mobile document into something the Smart Tank 520 can actually print.
+Accepting a PDF or PWG Raster job over IPP is therefore only the network-ingress half of the project. The firmware deliberately does **not** claim that a physical page printed until a printer backend reports that state.
 
-## Current firmware
-
-Implemented on the `chore/initial-project-skeleton` branch:
+## Implemented on `chore/initial-project-skeleton`
 
 - Arduino IDE / ESP32-S3 sketch
-- Wi-Fi station mode
-- fallback configuration access point
-- persistent Wi-Fi/printer configuration using Preferences
-- mobile-friendly configuration web page
-- Wi-Fi scan page
-- DNS-SD `_ipp._tcp` advertisement
-- Android-compatible IPP resource-path TXT record (`rp=ipp/print`)
-- mobile-oriented IPP capability response
-- IPP `Print-Job` ingress
-- support declarations for PWG Raster, PCLm, PDF, JPEG and URF
-- persistent LittleFS print-job spool
-- 4 MiB incoming-job safety limit
-- one-job-at-a-time queue protection
+- Wi-Fi station mode with fallback configuration AP
+- persistent Wi-Fi and printer configuration using Preferences
+- mobile configuration web page and Wi-Fi scanner
+- DNS-SD `_ipp._tcp` advertisement with `rp=ipp/print`
+- IPP 1.1/2.0 request handling over HTTP
+- `Print-Job`
+- `Validate-Job`
+- `Cancel-Job`
+- `Get-Job-Attributes`
+- `Get-Jobs`
+- `Get-Printer-Attributes`
+- requested-attributes handling for the implemented attribute set
+- `which-jobs` and `limit` handling for Get-Jobs
+- persistent multi-job LittleFS spool
+- up to 8 active jobs, with terminal jobs retained for IPP history
+- reboot recovery: a job left in `processing` is returned to `pending`
+- cancellation and persistent job-state reasons
+- 4 MiB per-document safety limit
+- accepted mobile formats: PWG Raster, PCLm, PDF, JPEG and URF
+- strict HTTP request-path/content-type/content-length checks
+- no false `completed` state before a real backend reports completion
 
-The incoming document is currently **queued, not yet rendered and sent to the HP printer**. The firmware does not claim successful physical printing until the USB Host and HP PCLm/printer backend are implemented and tested against hardware.
+The IPP behavior follows the IPP operation and job-state model in RFC 8011: Validate-Job does not create a job, Get-Jobs supports completed/not-completed selection, Cancel-Job transitions a live job to canceled, and Get-Job-Attributes exposes the retained job object. citeturn0search0turn2search0
 
-## Why PCLm matters
+## Current boundary
 
-PCLm is particularly relevant to mobile printing because Android/Mopria supports it and HP uses it in mobile-oriented printing stacks. The Smart Tank 520 also explicitly lists HP PCLm among its supported print languages.
+The current firmware is a **working network-facing print-server layer**, not yet a complete physical HP printer driver.
+
+Still required for real paper output:
+
+1. ESP32-S3 USB Host initialization and enumeration of the Smart Tank 520.
+2. USB endpoint/interface identification and bulk transport.
+3. HP PCLm/PCL 3 GUI-compatible rendering/translation where the phone does not already supply a printer-compatible document.
+4. A backend worker that changes jobs from `pending` to `processing` and finally `completed` or `aborted` based on real USB/printer status.
+5. Hardware testing with the actual Smart Tank 520.
+
+HP documents the Smart Tank 520 as supporting PCLm, which is why PCLm is the preferred direct mobile-to-HP path. citeturn1search0
 
 ## Configuration
 
-On first boot, connect to:
+First boot creates:
 
 ```text
 SSID:     HP-Print-Server
 Password: configureme
 ```
 
-and open:
+Open:
 
 ```text
 http://192.168.4.1/
 ```
 
-Configure the normal Wi-Fi network and printer information. The configuration is stored in ESP32 NVS and survives reboot.
+Configure the normal Wi-Fi network and printer information. Configuration survives reboot.
 
-The AP password is a development default and must be made configurable before production use.
+The AP password remains a development default and should be made configurable before production use.
 
-## Build with Arduino IDE
+## Arduino IDE build
 
 1. Install Arduino IDE.
 2. Install **esp32 by Espressif Systems** through Boards Manager.
-3. Select the board definition matching the physical ESP32-S3 N16R8-class board.
+3. Select the ESP32-S3 board definition matching the physical board.
 4. Open `HP-print-server.ino`.
 5. Compile and upload.
 6. Open Serial Monitor at 115200 baud.
 
-The project intentionally uses Arduino IDE rather than PlatformIO.
-
 ## Project files
 
 - `HP-print-server.ino` — application, configuration UI, Wi-Fi and service startup
-- `mobile_ipp_server.h/.cpp` — mobile IPP HTTP/IPP server
-- `mobile_print_queue.h/.cpp` — persistent print-job spool
-- `mobile_print_profile.h` — Android/Mopria-oriented IPP profile
-- `printer_protocols.h` — protocol/discovery definitions retained for the next transport/discovery layers
+- `mobile_ipp_server.h/.cpp` — HTTP + IPP smartphone-facing server
+- `mobile_print_queue.h/.cpp` — persistent multi-job spool and recovery
+- `mobile_print_profile.h` — mobile IPP/DNS-SD profile
+- `printer_protocols.h` — transport/discovery enums for the printer-side roadmap
 
-## Verification status
+## Verification
 
-Source-level verification has been performed against the IPP data-type definitions and Android/Mopria discovery requirements. Hardware compilation/upload and end-to-end printing still require an ESP32-S3 board connected to the development environment.
+The current source was re-reviewed after implementation specifically for the failure modes found during the earlier simulation: single-job storage, incorrect IPP operation handling, missing Get-Jobs, incorrect job-state semantics, cancellation, reboot recovery, queue capacity, requested attributes, Get-Jobs filtering, and false completion.
 
-The next hardware milestone is:
-
-1. ESP32-S3 USB Host initialization.
-2. Enumerate the HP Smart Tank 520 as a USB printer.
-3. Identify its USB interfaces/endpoints.
-4. Implement the HP printer transport.
-5. Implement or integrate a correct PCLm/PWG rendering path.
-6. Consume the persistent IPP job and report real job state back to the phone.
-7. Test PDF, photo, copies, page range, orientation and A4 printing from Android.
+A physical Arduino build and end-to-end Android print test still require the ESP32-S3 development board and Arduino ESP32 toolchain. The repository should therefore be treated as **network-layer implementation complete, hardware backend not yet complete**, rather than as a finished printer driver.

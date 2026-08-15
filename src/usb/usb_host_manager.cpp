@@ -1,6 +1,7 @@
 #include "usb_host_manager.h"
 
 #include <cstring>
+#include "esp_intr_alloc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "usb/usb_host.h"
@@ -19,7 +20,6 @@ struct UsbHostRuntime {
   usb_device_handle_t device = nullptr;
   uint8_t address = 0;
   bool device_open = false;
-  bool printer_interface_found = false;
   uint8_t claimed_interface = 0;
   bool interface_claimed = false;
   volatile bool new_device_pending = false;
@@ -34,9 +34,9 @@ UsbHostManager *g_manager = nullptr;
 
 #if defined(CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK)
 static bool usbEnumFilter(const usb_device_desc_t *, uint8_t *) {
-  // Arduino-ESP32 3.3.11/ESP-IDF 5.5.5 has a regression where enumeration
-  // can stall if this feature is enabled but the callback is NULL. Allow all
-  // devices here; printer selection happens after the descriptors are read.
+  // Arduino-ESP32 3.3.11 / ESP-IDF 5.5.5 can stall enumeration when this
+  // feature is enabled and the callback is NULL. Allow all devices here;
+  // printer selection is performed from the configuration descriptors.
   return true;
 }
 #endif
@@ -62,7 +62,6 @@ static void resetRuntimeDeviceState() {
   g_usb.device = nullptr;
   g_usb.address = 0;
   g_usb.device_open = false;
-  g_usb.printer_interface_found = false;
   g_usb.interface_claimed = false;
 }
 
@@ -125,10 +124,10 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
 
   out.configurationValue = cfgDesc->bConfigurationValue;
 
-  size_t offset = 0;
+  int offset = 0;
   const size_t totalLength = cfgDesc->wTotalLength;
-  const usb_standard_desc_t *desc =
-      usb_parse_next_descriptor((const usb_standard_desc_t *)cfgDesc, totalLength, (int *)&offset);
+  const usb_standard_desc_t *desc = usb_parse_next_descriptor(
+      (const usb_standard_desc_t *)cfgDesc, totalLength, &offset);
 
   UsbPrinterInterfaceInfo *currentPrinter = nullptr;
 
@@ -139,7 +138,7 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
 
       if (intf->bInterfaceClass == USB_CLASS_PRINTER &&
           intf->bInterfaceSubClass == USB_SUBCLASS_PRINTER &&
-          (intf->bInterfaceProtocol <= 0x04 || intf->bInterfaceProtocol == 0xFF)) {
+          intf->bInterfaceProtocol <= 0x04) {
         if (!out.printer.found) {
           out.printer.found = true;
           out.printer.interfaceNumber = intf->bInterfaceNumber;
@@ -168,7 +167,7 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
       }
     }
 
-    desc = usb_parse_next_descriptor((const usb_standard_desc_t *)desc, totalLength, (int *)&offset);
+    desc = usb_parse_next_descriptor((const usb_standard_desc_t *)desc, totalLength, &offset);
   }
 
   if (!out.printer.found) {
@@ -177,6 +176,7 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
     return false;
   }
 
+  // USB Printer Class requires a Bulk OUT endpoint; Bulk IN is optional.
   if (!out.printer.bulkOut.valid()) {
     error = "Printer Class interface has no Bulk OUT endpoint";
     closeCurrentDevice();
@@ -191,8 +191,9 @@ static void clientEventCallback(const usb_host_client_event_msg_t *event, void *
 
   switch (event->event) {
     case USB_HOST_CLIENT_EVENT_NEW_DEV:
-      // Only one device is owned by this backend. Do not repeatedly reopen the
-      // same device if the stack produces duplicate application-level events.
+      // The callback never opens devices or performs descriptor work. This is
+      // deliberate: the SDK requires the callback to remain short and lets
+      // the client task perform the real state-machine work.
       if (!g_usb.device_open && !g_usb.new_device_pending) {
         g_usb.new_device_address = event->new_dev.address;
         g_usb.new_device_pending = true;
@@ -220,10 +221,7 @@ static void clientTask(void *) {
 
   const esp_err_t regErr = usb_host_client_register(&config, &g_usb.client);
   if (regErr != ESP_OK) {
-    if (g_manager) {
-      // The manager is already in a task; only store the error state here.
-      // No logging loop is created on failure.
-    }
+    if (g_manager) g_manager->onEnumerationError(String("usb_host_client_register failed: ") + esp_err_to_name(regErr));
     vTaskDelete(nullptr);
     return;
   }
@@ -231,7 +229,7 @@ static void clientTask(void *) {
   while (true) {
     const esp_err_t eventErr = usb_host_client_handle_events(g_usb.client, pdMS_TO_TICKS(100));
     if (eventErr != ESP_OK && eventErr != ESP_ERR_TIMEOUT) {
-      if (g_manager) g_manager->poll();
+      if (g_manager) g_manager->onEnumerationError(String("USB client event handling failed: ") + esp_err_to_name(eventErr));
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
@@ -239,42 +237,25 @@ static void clientTask(void *) {
     if (g_usb.device_gone_pending) {
       g_usb.device_gone_pending = false;
       closeCurrentDevice();
-      if (g_manager) {
-        g_manager->poll();
-      }
+      if (g_manager) g_manager->onDetached();
     }
 
     if (g_usb.new_device_pending && !g_usb.device_open) {
       const uint8_t address = g_usb.new_device_address;
       g_usb.new_device_pending = false;
+      if (g_manager) g_manager->poll();
 
       UsbDeviceInfo info;
       String error;
-      if (g_manager) {
-        // Manager state is changed only from this task, eliminating races
-        // between USB callbacks and the Arduino loop.
-        g_manager->poll();
-      }
-
       if (enumerateDevice(address, info, error)) {
-        if (g_manager) {
-          // Store the fully enumerated device by calling the private state hook
-          // through the public adapter below.
-        }
-        if (g_manager) {
-          // This is intentionally handled by the manager's friend-free bridge
-          // in the next block: g_manager is only used as a notification target.
-        }
-      } else if (g_manager) {
-        // Enumeration failures are normal for non-printer USB devices; they
-        // must not cause a retry storm.
-        g_manager->poll();
-      }
-
-      if (g_manager && info.attached) {
-        // The manager object is updated through a small static bridge below.
-        // Keeping ownership here ensures there is exactly one USB client task.
-        // (See managerBridgeAttach.)
+        if (g_manager) g_manager->onEnumerated(info);
+        Serial.println("[USB] Printer Class device enumerated");
+        Serial.printf("[USB] VID: 0x%04X  PID: 0x%04X  address: %u\n", info.vid, info.pid, info.address);
+      } else {
+        if (g_manager) g_manager->onEnumerationError(error);
+        Serial.printf("[USB] Ignored device at address %u: %s\n", address, error.c_str());
+        // enumerateDevice() already closed non-printer/error devices. No retry
+        // is scheduled, preventing a reconnect/error loop.
       }
     }
   }
@@ -287,9 +268,8 @@ static void hostTask(void *) {
     if (err != ESP_OK) {
       vTaskDelay(pdMS_TO_TICKS(10));
     }
-    // The host remains installed for the lifetime of the firmware. There is
-    // deliberately no install/uninstall cycle in the normal printer workflow;
-    // this prevents reconnect loops and stale device handles.
+    // Host Library stays installed for the lifetime of the firmware. There is
+    // no normal install/uninstall cycle, so reconnects do not recreate tasks.
   }
 }
 
@@ -332,12 +312,26 @@ bool UsbHostManager::begin() {
 }
 
 void UsbHostManager::poll() {
-  // USB event handling is deliberately owned by the single client task. The
-  // Arduino loop must never call usb_host_client_handle_events() as well.
-  // That would create the overlapping event-consumer loop that caused the
-  // class of repeat/reconnect bugs we are explicitly avoiding.
+  // Intentionally empty. The USB client event loop has exactly one owner:
+  // clientTask(). The Arduino loop must never call
+  // usb_host_client_handle_events() as a second consumer.
 }
 
-// NOTE: The current manager build stops at descriptor discovery. The next
-// printer-transport layer will claim the discovered interface and own USB
-// transfers; it must not create another USB host client or host event loop.
+void UsbHostManager::onEnumerated(const UsbDeviceInfo &info) {
+  device_ = info;
+  error_.clear();
+  state_ = info.printer.found ? PRINTER_READY : DEVICE_ATTACHED;
+}
+
+void UsbHostManager::onDetached() {
+  device_ = UsbDeviceInfo{};
+  error_.clear();
+  state_ = started_ ? RUNNING : STOPPED;
+}
+
+void UsbHostManager::onEnumerationError(const String &error) {
+  // A non-printer device is not a fatal USB-host error. Keep the host alive so
+  // a later printer can be attached. Record the reason without retrying it.
+  error_ = error;
+  if (started_) state_ = RUNNING;
+}

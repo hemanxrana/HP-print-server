@@ -4,8 +4,6 @@
 static constexpr const char *QUEUE_NS = "print-queue";
 
 bool MobilePrintQueue::begin() {
-  // Do not auto-format a failed filesystem mount: doing so could destroy an
-  // accepted print job after a transient mount problem.
   if (!LittleFS.begin(false)) {
     Serial.println("[Queue] LittleFS mount failed");
     return false;
@@ -59,25 +57,28 @@ bool MobilePrintQueue::enqueue(const uint8_t *data, size_t length, const String 
     return false;
   }
 
-  jobId_++;
-  if (jobId_ == 0) jobId_ = 1;
+  uint32_t newJobId = jobId_ + 1;
+  if (newJobId == 0) newJobId = 1;
+
+  Preferences p;
+  if (!p.begin(QUEUE_NS, false)) {
+    LittleFS.remove(JOB_PATH);
+    error = "Job metadata storage unavailable";
+    return false;
+  }
+  bool metaOk = p.putUInt("nextid", newJobId) > 0 && p.putString("format", format) > 0;
+  p.end();
+  if (!metaOk) {
+    LittleFS.remove(JOB_PATH);
+    error = "Job metadata could not be persisted";
+    return false;
+  }
+
+  jobId_ = newJobId;
   jobSize_ = length;
   jobFormat_ = format;
   queued_ = true;
   jobId = jobId_;
-
-  Preferences p;
-  if (!p.begin(QUEUE_NS, false)) {
-    error = "Job was spooled but queue metadata could not be persisted";
-    return false;
-  }
-  bool metaOk = p.putUInt("nextid", jobId_) > 0 && p.putString("format", jobFormat_) > 0;
-  p.end();
-  if (!metaOk) {
-    error = "Job was spooled but queue metadata could not be persisted";
-    return false;
-  }
-
   return true;
 }
 
@@ -111,11 +112,7 @@ bool MobilePrintQueue::clear(String &error) {
   queued_ = false;
   jobSize_ = 0;
   jobFormat_ = "";
-
   Preferences p;
-  if (p.begin(QUEUE_NS, false)) {
-    p.remove("format");
-    p.end();
-  }
+  if (p.begin(QUEUE_NS, false)) { p.remove("format"); p.end(); }
   return true;
 }

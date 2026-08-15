@@ -1,0 +1,26 @@
+#pragma once
+#include <Arduino.h>
+#include <WiFi.h>
+
+class IppServer {
+public:
+  using PrintJobHandler = bool (*)(const uint8_t *document, size_t length, const String &documentFormat, String &error);
+
+  IppServer(uint16_t port = 631);
+  void begin(const String &printerName, PrintJobHandler handler);
+  void poll();
+  bool running() const;
+
+private:
+  WiFiServer server_;
+  uint16_t port_;
+  String printerName_;
+  PrintJobHandler handler_ = nullptr;
+
+  void handleClient(WiFiClient &client);
+  bool readHttp(WiFiClient &client, uint8_t *body, size_t capacity, size_t &bodyLength);
+  bool handleIpp(const uint8_t *request, size_t length, uint8_t *response, size_t capacity, size_t &responseLength);
+  size_t addStringAttr(uint8_t *out, size_t capacity, size_t pos, uint8_t tag, const char *name, const String &value);
+  size_t addIntegerAttr(uint8_t *out, size_t capacity, size_t pos, uint8_t tag, const char *name, uint32_t value);
+  size_t addEnumAttr(uint8_t *out, size_t capacity, size_t pos, uint8_t tag, const char *name, uint32_t value);
+};

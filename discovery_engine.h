@@ -23,10 +23,12 @@ class PrinterDiscoveryEngine {
 public:
   PrinterDiscoveryEngine();
   void begin();
+  void setSNMPTarget(const String &ip);
   size_t scan(PrinterEndpoint *results, size_t capacity, uint32_t timeoutMs = 1500);
 
 private:
   WiFiUDP udp_;
+  String snmpTarget_;
   void addEndpoint(PrinterEndpoint *results, size_t capacity, size_t &count, const PrinterEndpoint &candidate);
   void scanSSDP(PrinterEndpoint *results, size_t capacity, size_t &count, uint32_t timeoutMs);
   void scanWSD(PrinterEndpoint *results, size_t capacity, size_t &count, uint32_t timeoutMs);

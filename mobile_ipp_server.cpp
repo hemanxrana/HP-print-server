@@ -31,6 +31,16 @@ bool addInt(uint8_t *out, size_t cap, size_t &pos, uint8_t tag,
   return true;
 }
 
+bool addRange(uint8_t *out, size_t cap, size_t &pos, const char *name, uint32_t low, uint32_t high) {
+  size_t nl = strlen(name);
+  if (nl > 65535 || pos + 13 + nl > cap) return false;
+  out[pos++] = 0x33; put16(out + pos, (uint16_t)nl); pos += 2;
+  memcpy(out + pos, name, nl); pos += nl;
+  put16(out + pos, 8); pos += 2;
+  put32(out + pos, low); pos += 4; put32(out + pos, high); pos += 4;
+  return true;
+}
+
 bool addKeyword(uint8_t *out, size_t cap, size_t &pos, const char *name, const char *value) {
   return addString(out, cap, pos, 0x44, name, value);
 }
@@ -63,7 +73,6 @@ bool MobileIppServer::readHttpBody(WiFiClient &client, uint8_t **body, size_t &l
   *body = nullptr;
   length = 0;
   client.setTimeout(5);
-
   String requestLine = client.readStringUntil('\n');
   requestLine.trim();
   if (!requestLine.startsWith("POST ")) return false;
@@ -80,7 +89,6 @@ bool MobileIppServer::readHttpBody(WiFiClient &client, uint8_t **body, size_t &l
     if (lower.startsWith("content-length:")) contentLength = (size_t)lower.substring(15).toInt();
     if (lower.startsWith("content-type:") && lower.indexOf("application/ipp") >= 0) ipp = true;
   }
-
   if (!ipp || contentLength < 8 || contentLength > MAX_IPP_BODY) return false;
 
   uint8_t *buffer = (uint8_t *)ps_malloc(contentLength);
@@ -144,15 +152,10 @@ bool MobileIppServer::buildResponse(const uint8_t *request, size_t length,
   uint32_t jobId = 0;
   String error;
 
-  if (operation == 0x0002) { // Print-Job
-    if (documentOffset >= length) {
-      status = 0x0402;
-      error = "Print-Job has no document";
-    } else if (!handler_) {
-      status = 0x0502;
-      error = "Print backend unavailable";
-    } else if (!handler_(request + documentOffset, length - documentOffset,
-                         documentFormat, jobId, error)) {
+  if (operation == 0x0002) {
+    if (documentOffset >= length) { status = 0x0402; error = "Print-Job has no document"; }
+    else if (!handler_) { status = 0x0502; error = "Print backend unavailable"; }
+    else if (!handler_(request + documentOffset, length - documentOffset, documentFormat, jobId, error)) {
       status = 0x040A;
       if (error.isEmpty()) error = "Document rejected";
     }
@@ -168,7 +171,6 @@ bool MobileIppServer::buildResponse(const uint8_t *request, size_t length,
   put16(response + r, status); r += 2;
   put32(response + r, requestId); r += 4;
   response[r++] = 0x01;
-
   if (!addString(response, capacity, r, 0x47, "attributes-charset", "utf-8")) return false;
   if (!addString(response, capacity, r, 0x48, "attributes-natural-language", "en")) return false;
   if (!error.isEmpty() && !addString(response, capacity, r, 0x41, "status-message", error)) return false;
@@ -176,6 +178,8 @@ bool MobileIppServer::buildResponse(const uint8_t *request, size_t length,
   if (operation == 0x000B || operation == 0x0004) {
     response[r++] = 0x04;
     if (!addString(response, capacity, r, 0x42, "printer-name", printerName_)) return false;
+    if (!addString(response, capacity, r, 0x42, "printer-make-and-model", "ESP32-S3 HP Print Server")) return false;
+    if (!addString(response, capacity, r, 0x41, "printer-info", "Smartphone print server")) return false;
     if (!addString(response, capacity, r, 0x45, "printer-uri-supported", printerUri_)) return false;
     if (!addKeyword(response, capacity, r, "uri-authentication-supported", "none")) return false;
     if (!addKeyword(response, capacity, r, "uri-security-supported", "none")) return false;
@@ -186,8 +190,17 @@ bool MobileIppServer::buildResponse(const uint8_t *request, size_t length,
     if (!addEnum(response, capacity, r, "operations-supported", 0x0008)) return false;
     if (!addEnum(response, capacity, r, "operations-supported", 0x0009)) return false;
     if (!addEnum(response, capacity, r, "operations-supported", 0x000B)) return false;
+    if (!addString(response, capacity, r, 0x47, "charset-configured", "utf-8")) return false;
+    if (!addString(response, capacity, r, 0x47, "charset-supported", "utf-8")) return false;
+    if (!addString(response, capacity, r, 0x48, "natural-language-configured", "en")) return false;
+    if (!addString(response, capacity, r, 0x48, "generated-natural-language-supported", "en")) return false;
+    if (!addKeyword(response, capacity, r, "compression-supported", "none")) return false;
+    if (!addKeyword(response, capacity, r, "pdl-override-supported", "not-attempted")) return false;
+    if (!addString(response, capacity, r, 0x49, "document-format-default", "application/PCLm")) return false;
+    if (!addBool(response, capacity, r, "printer-is-accepting-jobs", true)) return false;
     if (!addEnum(response, capacity, r, "printer-state", 3)) return false;
     if (!addKeyword(response, capacity, r, "printer-state-reasons", "none")) return false;
+    if (!addInt(response, capacity, r, 0x21, "printer-up-time", millis() / 1000UL)) return false;
     if (!addInt(response, capacity, r, 0x21, "queued-job-count", 0)) return false;
     if (!addMime(response, capacity, r, "image/pwg-raster")) return false;
     if (!addMime(response, capacity, r, "application/PCLm")) return false;
@@ -200,7 +213,7 @@ bool MobileIppServer::buildResponse(const uint8_t *request, size_t length,
     if (!addKeyword(response, capacity, r, "sides-default", "one-sided")) return false;
     if (!addBool(response, capacity, r, "color-supported", true)) return false;
     if (!addInt(response, capacity, r, 0x21, "copies-default", 1)) return false;
-    if (!addInt(response, capacity, r, 0x21, "copies-supported", 99)) return false;
+    if (!addRange(response, capacity, r, "copies-supported", 1, 99)) return false;
   }
 
   if (operation == 0x0002) {
@@ -208,8 +221,12 @@ bool MobileIppServer::buildResponse(const uint8_t *request, size_t length,
     if (!addInt(response, capacity, r, 0x21, "job-id", jobId)) return false;
     String jobUri = printerUri_ + "/job-" + String(jobId);
     if (!addString(response, capacity, r, 0x45, "job-uri", jobUri)) return false;
+    if (!addString(response, capacity, r, 0x45, "job-printer-uri", printerUri_)) return false;
+    if (!addString(response, capacity, r, 0x42, "job-name", "Android mobile print job")) return false;
+    if (!addString(response, capacity, r, 0x42, "job-originating-user-name", "android")) return false;
     if (!addEnum(response, capacity, r, "job-state", 3)) return false;
     if (!addKeyword(response, capacity, r, "job-state-reasons", "job-incoming")) return false;
+    if (!addInt(response, capacity, r, 0x21, "job-printer-up-time", millis() / 1000UL)) return false;
   }
 
   if (r + 1 > capacity) return false;
@@ -223,16 +240,11 @@ void MobileIppServer::handleClient(WiFiClient &client) {
   size_t bodyLength = 0;
   uint8_t *response = (uint8_t *)malloc(RESPONSE_CAPACITY);
   size_t responseLength = 0;
-  bool ok = response && readHttpBody(client, &body, bodyLength) &&
-            buildResponse(body, bodyLength, response, RESPONSE_CAPACITY, responseLength);
-
-  if (!ok) {
-    client.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-  } else {
+  bool ok = response && readHttpBody(client, &body, bodyLength) && buildResponse(body, bodyLength, response, RESPONSE_CAPACITY, responseLength);
+  if (!ok) client.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+  else {
     client.print("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: ");
-    client.print(responseLength);
-    client.print("\r\nConnection: close\r\n\r\n");
-    client.write(response, responseLength);
+    client.print(responseLength); client.print("\r\nConnection: close\r\n\r\n"); client.write(response, responseLength);
   }
   if (body) free(body);
   if (response) free(response);

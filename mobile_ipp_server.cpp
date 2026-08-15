@@ -38,6 +38,10 @@ bool addKeyword(uint8_t *out, size_t cap, size_t &pos, const char *name, const c
 bool addMime(uint8_t *out, size_t cap, size_t &pos, const char *value) {
   return addString(out, cap, pos, 0x49, "document-format-supported", value);
 }
+
+bool addEnum(uint8_t *out, size_t cap, size_t &pos, const char *name, uint32_t value) {
+  return addInt(out, cap, pos, 0x23, name, value);
+}
 }
 
 MobileIppServer::MobileIppServer(uint16_t port) : server_(port), port_(port) {}
@@ -132,37 +136,30 @@ bool MobileIppServer::buildResponse(const uint8_t *request, size_t length,
   }
   if (!sawOperationGroup) return false;
 
-  uint16_t status = 0x0000; // successful-ok
+  uint16_t status = 0x0000;
   uint32_t jobId = 0;
   String error;
 
   if (operation == 0x0002) { // Print-Job
     if (documentOffset >= length) {
-      status = 0x0402; // client-error-bad-request
+      status = 0x0402;
       error = "Print-Job has no document";
     } else if (!handler_) {
-      status = 0x0502; // server-error-service-unavailable
+      status = 0x0502;
       error = "Print backend unavailable";
     } else if (!handler_(request + documentOffset, length - documentOffset,
                          documentFormat, jobId, error)) {
-      status = 0x040A; // client-error-document-format-error
+      status = 0x040A;
       if (error.isEmpty()) error = "Document rejected";
     }
   } else if (operation == 0x0004 || operation == 0x000B) {
-    // Validate-Job and Get-Printer-Attributes are safe to answer before a
-    // document is submitted. Android commonly performs capability queries.
-    if (operation == 0x0004 && !handler_) {
-      status = 0x0502;
-      error = "Print backend unavailable";
-    }
-  } else if (operation == 0x0009) {
-    // Get-Jobs: valid empty job list until the queue exposes jobs through a
-    // future persistent job database.
-  } else if (operation == 0x0008) {
-    // Get-Job-Attributes: return a generic completed/unknown job response.
-    // Detailed persistent job state is added by the print queue layer.
+    // Validate-Job and Get-Printer-Attributes are the important discovery and
+    // capability operations for the Android mobile print path.
+  } else if (operation == 0x0009 || operation == 0x0008) {
+    // Get-Jobs/Get-Job-Attributes are accepted; detailed job state will be
+    // connected to the persistent queue in the next job-control increment.
   } else {
-    status = 0x0501; // server-error-operation-not-supported
+    status = 0x0501;
     error = "IPP operation not supported";
   }
 
@@ -170,22 +167,26 @@ bool MobileIppServer::buildResponse(const uint8_t *request, size_t length,
   response[r++] = version >> 8; response[r++] = version & 0xff;
   put16(response + r, status); r += 2;
   put32(response + r, requestId); r += 4;
-  response[r++] = 0x01; // operation-attributes-tag
+  response[r++] = 0x01;
 
   if (!addString(response, capacity, r, 0x47, "attributes-charset", "utf-8")) return false;
   if (!addString(response, capacity, r, 0x48, "attributes-natural-language", "en")) return false;
-
   if (!error.isEmpty() && !addString(response, capacity, r, 0x41, "status-message", error)) return false;
 
   if (operation == 0x000B || operation == 0x0004) {
-    response[r++] = 0x04; // printer-attributes-tag
+    response[r++] = 0x04;
     if (!addString(response, capacity, r, 0x42, "printer-name", printerName_)) return false;
     if (!addString(response, capacity, r, 0x45, "printer-uri-supported", printerUri_)) return false;
-    if (!addString(response, capacity, r, 0x44, "uri-authentication-supported", "none")) return false;
-    if (!addString(response, capacity, r, 0x44, "uri-security-supported", "none")) return false;
+    if (!addKeyword(response, capacity, r, "uri-authentication-supported", "none")) return false;
+    if (!addKeyword(response, capacity, r, "uri-security-supported", "none")) return false;
+    if (!addKeyword(response, capacity, r, "ipp-versions-supported", "1.1")) return false;
     if (!addKeyword(response, capacity, r, "ipp-versions-supported", "2.0")) return false;
-    if (!addKeyword(response, capacity, r, "operations-supported", "print-job")) return false;
-    if (!addInt(response, capacity, r, 0x23, "printer-state", 3)) return false;
+    if (!addEnum(response, capacity, r, "operations-supported", 0x0002)) return false;
+    if (!addEnum(response, capacity, r, "operations-supported", 0x0004)) return false;
+    if (!addEnum(response, capacity, r, "operations-supported", 0x0008)) return false;
+    if (!addEnum(response, capacity, r, "operations-supported", 0x0009)) return false;
+    if (!addEnum(response, capacity, r, "operations-supported", 0x000B)) return false;
+    if (!addEnum(response, capacity, r, "printer-state", 3)) return false;
     if (!addKeyword(response, capacity, r, "printer-state-reasons", "none")) return false;
     if (!addInt(response, capacity, r, 0x21, "queued-job-count", 0)) return false;
     if (!addMime(response, capacity, r, "image/pwg-raster")) return false;
@@ -193,19 +194,19 @@ bool MobileIppServer::buildResponse(const uint8_t *request, size_t length,
     if (!addMime(response, capacity, r, "application/pdf")) return false;
     if (!addMime(response, capacity, r, "image/jpeg")) return false;
     if (!addMime(response, capacity, r, "image/urf")) return false;
-    if (!addString(response, capacity, r, 0x44, "media", "iso_a4_210x297mm")) return false;
-    if (!addKeyword(response, capacity, r, "color-supported", "true")) return false;
+    if (!addKeyword(response, capacity, r, "media-supported", "iso_a4_210x297mm")) return false;
+    if (!addString(response, capacity, r, 0x42, "media-default", "iso_a4_210x297mm")) return false;
+    if (!addString(response, capacity, r, 0x42, "sides-supported", "one-sided")) return false;
     if (!addInt(response, capacity, r, 0x21, "copies-default", 1)) return false;
     if (!addInt(response, capacity, r, 0x21, "copies-supported", 99)) return false;
-    if (!addKeyword(response, capacity, r, "sides-supported", "one-sided")) return false;
   }
 
   if (operation == 0x0002) {
-    response[r++] = 0x02; // job-attributes-tag
+    response[r++] = 0x02;
     if (!addInt(response, capacity, r, 0x21, "job-id", jobId)) return false;
     String jobUri = printerUri_ + "/job-" + String(jobId);
     if (!addString(response, capacity, r, 0x45, "job-uri", jobUri)) return false;
-    if (!addInt(response, capacity, r, 0x23, "job-state", 3)) return false; // processing
+    if (!addEnum(response, capacity, r, "job-state", 3)) return false;
     if (!addKeyword(response, capacity, r, "job-state-reasons", "job-incoming")) return false;
   }
 
@@ -220,7 +221,6 @@ void MobileIppServer::handleClient(WiFiClient &client) {
   size_t bodyLength = 0;
   uint8_t *response = (uint8_t *)malloc(RESPONSE_CAPACITY);
   size_t responseLength = 0;
-
   bool ok = response && readHttpBody(client, &body, bodyLength) &&
             buildResponse(body, bodyLength, response, RESPONSE_CAPACITY, responseLength);
 
@@ -232,7 +232,6 @@ void MobileIppServer::handleClient(WiFiClient &client) {
     client.print("\r\nConnection: close\r\n\r\n");
     client.write(response, responseLength);
   }
-
   if (body) free(body);
   if (response) free(response);
   client.stop();

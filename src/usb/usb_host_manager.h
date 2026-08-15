@@ -4,7 +4,14 @@
 
 class UsbHostManager {
 public:
-  enum State : uint8_t { STOPPED, RUNNING, DEVICE_ATTACHED, PRINTER_READY, ERROR };
+  enum State : uint8_t {
+    STOPPED,
+    RUNNING,
+    ENUMERATING,
+    DEVICE_ATTACHED,
+    PRINTER_READY,
+    ERROR
+  };
 
   bool begin();
   void poll();
@@ -12,12 +19,9 @@ public:
   const UsbDeviceInfo &device() const { return device_; }
   const String &lastError() const { return error_; }
 
-  // Called by the hardware-specific USB adapter when enumeration completes.
-  void onDeviceAttached(const UsbDeviceInfo &info);
-  void onDeviceDetached();
-
 private:
   State state_ = STOPPED;
   UsbDeviceInfo device_;
   String error_;
+  bool started_ = false;
 };

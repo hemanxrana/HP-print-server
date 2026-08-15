@@ -1,8 +1,9 @@
 #pragma once
+#include <Arduino.h>
 
-// Discovery and transport are independent. A printer may advertise itself
-// with mDNS, WSD, SSDP, or SNMP while accepting jobs over IPP, RAW 9100, LPR,
-// or another transport.
+// Discovery and transport are intentionally independent. A printer can be
+// discovered with mDNS, WSD, SSDP, SNMP, or a direct/manual address and still
+// accept jobs over a different transport.
 
 enum PrinterTransport : uint8_t {
   TRANSPORT_USB = 0,
@@ -25,7 +26,12 @@ enum PrinterDiscovery : uint8_t {
   DISCOVERY_WIFI_DIRECT
 };
 
-const char *transportName(PrinterTransport transport) {
+constexpr uint8_t PRINTER_TRANSPORT_FIRST = TRANSPORT_USB;
+constexpr uint8_t PRINTER_TRANSPORT_LAST = TRANSPORT_HTTPS;
+constexpr uint8_t PRINTER_DISCOVERY_FIRST = DISCOVERY_MANUAL_IP;
+constexpr uint8_t PRINTER_DISCOVERY_LAST = DISCOVERY_WIFI_DIRECT;
+
+inline const char *transportName(PrinterTransport transport) {
   switch (transport) {
     case TRANSPORT_USB: return "USB Host";
     case TRANSPORT_IPP: return "IPP";
@@ -39,7 +45,7 @@ const char *transportName(PrinterTransport transport) {
   }
 }
 
-const char *discoveryName(PrinterDiscovery discovery) {
+inline const char *discoveryName(PrinterDiscovery discovery) {
   switch (discovery) {
     case DISCOVERY_MANUAL_IP: return "Manual IP";
     case DISCOVERY_MDNS: return "mDNS / DNS-SD";
@@ -50,4 +56,12 @@ const char *discoveryName(PrinterDiscovery discovery) {
     case DISCOVERY_WIFI_DIRECT: return "Wi-Fi Direct";
     default: return "Unknown";
   }
+}
+
+inline bool isValidTransport(uint8_t value) {
+  return value >= PRINTER_TRANSPORT_FIRST && value <= PRINTER_TRANSPORT_LAST;
+}
+
+inline bool isValidDiscovery(uint8_t value) {
+  return value >= PRINTER_DISCOVERY_FIRST && value <= PRINTER_DISCOVERY_LAST;
 }

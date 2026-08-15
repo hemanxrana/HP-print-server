@@ -1,6 +1,5 @@
 #include "usb_host_manager.h"
 
-#include <cstring>
 #include "esp_intr_alloc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -14,6 +13,7 @@ static constexpr uint8_t USB_CLASS_PRINTER = 0x07;
 static constexpr uint8_t USB_SUBCLASS_PRINTER = 0x01;
 static constexpr uint8_t USB_ENDPOINT_XFER_BULK = 0x02;
 static constexpr uint8_t USB_ENDPOINT_DIR_IN = 0x80;
+static constexpr int MAX_ALREADY_CONNECTED_DEVICES = 8;
 
 struct UsbHostRuntime {
   usb_host_client_handle_t client = nullptr;
@@ -27,6 +27,7 @@ struct UsbHostRuntime {
   volatile uint8_t new_device_address = 0;
   volatile usb_device_handle_t gone_device = nullptr;
   TaskHandle_t client_task = nullptr;
+  TaskHandle_t host_task = nullptr;
 };
 
 UsbHostRuntime g_usb;
@@ -186,6 +187,43 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
   return true;
 }
 
+static void publishEnumerationResult(const UsbDeviceInfo &info) {
+  if (!g_manager) return;
+  g_manager->onEnumerated(info);
+  Serial.printf("[USB] Printer: %s\n", info.product.length() ? info.product.c_str() : "USB Printer");
+  Serial.printf("[USB] VID: 0x%04X  PID: 0x%04X  address: %u\n", info.vid, info.pid, info.address);
+  Serial.printf("[USB] Interface: %u alt=%u subclass=0x%02X protocol=0x%02X\n",
+                info.printer.interfaceNumber, info.printer.alternateSetting,
+                info.printer.subclass, info.printer.protocol);
+  Serial.printf("[USB] Bulk OUT: 0x%02X maxPacket=%u\n",
+                info.printer.bulkOut.address, info.printer.bulkOut.maxPacketSize);
+  if (info.printer.bulkIn.valid()) {
+    Serial.printf("[USB] Bulk IN: 0x%02X maxPacket=%u\n",
+                  info.printer.bulkIn.address, info.printer.bulkIn.maxPacketSize);
+  } else {
+    Serial.println("[USB] Bulk IN: none (optional for USB Printer Class)");
+  }
+}
+
+static void scanAlreadyConnectedDevices() {
+  uint8_t addresses[MAX_ALREADY_CONNECTED_DEVICES] = {};
+  int count = 0;
+  const esp_err_t err = usb_host_device_addr_list_fill(
+      MAX_ALREADY_CONNECTED_DEVICES, addresses, &count);
+  if (err != ESP_OK || count <= 0) return;
+
+  for (int i = 0; i < count && !g_usb.device_open; ++i) {
+    UsbDeviceInfo info;
+    String error;
+    if (enumerateDevice(addresses[i], info, error)) {
+      publishEnumerationResult(info);
+      return;
+    }
+    Serial.printf("[USB] Existing device at address %u ignored: %s\n",
+                  addresses[i], error.c_str());
+  }
+}
+
 static void clientEventCallback(const usb_host_client_event_msg_t *event, void *) {
   if (!event) return;
 
@@ -226,6 +264,10 @@ static void clientTask(void *) {
     return;
   }
 
+  // Handle a printer that was already plugged in before the firmware/client
+  // started. The Host Library explicitly recommends checking this list.
+  scanAlreadyConnectedDevices();
+
   while (true) {
     const esp_err_t eventErr = usb_host_client_handle_events(g_usb.client, pdMS_TO_TICKS(100));
     if (eventErr != ESP_OK && eventErr != ESP_ERR_TIMEOUT) {
@@ -243,14 +285,11 @@ static void clientTask(void *) {
     if (g_usb.new_device_pending && !g_usb.device_open) {
       const uint8_t address = g_usb.new_device_address;
       g_usb.new_device_pending = false;
-      if (g_manager) g_manager->poll();
 
       UsbDeviceInfo info;
       String error;
       if (enumerateDevice(address, info, error)) {
-        if (g_manager) g_manager->onEnumerated(info);
-        Serial.println("[USB] Printer Class device enumerated");
-        Serial.printf("[USB] VID: 0x%04X  PID: 0x%04X  address: %u\n", info.vid, info.pid, info.address);
+        publishEnumerationResult(info);
       } else {
         if (g_manager) g_manager->onEnumerationError(error);
         Serial.printf("[USB] Ignored device at address %u: %s\n", address, error.c_str());
@@ -294,13 +333,17 @@ bool UsbHostManager::begin() {
     return false;
   }
 
-  if (xTaskCreate(hostTask, "usb_host_lib", 4096, nullptr, 2, nullptr) != pdPASS) {
+  if (xTaskCreate(hostTask, "usb_host_lib", 4096, nullptr, 2, &g_usb.host_task) != pdPASS) {
+    usb_host_uninstall();
     state_ = ERROR;
     error_ = "Failed to create USB host library task";
     return false;
   }
 
   if (xTaskCreate(clientTask, "usb_printer_host", 6144, nullptr, 3, &g_usb.client_task) != pdPASS) {
+    vTaskDelete(g_usb.host_task);
+    g_usb.host_task = nullptr;
+    usb_host_uninstall();
     state_ = ERROR;
     error_ = "Failed to create USB printer client task";
     return false;

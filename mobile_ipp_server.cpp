@@ -42,6 +42,10 @@ bool addMime(uint8_t *out, size_t cap, size_t &pos, const char *value) {
 bool addEnum(uint8_t *out, size_t cap, size_t &pos, const char *name, uint32_t value) {
   return addInt(out, cap, pos, 0x23, name, value);
 }
+
+bool addBool(uint8_t *out, size_t cap, size_t &pos, const char *name, bool value) {
+  return addInt(out, cap, pos, 0x22, name, value ? 1 : 0);
+}
 }
 
 MobileIppServer::MobileIppServer(uint16_t port) : server_(port), port_(port) {}
@@ -152,12 +156,8 @@ bool MobileIppServer::buildResponse(const uint8_t *request, size_t length,
       status = 0x040A;
       if (error.isEmpty()) error = "Document rejected";
     }
-  } else if (operation == 0x0004 || operation == 0x000B) {
-    // Validate-Job and Get-Printer-Attributes are the important discovery and
-    // capability operations for the Android mobile print path.
-  } else if (operation == 0x0009 || operation == 0x0008) {
-    // Get-Jobs/Get-Job-Attributes are accepted; detailed job state will be
-    // connected to the persistent queue in the next job-control increment.
+  } else if (operation == 0x0004 || operation == 0x000B || operation == 0x0009 || operation == 0x0008) {
+    // Capability/job queries are accepted on the mobile path.
   } else {
     status = 0x0501;
     error = "IPP operation not supported";
@@ -195,8 +195,10 @@ bool MobileIppServer::buildResponse(const uint8_t *request, size_t length,
     if (!addMime(response, capacity, r, "image/jpeg")) return false;
     if (!addMime(response, capacity, r, "image/urf")) return false;
     if (!addKeyword(response, capacity, r, "media-supported", "iso_a4_210x297mm")) return false;
-    if (!addString(response, capacity, r, 0x42, "media-default", "iso_a4_210x297mm")) return false;
-    if (!addString(response, capacity, r, 0x42, "sides-supported", "one-sided")) return false;
+    if (!addKeyword(response, capacity, r, "media-default", "iso_a4_210x297mm")) return false;
+    if (!addKeyword(response, capacity, r, "sides-supported", "one-sided")) return false;
+    if (!addKeyword(response, capacity, r, "sides-default", "one-sided")) return false;
+    if (!addBool(response, capacity, r, "color-supported", true)) return false;
     if (!addInt(response, capacity, r, 0x21, "copies-default", 1)) return false;
     if (!addInt(response, capacity, r, 0x21, "copies-supported", 99)) return false;
   }

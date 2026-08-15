@@ -20,7 +20,10 @@ private:
   String printerName_;
   String printerUri_;
   JobHandler handler_ = nullptr;
-  uint32_t nextJobId_ = 1;
+  uint32_t lastJobId_ = 0;
+  String lastJobFormat_;
+  uint8_t lastJobState_ = 3; // pending
+  String lastJobReason_ = "job-incoming";
 
   void handleClient(WiFiClient &client);
   bool readHttpBody(WiFiClient &client, uint8_t **body, size_t &length);

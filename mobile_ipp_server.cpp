@@ -1,0 +1,244 @@
+#include "mobile_ipp_server.h"
+#include <stdlib.h>
+#include <string.h>
+
+namespace {
+constexpr size_t MAX_IPP_BODY = 4 * 1024 * 1024;
+constexpr size_t RESPONSE_CAPACITY = 8192;
+
+uint16_t get16(const uint8_t *p) { return ((uint16_t)p[0] << 8) | p[1]; }
+void put16(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v & 0xff; }
+void put32(uint8_t *p, uint32_t v) { p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p[3]=v; }
+
+bool addString(uint8_t *out, size_t cap, size_t &pos, uint8_t tag,
+               const char *name, const String &value) {
+  size_t nl = strlen(name), vl = value.length();
+  if (nl > 65535 || vl > 65535 || pos + 5 + nl + vl > cap) return false;
+  out[pos++] = tag; put16(out + pos, (uint16_t)nl); pos += 2;
+  memcpy(out + pos, name, nl); pos += nl;
+  put16(out + pos, (uint16_t)vl); pos += 2;
+  memcpy(out + pos, value.c_str(), vl); pos += vl;
+  return true;
+}
+
+bool addInt(uint8_t *out, size_t cap, size_t &pos, uint8_t tag,
+            const char *name, uint32_t value) {
+  size_t nl = strlen(name);
+  if (nl > 65535 || pos + 9 + nl > cap) return false;
+  out[pos++] = tag; put16(out + pos, (uint16_t)nl); pos += 2;
+  memcpy(out + pos, name, nl); pos += nl;
+  put16(out + pos, 4); pos += 2; put32(out + pos, value); pos += 4;
+  return true;
+}
+
+bool addKeyword(uint8_t *out, size_t cap, size_t &pos, const char *name, const char *value) {
+  return addString(out, cap, pos, 0x44, name, value);
+}
+
+bool addMime(uint8_t *out, size_t cap, size_t &pos, const char *value) {
+  return addString(out, cap, pos, 0x49, "document-format-supported", value);
+}
+}
+
+MobileIppServer::MobileIppServer(uint16_t port) : server_(port), port_(port) {}
+
+void MobileIppServer::begin(const String &printerName, const String &printerUri, JobHandler handler) {
+  printerName_ = printerName;
+  printerUri_ = printerUri;
+  handler_ = handler;
+  server_.begin();
+  running_ = true;
+  Serial.printf("[IPP] Listening on TCP %u at %s\n", port_, printerUri_.c_str());
+}
+
+bool MobileIppServer::readHttpBody(WiFiClient &client, uint8_t **body, size_t &length) {
+  *body = nullptr;
+  length = 0;
+  client.setTimeout(5);
+
+  String requestLine = client.readStringUntil('\n');
+  requestLine.trim();
+  if (!requestLine.startsWith("POST ")) return false;
+
+  size_t contentLength = 0;
+  bool ipp = false;
+  unsigned long deadline = millis() + 5000;
+  while (millis() < deadline) {
+    if (!client.available()) { delay(1); continue; }
+    String line = client.readStringUntil('\n');
+    line.trim();
+    if (line.isEmpty()) break;
+    String lower = line; lower.toLowerCase();
+    if (lower.startsWith("content-length:")) contentLength = (size_t)lower.substring(15).toInt();
+    if (lower.startsWith("content-type:") && lower.indexOf("application/ipp") >= 0) ipp = true;
+  }
+
+  if (!ipp || contentLength < 8 || contentLength > MAX_IPP_BODY) return false;
+
+  uint8_t *buffer = (uint8_t *)ps_malloc(contentLength);
+  if (!buffer) buffer = (uint8_t *)malloc(contentLength);
+  if (!buffer) return false;
+
+  size_t got = 0;
+  deadline = millis() + 15000;
+  while (got < contentLength && millis() < deadline) {
+    if (!client.available()) { delay(1); continue; }
+    int n = client.read(buffer + got, contentLength - got);
+    if (n > 0) got += (size_t)n;
+  }
+  if (got != contentLength) { free(buffer); return false; }
+  *body = buffer;
+  length = got;
+  return true;
+}
+
+bool MobileIppServer::buildResponse(const uint8_t *request, size_t length,
+                                     uint8_t *response, size_t capacity,
+                                     size_t &responseLength) {
+  responseLength = 0;
+  if (length < 8 || capacity < 128) return false;
+
+  uint16_t version = get16(request);
+  const uint16_t operation = get16(request + 2);
+  const uint32_t requestId = ((uint32_t)request[4] << 24) | ((uint32_t)request[5] << 16) |
+                             ((uint32_t)request[6] << 8) | request[7];
+  if (version < 0x0100 || version > 0x0200) version = 0x0200;
+
+  String documentFormat = "application/octet-stream";
+  size_t pos = 8;
+  bool sawOperationGroup = false;
+  size_t documentOffset = length;
+
+  while (pos < length) {
+    uint8_t tag = request[pos++];
+    if (tag == 0x03) { documentOffset = pos; break; }
+    if (tag == 0x01 || tag == 0x02 || tag == 0x04) {
+      if (tag == 0x01) sawOperationGroup = true;
+      continue;
+    }
+    if (pos + 4 > length) return false;
+    uint16_t nameLen = get16(request + pos); pos += 2;
+    if (pos + nameLen + 2 > length) return false;
+    String name;
+    for (uint16_t i = 0; i < nameLen; ++i) name += (char)request[pos + i];
+    pos += nameLen;
+    uint16_t valueLen = get16(request + pos); pos += 2;
+    if (pos + valueLen > length) return false;
+    if (name == "document-format" && valueLen > 0 && valueLen < 128) {
+      documentFormat = "";
+      for (uint16_t i = 0; i < valueLen; ++i) documentFormat += (char)request[pos + i];
+    }
+    pos += valueLen;
+  }
+  if (!sawOperationGroup) return false;
+
+  uint16_t status = 0x0000; // successful-ok
+  uint32_t jobId = 0;
+  String error;
+
+  if (operation == 0x0002) { // Print-Job
+    if (documentOffset >= length) {
+      status = 0x0402; // client-error-bad-request
+      error = "Print-Job has no document";
+    } else if (!handler_) {
+      status = 0x0502; // server-error-service-unavailable
+      error = "Print backend unavailable";
+    } else if (!handler_(request + documentOffset, length - documentOffset,
+                         documentFormat, jobId, error)) {
+      status = 0x040A; // client-error-document-format-error
+      if (error.isEmpty()) error = "Document rejected";
+    }
+  } else if (operation == 0x0004 || operation == 0x000B) {
+    // Validate-Job and Get-Printer-Attributes are safe to answer before a
+    // document is submitted. Android commonly performs capability queries.
+    if (operation == 0x0004 && !handler_) {
+      status = 0x0502;
+      error = "Print backend unavailable";
+    }
+  } else if (operation == 0x0009) {
+    // Get-Jobs: valid empty job list until the queue exposes jobs through a
+    // future persistent job database.
+  } else if (operation == 0x0008) {
+    // Get-Job-Attributes: return a generic completed/unknown job response.
+    // Detailed persistent job state is added by the print queue layer.
+  } else {
+    status = 0x0501; // server-error-operation-not-supported
+    error = "IPP operation not supported";
+  }
+
+  size_t r = 0;
+  response[r++] = version >> 8; response[r++] = version & 0xff;
+  put16(response + r, status); r += 2;
+  put32(response + r, requestId); r += 4;
+  response[r++] = 0x01; // operation-attributes-tag
+
+  if (!addString(response, capacity, r, 0x47, "attributes-charset", "utf-8")) return false;
+  if (!addString(response, capacity, r, 0x48, "attributes-natural-language", "en")) return false;
+
+  if (!error.isEmpty() && !addString(response, capacity, r, 0x41, "status-message", error)) return false;
+
+  if (operation == 0x000B || operation == 0x0004) {
+    response[r++] = 0x04; // printer-attributes-tag
+    if (!addString(response, capacity, r, 0x42, "printer-name", printerName_)) return false;
+    if (!addString(response, capacity, r, 0x45, "printer-uri-supported", printerUri_)) return false;
+    if (!addString(response, capacity, r, 0x44, "uri-authentication-supported", "none")) return false;
+    if (!addString(response, capacity, r, 0x44, "uri-security-supported", "none")) return false;
+    if (!addKeyword(response, capacity, r, "ipp-versions-supported", "2.0")) return false;
+    if (!addKeyword(response, capacity, r, "operations-supported", "print-job")) return false;
+    if (!addInt(response, capacity, r, 0x23, "printer-state", 3)) return false;
+    if (!addKeyword(response, capacity, r, "printer-state-reasons", "none")) return false;
+    if (!addInt(response, capacity, r, 0x21, "queued-job-count", 0)) return false;
+    if (!addMime(response, capacity, r, "image/pwg-raster")) return false;
+    if (!addMime(response, capacity, r, "application/PCLm")) return false;
+    if (!addMime(response, capacity, r, "application/pdf")) return false;
+    if (!addMime(response, capacity, r, "image/jpeg")) return false;
+    if (!addMime(response, capacity, r, "image/urf")) return false;
+    if (!addString(response, capacity, r, 0x44, "media", "iso_a4_210x297mm")) return false;
+    if (!addKeyword(response, capacity, r, "color-supported", "true")) return false;
+    if (!addInt(response, capacity, r, 0x21, "copies-default", 1)) return false;
+    if (!addInt(response, capacity, r, 0x21, "copies-supported", 99)) return false;
+    if (!addKeyword(response, capacity, r, "sides-supported", "one-sided")) return false;
+  }
+
+  if (operation == 0x0002) {
+    response[r++] = 0x02; // job-attributes-tag
+    if (!addInt(response, capacity, r, 0x21, "job-id", jobId)) return false;
+    String jobUri = printerUri_ + "/job-" + String(jobId);
+    if (!addString(response, capacity, r, 0x45, "job-uri", jobUri)) return false;
+    if (!addInt(response, capacity, r, 0x23, "job-state", 3)) return false; // processing
+    if (!addKeyword(response, capacity, r, "job-state-reasons", "job-incoming")) return false;
+  }
+
+  if (r + 1 > capacity) return false;
+  response[r++] = 0x03;
+  responseLength = r;
+  return true;
+}
+
+void MobileIppServer::handleClient(WiFiClient &client) {
+  uint8_t *body = nullptr;
+  size_t bodyLength = 0;
+  uint8_t *response = (uint8_t *)malloc(RESPONSE_CAPACITY);
+  size_t responseLength = 0;
+
+  bool ok = response && readHttpBody(client, &body, bodyLength) &&
+            buildResponse(body, bodyLength, response, RESPONSE_CAPACITY, responseLength);
+
+  if (!ok) {
+    client.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+  } else {
+    client.print("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: ");
+    client.print(responseLength);
+    client.print("\r\nConnection: close\r\n\r\n");
+    client.write(response, responseLength);
+  }
+
+  if (body) free(body);
+  if (response) free(response);
+  client.stop();
+}
+
+void MobileIppServer::poll() {
+  WiFiClient client = server_.available();
+  if (client) handleClient(client);
+}

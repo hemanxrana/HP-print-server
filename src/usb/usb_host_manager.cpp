@@ -25,6 +25,8 @@ struct UsbHostRuntime {
   volatile bool new_device_pending = false;
   volatile bool device_gone_pending = false;
   volatile uint8_t new_device_address = 0;
+  volatile bool deferred_device_pending = false;
+  volatile uint8_t deferred_device_address = 0;
   volatile usb_device_handle_t gone_device = nullptr;
   TaskHandle_t client_task = nullptr;
   TaskHandle_t host_task = nullptr;
@@ -205,6 +207,14 @@ static void publishEnumerationResult(const UsbDeviceInfo &info) {
   }
 }
 
+static void queueDeferredDeviceIfNeeded() {
+  if (!g_usb.device_open && g_usb.deferred_device_pending && !g_usb.new_device_pending) {
+    g_usb.new_device_address = g_usb.deferred_device_address;
+    g_usb.new_device_pending = true;
+    g_usb.deferred_device_pending = false;
+  }
+}
+
 static void scanAlreadyConnectedDevices() {
   uint8_t addresses[MAX_ALREADY_CONNECTED_DEVICES] = {};
   int count = 0;
@@ -229,12 +239,16 @@ static void clientEventCallback(const usb_host_client_event_msg_t *event, void *
 
   switch (event->event) {
     case USB_HOST_CLIENT_EVENT_NEW_DEV:
-      // The callback never opens devices or performs descriptor work. This is
-      // deliberate: the SDK requires the callback to remain short and lets
-      // the client task perform the real state-machine work.
+      // The callback never opens devices or performs descriptor work. It only
+      // records one event for the client task, preventing overlapping loops.
       if (!g_usb.device_open && !g_usb.new_device_pending) {
         g_usb.new_device_address = event->new_dev.address;
         g_usb.new_device_pending = true;
+      } else if (g_usb.device_open && !g_usb.deferred_device_pending) {
+        // A second device may arrive while a non-printer device is being
+        // inspected. Remember it instead of losing its NEW_DEV event.
+        g_usb.deferred_device_address = event->new_dev.address;
+        g_usb.deferred_device_pending = true;
       }
       break;
 
@@ -264,8 +278,6 @@ static void clientTask(void *) {
     return;
   }
 
-  // Handle a printer that was already plugged in before the firmware/client
-  // started. The Host Library explicitly recommends checking this list.
   scanAlreadyConnectedDevices();
 
   while (true) {
@@ -280,6 +292,7 @@ static void clientTask(void *) {
       g_usb.device_gone_pending = false;
       closeCurrentDevice();
       if (g_manager) g_manager->onDetached();
+      queueDeferredDeviceIfNeeded();
     }
 
     if (g_usb.new_device_pending && !g_usb.device_open) {
@@ -293,8 +306,7 @@ static void clientTask(void *) {
       } else {
         if (g_manager) g_manager->onEnumerationError(error);
         Serial.printf("[USB] Ignored device at address %u: %s\n", address, error.c_str());
-        // enumerateDevice() already closed non-printer/error devices. No retry
-        // is scheduled, preventing a reconnect/error loop.
+        queueDeferredDeviceIfNeeded();
       }
     }
   }
@@ -304,11 +316,7 @@ static void hostTask(void *) {
   while (true) {
     uint32_t flags = 0;
     const esp_err_t err = usb_host_lib_handle_events(portMAX_DELAY, &flags);
-    if (err != ESP_OK) {
-      vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    // Host Library stays installed for the lifetime of the firmware. There is
-    // no normal install/uninstall cycle, so reconnects do not recreate tasks.
+    if (err != ESP_OK) vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 

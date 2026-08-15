@@ -1,170 +1,167 @@
-/*
- * HP Print Server
- * ESP32-S3 / Arduino IDE foundation
- *
- * Initial milestone:
- *   - ESP32-S3 Arduino firmware boots cleanly
- *   - Wi-Fi configuration is isolated from application logic
- *   - HTTP endpoint provides a basic health/status response
- *   - Future modules will add mDNS/DNS-SD, IPP, USB Host, and HP printing
- *
- * Board target:
- *   ESP32-S3 N16R8-class board
- *
- * Arduino IDE:
- *   Install Espressif ESP32 board support and select the appropriate
- *   ESP32-S3 board for your hardware.
- */
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Preferences.h>
 
-// -----------------------------------------------------------------------------
-// User configuration
-// -----------------------------------------------------------------------------
+WebServer server(80);
+Preferences prefs;
 
-// Put your Wi-Fi credentials here, or replace this section later with a
-// configuration portal / non-volatile settings system.
-const char *WIFI_SSID = "YOUR_WIFI_SSID";
-const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+struct Config {
+  String wifiSsid;
+  String wifiPassword;
+  String printerName;
+  String printerModel;
+  String printerIp;
+  uint16_t printerPort;
+};
 
-// HTTP status server. This is intentionally separate from the future IPP
-// server; it gives us a simple way to verify networking before implementing
-// printing.
-WebServer statusServer(80);
+Config config;
 
-// -----------------------------------------------------------------------------
-// Wi-Fi
-// -----------------------------------------------------------------------------
+const char *AP_SSID = "HP-Print-Server";
+const char *AP_PASSWORD = "configureme";
 
-void connectWiFi()
-{
-    Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
-
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-    const unsigned long timeoutMs = 20000;
-    const unsigned long start = millis();
-
-    while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs)
-    {
-        delay(500);
-        Serial.print('.');
-    }
-
-    Serial.println();
-
-    if (WiFi.status() == WL_CONNECTED)
-    {
-        Serial.println("[WiFi] Connected");
-        Serial.print("[WiFi] IP address: ");
-        Serial.println(WiFi.localIP());
-    }
-    else
-    {
-        Serial.println("[WiFi] Connection failed");
-        Serial.println("[WiFi] Firmware will continue running.");
-    }
+String htmlEscape(const String &value) {
+  String out = value;
+  out.replace("&", "&amp;");
+  out.replace("<", "&lt;");
+  out.replace(">", "&gt;");
+  out.replace("\"", "&quot;");
+  out.replace("'", "&#39;");
+  return out;
 }
 
-// -----------------------------------------------------------------------------
-// HTTP status endpoint
-// -----------------------------------------------------------------------------
-
-void handleRoot()
-{
-    statusServer.send(
-        200,
-        "text/plain",
-        "HP Print Server\n"
-        "Status: OK\n"
-        "Protocol: HTTP status endpoint only\n"
-        "IPP: not implemented yet\n"
-        "USB printer backend: not implemented yet\n");
+void loadConfig() {
+  prefs.begin("printer", true);
+  config.wifiSsid = prefs.getString("ssid", "");
+  config.wifiPassword = prefs.getString("pass", "");
+  config.printerName = prefs.getString("name", "HP Printer");
+  config.printerModel = prefs.getString("model", "");
+  config.printerIp = prefs.getString("ip", "");
+  config.printerPort = prefs.getUShort("port", 9100);
+  prefs.end();
 }
 
-void handleHealth()
-{
-    statusServer.send(200, "text/plain", "OK\n");
+void saveConfig() {
+  prefs.begin("printer", false);
+  prefs.putString("ssid", config.wifiSsid);
+  prefs.putString("pass", config.wifiPassword);
+  prefs.putString("name", config.printerName);
+  prefs.putString("model", config.printerModel);
+  prefs.putString("ip", config.printerIp);
+  prefs.putUShort("port", config.printerPort);
+  prefs.end();
 }
 
-void handleNotFound()
-{
-    statusServer.send(404, "text/plain", "Not found\n");
+void startAccessPoint() {
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.print("[AP] SSID: ");
+  Serial.println(AP_SSID);
+  Serial.print("[AP] Password: ");
+  Serial.println(AP_PASSWORD);
+  Serial.print("[AP] Configure at: http://");
+  Serial.println(WiFi.softAPIP());
 }
 
-void startStatusServer()
-{
-    statusServer.on("/", HTTP_GET, handleRoot);
-    statusServer.on("/health", HTTP_GET, handleHealth);
-    statusServer.onNotFound(handleNotFound);
-    statusServer.begin();
+bool connectWiFi() {
+  if (config.wifiSsid.isEmpty()) return false;
 
-    Serial.println("[HTTP] Status server started on port 80");
-}
+  WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
+  Serial.printf("[WiFi] Connecting to %s", config.wifiSsid.c_str());
 
-// -----------------------------------------------------------------------------
-// Future subsystems
-// -----------------------------------------------------------------------------
-
-void initMDNS()
-{
-    // TODO: Add DNS-SD/mDNS printer advertisement.
-}
-
-void initIPP()
-{
-    // TODO: Add IPP server.
-}
-
-void initUSBHost()
-{
-    // TODO: Initialize ESP32-S3 USB Host stack.
-}
-
-void initPrinterBackend()
-{
-    // TODO: Detect and initialize the connected HP printer.
-}
-
-// -----------------------------------------------------------------------------
-// Arduino entry points
-// -----------------------------------------------------------------------------
-
-void setup()
-{
-    Serial.begin(115200);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
     delay(500);
+    Serial.print('.');
+  }
+  Serial.println();
 
-    Serial.println();
-    Serial.println("========================================");
-    Serial.println("        HP Print Server - ESP32-S3");
-    Serial.println("========================================");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WiFi] Connected: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
 
-    Serial.printf("[SYS] Free heap: %u bytes\n", ESP.getFreeHeap());
-
-    connectWiFi();
-
-    if (WiFi.status() == WL_CONNECTED)
-    {
-        startStatusServer();
-        initMDNS();
-        initIPP();
-    }
-
-    initUSBHost();
-    initPrinterBackend();
-
-    Serial.println("[SYS] Initialization complete");
+  Serial.println("[WiFi] Connection failed");
+  return false;
 }
 
-void loop()
-{
-    statusServer.handleClient();
+String page() {
+  String wifiState = WiFi.status() == WL_CONNECTED ? "Connected: " + WiFi.localIP().toString() : "Not connected";
+  String apState = "http://" + WiFi.softAPIP().toString();
 
-    // Future print-job processing will run here or in dedicated FreeRTOS
-    // tasks once the individual subsystems have been implemented.
-    delay(2);
+  String html = R"rawliteral(<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>
+  <title>HP Print Server</title><style>
+  body{font-family:Arial,sans-serif;max-width:720px;margin:30px auto;padding:0 16px;background:#f5f5f5;color:#222}
+  section{background:white;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 8px #0001}
+  input{width:100%;box-sizing:border-box;padding:10px;margin:6px 0 14px;border:1px solid #bbb;border-radius:6px}
+  button{padding:11px 18px;border:0;border-radius:7px;cursor:pointer}.save{background:#222;color:white}
+  .status{padding:10px;background:#eee;border-radius:6px}small{color:#666}
+  </style></head><body><h1>HP Print Server</h1>
+  <section><h2>Network</h2><div class='status'>Wi-Fi: )rawliteral" + htmlEscape(wifiState) + R"rawliteral(</div>
+  <p><small>Configuration AP: )rawliteral" + htmlEscape(apState) + R"rawliteral(</small></p>
+  <form method='POST' action='/save'>
+  <label>Wi-Fi SSID</label><input name='ssid' value=')rawliteral" + htmlEscape(config.wifiSsid) + R"rawliteral('>
+  <label>Wi-Fi password</label><input type='password' name='password' placeholder='Leave unchanged to keep current password'>
+  <button class='save' type='submit'>Save &amp; Connect</button></form></section>
+  <section><h2>Printer</h2><form method='POST' action='/save'>
+  <label>Printer name</label><input name='printerName' value=')rawliteral" + htmlEscape(config.printerName) + R"rawliteral('>
+  <label>Printer model</label><input name='printerModel' value=')rawliteral" + htmlEscape(config.printerModel) + R"rawliteral(' placeholder='Example: HP Smart Tank 520'>
+  <label>Printer IP</label><input name='printerIp' value=')rawliteral" + htmlEscape(config.printerIp) + R"rawliteral(' placeholder='Optional; leave blank for USB'>
+  <label>Printer TCP port</label><input type='number' name='printerPort' value=')rawliteral" + String(config.printerPort) + R"rawliteral('>
+  <input type='hidden' name='ssid' value=')rawliteral" + htmlEscape(config.wifiSsid) + R"rawliteral('>
+  <button class='save' type='submit'>Save printer settings</button></form></section>
+  <section><h2>Server</h2><div class='status'>IPP: Not implemented yet<br>USB Host: Not implemented yet</div></section>
+  </body></html>)rawliteral";
+  return html;
+}
+
+void handleRoot() { server.send(200, "text/html", page()); }
+
+void handleSave() {
+  if (server.hasArg("ssid")) config.wifiSsid = server.arg("ssid");
+  if (server.hasArg("password") && server.arg("password").length()) config.wifiPassword = server.arg("password");
+  if (server.hasArg("printerName")) config.printerName = server.arg("printerName");
+  if (server.hasArg("printerModel")) config.printerModel = server.arg("printerModel");
+  if (server.hasArg("printerIp")) config.printerIp = server.arg("printerIp");
+  if (server.hasArg("printerPort")) {
+    int port = server.arg("printerPort").toInt();
+    if (port > 0 && port <= 65535) config.printerPort = (uint16_t)port;
+  }
+
+  saveConfig();
+  server.send(200, "text/html", "<meta http-equiv='refresh' content='3;url=/'><p>Saved. Attempting Wi-Fi connection...</p>");
+
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+}
+
+void handleHealth() {
+  server.send(200, "text/plain", WiFi.status() == WL_CONNECTED ? "OK\n" : "CONFIGURATION_REQUIRED\n");
+}
+
+void handleNotFound() { server.send(404, "text/plain", "Not found\n"); }
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== HP Print Server / ESP32-S3 ===");
+
+  loadConfig();
+  startAccessPoint();
+  connectWiFi();
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/health", HTTP_GET, handleHealth);
+  server.on("/save", HTTP_POST, handleSave);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  Serial.println("[HTTP] Configuration server started");
+
+  // Future: mDNS/DNS-SD, IPP server, USB Host and HP backend.
+}
+
+void loop() {
+  server.handleClient();
+  delay(2);
 }

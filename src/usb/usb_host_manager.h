@@ -19,6 +19,12 @@ public:
   const UsbDeviceInfo &device() const { return device_; }
   const String &lastError() const { return error_; }
 
+  // USB client task notification points. These are not USB callbacks; the
+  // single client task calls them after it has finished descriptor work.
+  void onEnumerated(const UsbDeviceInfo &info);
+  void onDetached();
+  void onEnumerationError(const String &error);
+
 private:
   State state_ = STOPPED;
   UsbDeviceInfo device_;

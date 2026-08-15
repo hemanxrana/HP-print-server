@@ -52,6 +52,9 @@ Accepting a PDF or PWG Raster job over IPP is therefore only the network-ingress
 - accepted mobile formats: PWG Raster, PCLm, PDF, JPEG and URF
 - strict HTTP request-path/content-type/content-length checks
 - no false `completed` state before a real backend reports completion
+- retained printer-discovery layer for mDNS, SSDP, WSD and targeted SNMP
+- retained RAW 9100 and LPR transport interfaces
+- corrected IPP transport request encoder for outbound printer-to-printer use
 
 The IPP behavior follows the IPP operation and job-state model in RFC 8011: Validate-Job does not create a job, Get-Jobs supports completed/not-completed selection, Cancel-Job transitions a live job to canceled, and Get-Job-Attributes exposes the retained job object.
 
@@ -103,10 +106,13 @@ The AP password remains a development default and should be made configurable be
 - `mobile_ipp_server.h/.cpp` — HTTP + IPP smartphone-facing server
 - `mobile_print_queue.h/.cpp` — persistent multi-job spool and recovery
 - `mobile_print_profile.h` — mobile IPP/DNS-SD profile
-- `printer_protocols.h` — transport/discovery enums for the printer-side roadmap
+- `discovery_engine.h/.cpp` — mDNS, SSDP, WSD and targeted SNMP discovery
+- `print_transports.h/.cpp` — RAW 9100, LPR and outbound IPP transport helpers
+- `ipp_server.h/.cpp` — legacy IPP compatibility layer; mobile printing uses `mobile_ipp_server`
+- `printer_protocols.h` — transport/discovery enums
 
 ## Verification
 
-The current source was re-reviewed after implementation specifically for the failure modes found during the earlier simulation: single-job storage, incorrect IPP operation handling, missing Get-Jobs, incorrect job-state semantics, cancellation, reboot recovery, queue capacity, requested attributes, Get-Jobs filtering, and false completion.
+The current source was re-reviewed after implementation specifically for the failure modes found during the earlier simulation: single-job storage, incorrect IPP operation handling, missing Get-Jobs, incorrect job-state semantics, cancellation, reboot recovery, queue capacity, requested attributes, Get-Jobs filtering, and false completion. The previously removed discovery/transport files were also restored so the protocol roadmap is not silently lost.
 
 A physical Arduino build and end-to-end Android print test still require the ESP32-S3 development board and Arduino ESP32 toolchain. The repository should therefore be treated as **network-layer implementation complete, hardware backend not yet complete**, rather than as a finished printer driver.

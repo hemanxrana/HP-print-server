@@ -7,7 +7,10 @@
 // decides whether it can interpret them.
 namespace MobilePrintProfile {
 static constexpr const char *SERVICE_TYPE = "_ipp._tcp";
-static constexpr const char *SERVICE_SUBTYPE = "_universal._sub._ipp._tcp";
+// IPP Everywhere discovery subtype. The Arduino mDNS layer currently
+// advertises the generic _ipp._tcp service; this constant is kept for the
+// service profile and for a future native-subtype registration path.
+static constexpr const char *SERVICE_SUBTYPE = "_print._sub._ipp._tcp";
 static constexpr uint16_t IPP_PORT = 631;
 static constexpr const char *IPP_PATH = "/ipp/print";
 

@@ -46,11 +46,33 @@ bool allocateRawBuffer() {
   return rawBuffer != nullptr;
 }
 
+bool looksLikePcl3Gui() {
+  if (!rawBuffer || rawLength < 2) return false;
+  const size_t inspect = min(rawLength, static_cast<size_t>(512));
+  for (size_t i = 0; i + 1 < inspect; ++i) {
+    if (rawBuffer[i] == 0x1B && (rawBuffer[i + 1] == 'E' || rawBuffer[i + 1] == '&')) return true;
+  }
+  // HP jobs may be wrapped in PJL before the PCL stream.
+  for (size_t i = 0; i + 9 < inspect; ++i) {
+    if (rawBuffer[i] == 0x1B && rawBuffer[i + 1] == '%' && rawBuffer[i + 2] == '-') return true;
+  }
+  return false;
+}
+
 void finishRawJob(const char *reason) {
-  if (!rawClient || rawLength == 0) {
+  if (rawLength == 0) {
     freeRawBuffer();
+    rawClient.stop();
     return;
   }
+
+  if (!looksLikePcl3Gui()) {
+    Serial.println("[RAW] Rejected job: data does not look like HP PCL 3 GUI/PJL-wrapped PCL");
+    freeRawBuffer();
+    rawClient.stop();
+    return;
+  }
+
   uint32_t jobId = 0;
   String error;
   if (!printQueue.enqueue(rawBuffer, rawLength, PCL3GUI_MIME, jobId, error)) {
@@ -66,8 +88,13 @@ void finishRawJob(const char *reason) {
 void handleRawServer() {
   if (!rawServerStarted) return;
 
-  if (!rawClient || !rawClient.connected()) {
-    if (rawClient) rawClient.stop();
+  // If a client has finished sending, preserve that job before accepting a
+  // new connection. JetDirect normally uses connection-close as job EOF.
+  if (rawClient && !rawClient.connected()) {
+    finishRawJob("connection-closed");
+  }
+
+  if (!rawClient) {
     WiFiClient incoming = rawServer.available();
     if (incoming) {
       if (!allocateRawBuffer()) {

@@ -16,6 +16,7 @@ public:
   const String &statusReason() const { return reason_; }
   const UsbDeviceInfo &device() const { return host_.device(); }
   bool processNext(MobilePrintQueue &queue, String &error);
+  bool testPrint(String &error);
 
 private:
   UsbHostManager &host_;

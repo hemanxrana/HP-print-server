@@ -1,4 +1,5 @@
 #include "print_transports.h"
+#include <WiFi.h>
 #include <string.h>
 static bool connectClient(WiFiClient&c,const PrintTarget&t,uint16_t fallback,uint32_t timeout){c.setTimeout(timeout/1000+1);uint16_t port=t.port?t.port:fallback;if(t.address!=IPAddress(0,0,0,0))return c.connect(t.address,port,timeout);return !t.host.isEmpty()&&c.connect(t.host.c_str(),port,timeout);}
 static bool writeAll(WiFiClient&c,const uint8_t*d,size_t n){size_t sent=0;while(sent<n){size_t w=c.write(d+sent,n-sent);if(!w)return false;sent+=w;yield();}return true;}

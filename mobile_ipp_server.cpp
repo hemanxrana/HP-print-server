@@ -7,6 +7,12 @@ namespace {
 constexpr size_t MAX_IPP_BODY = MobilePrintQueue::MAX_JOB_BYTES;
 constexpr size_t RESPONSE_CAPACITY = 8192;
 constexpr size_t CHUNK_GROW = 8192;
+
+// IMPORTANT: this must not live on loopTask's stack. Android printer discovery
+// commonly asks for a large set of printer attributes; the old local
+// uint8_t response[8192] overflowed loopTask and triggered the stack canary.
+static uint8_t ippResponseBuffer[RESPONSE_CAPACITY];
+
 constexpr uint16_t OP_PRINT_JOB = 0x0002;
 constexpr uint16_t OP_VALIDATE_JOB = 0x0004;
 constexpr uint16_t OP_CANCEL_JOB = 0x0008;
@@ -207,7 +213,7 @@ bool MobileIppServer::buildResponse(const uint8_t *request, size_t length, uint8
     p += vl;
   }
   if (!operationGroup) return false;
-  Serial.printf("[IPP] op=0x%04X id=%lu len=%u format=%s\n", operation, (unsigned long)requestId, (unsigned)length, documentFormat.c_str());
+  Serial.printf("[IPP] op=0x%04X id=%lu len=%u format=%s freePSRAM=%u freeHeap=%u\n", operation, (unsigned long)requestId, (unsigned)length, documentFormat.c_str(), (unsigned)ESP.getFreePsram(), (unsigned)ESP.getFreeHeap());
 
   uint16_t status = ST_OK; String statusMessage; uint32_t jobId = 0;
   if (operation == OP_PRINT_JOB) {
@@ -296,14 +302,15 @@ void MobileIppServer::handleClient(WiFiClient &client) {
     client.print("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nBad Request\n");
     Serial.println("[IPP] Request could not be parsed; returning HTTP 400"); client.stop(); return;
   }
-  uint8_t response[RESPONSE_CAPACITY]; size_t responseLength = 0;
-  const bool ok = buildResponse(body, bodyLength, response, sizeof(response), responseLength);
+
+  size_t responseLength = 0;
+  const bool ok = buildResponse(body, bodyLength, ippResponseBuffer, sizeof(ippResponseBuffer), responseLength);
   free(body);
   if (!ok) {
     client.print("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nMalformed IPP request\n");
     Serial.println("[IPP] Request could not be parsed; returning HTTP 400"); client.stop(); return;
   }
-  client.print("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: "); client.print(responseLength); client.print("\r\nConnection: close\r\n\r\n"); client.write(response, responseLength); client.stop();
+  client.print("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: "); client.print(responseLength); client.print("\r\nConnection: close\r\n\r\n"); client.write(ippResponseBuffer, responseLength); client.stop();
 }
 
 void MobileIppServer::poll() {

@@ -1,9 +1,24 @@
 #include "usb_printer_backend.h"
 #include "status_led.h"
 #include <WiFi.h>
+#include <ESPmDNS.h>
+#include <esp_heap_caps.h>
+
+extern MobilePrintQueue printQueue;
 
 namespace {
 constexpr const char *PCL3GUI_MIME = "application/vnd.hp-PCL";
+constexpr uint16_t RAW_PORT = 9100;
+constexpr size_t RAW_MAX_BYTES = MobilePrintQueue::MAX_JOB_BYTES;
+constexpr uint32_t RAW_IDLE_TIMEOUT_MS = 5000;
+
+WiFiServer rawServer(RAW_PORT);
+WiFiClient rawClient;
+bool rawServerStarted = false;
+bool rawDiscoveryAdvertised = false;
+uint8_t *rawBuffer = nullptr;
+size_t rawLength = 0;
+unsigned long rawLastDataMs = 0;
 
 bool rawProtocolSupported(const UsbDeviceInfo &d) {
   return d.printer.found && d.printer.protocol == 0x02 && d.printer.usableForRawPrint();
@@ -14,6 +29,100 @@ bool pcl3GuiFormat(const String &format) {
   f.trim();
   f.toLowerCase();
   return f == "application/vnd.hp-pcl" || f == "application/vnd.hp-pcl3gui";
+}
+
+void freeRawBuffer() {
+  if (rawBuffer) {
+    heap_caps_free(rawBuffer);
+    rawBuffer = nullptr;
+  }
+  rawLength = 0;
+}
+
+bool allocateRawBuffer() {
+  freeRawBuffer();
+  rawBuffer = static_cast<uint8_t *>(heap_caps_malloc(RAW_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!rawBuffer) rawBuffer = static_cast<uint8_t *>(heap_caps_malloc(RAW_MAX_BYTES, MALLOC_CAP_8BIT));
+  return rawBuffer != nullptr;
+}
+
+void finishRawJob(const char *reason) {
+  if (!rawClient || rawLength == 0) {
+    freeRawBuffer();
+    return;
+  }
+  uint32_t jobId = 0;
+  String error;
+  if (!printQueue.enqueue(rawBuffer, rawLength, PCL3GUI_MIME, jobId, error)) {
+    Serial.printf("[RAW] Job rejected: %s\n", error.c_str());
+  } else {
+    Serial.printf("[RAW] Accepted JetDirect job %lu: %u bytes (%s)\n",
+                  static_cast<unsigned long>(jobId), static_cast<unsigned>(rawLength), reason);
+  }
+  freeRawBuffer();
+  rawClient.stop();
+}
+
+void handleRawServer() {
+  if (!rawServerStarted) return;
+
+  if (!rawClient || !rawClient.connected()) {
+    if (rawClient) rawClient.stop();
+    WiFiClient incoming = rawServer.available();
+    if (incoming) {
+      if (!allocateRawBuffer()) {
+        Serial.println("[RAW] Cannot allocate 4 MB job buffer");
+        incoming.stop();
+        return;
+      }
+      rawClient = incoming;
+      rawLength = 0;
+      rawLastDataMs = millis();
+      Serial.println("[RAW] TCP 9100 client connected");
+    }
+    return;
+  }
+
+  uint8_t chunk[1460];
+  while (rawClient.available()) {
+    const size_t want = min(static_cast<size_t>(rawClient.available()), sizeof(chunk));
+    const int got = rawClient.read(chunk, want);
+    if (got <= 0) break;
+    if (rawLength + static_cast<size_t>(got) > RAW_MAX_BYTES) {
+      Serial.println("[RAW] Job exceeds 4 MB limit; aborting connection");
+      freeRawBuffer();
+      rawClient.stop();
+      return;
+    }
+    memcpy(rawBuffer + rawLength, chunk, static_cast<size_t>(got));
+    rawLength += static_cast<size_t>(got);
+    rawLastDataMs = millis();
+  }
+
+  if (!rawClient.connected()) {
+    finishRawJob("connection-closed");
+  } else if (rawLength > 0 && millis() - rawLastDataMs >= RAW_IDLE_TIMEOUT_MS) {
+    finishRawJob("idle-timeout");
+  }
+}
+
+void startRawServerIfNeeded() {
+  if (WiFi.status() != WL_CONNECTED && WiFi.getMode() != WIFI_AP && WiFi.getMode() != WIFI_AP_STA) return;
+
+  if (!rawServerStarted) {
+    rawServer.begin();
+    rawServer.setNoDelay(true);
+    rawServerStarted = true;
+    Serial.println("[RAW] JetDirect/AppSocket server listening on TCP 9100");
+  }
+
+  if (!rawDiscoveryAdvertised && WiFi.getMode() != WIFI_OFF) {
+    if (MDNS.addService("pdl-datastream", "tcp", RAW_PORT)) {
+      MDNS.addServiceTxt("pdl-datastream", "tcp", "txtvers", "1");
+      rawDiscoveryAdvertised = true;
+      Serial.println("[mDNS] Advertising RAW _pdl-datastream._tcp on TCP 9100");
+    }
+  }
 }
 
 class UsbOutputStream : public Stream {
@@ -78,22 +187,20 @@ bool UsbPrinterBackend::begin() {
 }
 
 void UsbPrinterBackend::poll() {
+  startRawServerIfNeeded();
+  handleRawServer();
+
   if (!configured_) {
     StatusLed::set(StatusLed::ERROR);
     StatusLed::update();
     return;
   }
-
   if (state_ == PRINTING) {
     StatusLed::set(StatusLed::PRINTING);
     StatusLed::update();
     return;
   }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    // Keep the Wi-Fi state visible while the USB printer is being discovered.
-    StatusLed::set(StatusLed::WIFI_CONNECTED);
-  }
+  if (WiFi.status() == WL_CONNECTED) StatusLed::set(StatusLed::WIFI_CONNECTED);
 
   switch (host_.state()) {
     case UsbHostManager::PRINTER_READY:
@@ -135,7 +242,6 @@ bool UsbPrinterBackend::sendJob(MobilePrintQueue &queue, uint32_t jobId, String 
     error = "Selected USB interface is not the standard bidirectional Printer Class protocol 0x02";
     return false;
   }
-
   UsbOutputStream output(host_);
   if (!queue.readJob(jobId, output, error)) return false;
   if (output.error().length()) {
@@ -151,23 +257,19 @@ bool UsbPrinterBackend::processNext(MobilePrintQueue &queue, String &error) {
     error = reason_;
     return false;
   }
-
   const uint32_t jobId = queue.firstPendingId();
   if (!jobId) {
     error = "no pending print job";
     return false;
   }
-
   String stateError;
   if (!queue.setState(jobId, MobilePrintQueue::STATE_PROCESSING, "usb-transfer-started", stateError)) {
     error = stateError;
     return false;
   }
-
   state_ = PRINTING;
   reason_ = "printing-job-" + String(jobId);
   StatusLed::set(StatusLed::PRINTING);
-
   if (sendJob(queue, jobId, error)) {
     if (!queue.setState(jobId, MobilePrintQueue::STATE_COMPLETED, "usb-transfer-complete", stateError)) {
       error = stateError;
@@ -181,7 +283,6 @@ bool UsbPrinterBackend::processNext(MobilePrintQueue &queue, String &error) {
     StatusLed::set(StatusLed::PRINTER_READY);
     return true;
   }
-
   queue.setState(jobId, MobilePrintQueue::STATE_ABORTED, error, stateError);
   state_ = ERROR;
   reason_ = error;
@@ -199,7 +300,6 @@ bool UsbPrinterBackend::testPrint(String &error) {
     error = "Test Print requires the standard bidirectional Printer Class protocol 0x02";
     return false;
   }
-
   state_ = PRINTING;
   reason_ = "pcl3gui-test-print";
   StatusLed::set(StatusLed::PRINTING);

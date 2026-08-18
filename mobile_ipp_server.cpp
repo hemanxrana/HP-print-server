@@ -19,244 +19,29 @@ constexpr uint16_t ST_NOT_FOUND = 0x0406;
 constexpr uint16_t ST_DOC_FORMAT = 0x040B;
 constexpr uint16_t ST_UNSUPPORTED = 0x0501;
 constexpr uint16_t ST_UNAVAILABLE = 0x0502;
-
-uint16_t get16(const uint8_t *p) { return ((uint16_t)p[0] << 8) | p[1]; }
-uint32_t get32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
-void put16(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v; }
-void put32(uint8_t *p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
-
-bool addAttr(uint8_t *out, size_t cap, size_t &pos, uint8_t tag, const char *name, const uint8_t *value, size_t len) {
-  const size_t nl = strlen(name);
-  if (nl > 65535 || len > 65535 || pos + 5 + nl + len > cap) return false;
-  out[pos++] = tag; put16(out + pos, (uint16_t)nl); pos += 2;
-  memcpy(out + pos, name, nl); pos += nl; put16(out + pos, (uint16_t)len); pos += 2;
-  if (len) memcpy(out + pos, value, len); pos += len;
-  return true;
+uint16_t get16(const uint8_t *p){return ((uint16_t)p[0]<<8)|p[1];}
+uint32_t get32(const uint8_t *p){return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];}
+void put16(uint8_t*p,uint16_t v){p[0]=v>>8;p[1]=v;}
+void put32(uint8_t*p,uint32_t v){p[0]=v>>24;p[1]=v>>16;p[2]=v>>8;p[3]=v;}
+bool addAttr(uint8_t*out,size_t cap,size_t&pos,uint8_t tag,const char*name,const uint8_t*value,size_t len){const size_t nl=strlen(name);if(nl>65535||len>65535||pos+5+nl+len>cap)return false;out[pos++]=tag;put16(out+pos,(uint16_t)nl);pos+=2;memcpy(out+pos,name,nl);pos+=nl;put16(out+pos,(uint16_t)len);pos+=2;if(len)memcpy(out+pos,value,len);pos+=len;return true;}
+bool addString(uint8_t*out,size_t cap,size_t&pos,uint8_t tag,const char*name,const String&value){return addAttr(out,cap,pos,tag,name,(const uint8_t*)value.c_str(),value.length());}
+bool addMime(uint8_t*out,size_t cap,size_t&pos,const char*name,const char*value){return addAttr(out,cap,pos,0x49,name,(const uint8_t*)value,strlen(value));}
+bool addKeyword(uint8_t*out,size_t cap,size_t&pos,const char*name,const char*value){return addAttr(out,cap,pos,0x44,name,(const uint8_t*)value,strlen(value));}
+bool addCharset(uint8_t*out,size_t cap,size_t&pos,const char*name,const char*value){return addAttr(out,cap,pos,0x47,name,(const uint8_t*)value,strlen(value));}
+bool addLanguage(uint8_t*out,size_t cap,size_t&pos,const char*name,const char*value){return addAttr(out,cap,pos,0x48,name,(const uint8_t*)value,strlen(value));}
+bool addEnum(uint8_t*out,size_t cap,size_t&pos,const char*name,uint32_t value){uint8_t b[4];put32(b,value);return addAttr(out,cap,pos,0x23,name,b,4);}
+bool addInteger(uint8_t*out,size_t cap,size_t&pos,const char*name,uint32_t value){uint8_t b[4];put32(b,value);return addAttr(out,cap,pos,0x21,name,b,4);}
+bool addBool(uint8_t*out,size_t cap,size_t&pos,const char*name,bool value){const uint8_t b=value?1:0;return addAttr(out,cap,pos,0x22,name,&b,1);}
+bool addRange(uint8_t*out,size_t cap,size_t&pos,const char*name,uint32_t lo,uint32_t hi){uint8_t b[8];put32(b,lo);put32(b+4,hi);return addAttr(out,cap,pos,0x33,name,b,8);}
+bool isPcl3Gui(String format){format.trim();format.toLowerCase();return format=="application/vnd.hp-pcl"||format=="application/vnd.hp-pcl3gui";}
+bool requested(const String&list,const char*name){if(list.isEmpty())return true;String wanted=name;wanted.toLowerCase();int start=0;while(start<(int)list.length()){int end=list.indexOf(',',start);if(end<0)end=list.length();String item=list.substring(start,end);item.trim();item.toLowerCase();if(item=="all"||item==wanted)return true;start=end+1;}return false;}
+bool readLine(WiFiClient&client,String&line,unsigned long deadline){while(millis()<deadline){if(client.available()){line=client.readStringUntil('\n');line.trim();return true;}delay(1);}return false;}
+bool readExact(WiFiClient&client,uint8_t*buffer,size_t length,unsigned long timeoutMs){size_t got=0;const unsigned long deadline=millis()+timeoutMs;while(got<length&&millis()<deadline){if(!client.available()){delay(1);continue;}int n=client.read(buffer+got,length-got);if(n<=0)return false;got+=(size_t)n;}return got==length;}
+bool readChunked(WiFiClient&client,uint8_t*buffer,size_t cap,size_t&length){length=0;while(true){String line;if(!readLine(client,line,millis()+10000))return false;int semi=line.indexOf(';');if(semi>=0)line=line.substring(0,semi);size_t chunk=strtoul(line.c_str(),nullptr,16);if(chunk==0){do{if(!readLine(client,line,millis()+5000))return false;}while(!line.isEmpty());return true;}if(chunk>cap-length||!readExact(client,buffer+length,chunk,30000))return false;length+=chunk;uint8_t crlf[2];if(!readExact(client,crlf,2,5000)||crlf[0]!='\r'||crlf[1]!='\n')return false;}}
 }
-
-bool addString(uint8_t *out, size_t cap, size_t &pos, uint8_t tag, const char *name, const String &value) {
-  return addAttr(out, cap, pos, tag, name, (const uint8_t *)value.c_str(), value.length());
-}
-bool addMime(uint8_t *out, size_t cap, size_t &pos, const char *name, const char *value) {
-  return addAttr(out, cap, pos, 0x49, name, (const uint8_t *)value, strlen(value));
-}
-bool addKeyword(uint8_t *out, size_t cap, size_t &pos, const char *name, const char *value) {
-  return addAttr(out, cap, pos, 0x44, name, (const uint8_t *)value, strlen(value));
-}
-bool addEnum(uint8_t *out, size_t cap, size_t &pos, const char *name, uint32_t value) {
-  uint8_t b[4]; put32(b, value); return addAttr(out, cap, pos, 0x23, name, b, 4);
-}
-bool addInteger(uint8_t *out, size_t cap, size_t &pos, const char *name, uint32_t value) {
-  uint8_t b[4]; put32(b, value); return addAttr(out, cap, pos, 0x21, name, b, 4);
-}
-bool addBool(uint8_t *out, size_t cap, size_t &pos, const char *name, bool value) {
-  const uint8_t b = value ? 1 : 0; return addAttr(out, cap, pos, 0x22, name, &b, 1);
-}
-bool addRange(uint8_t *out, size_t cap, size_t &pos, const char *name, uint32_t lo, uint32_t hi) {
-  uint8_t b[8]; put32(b, lo); put32(b + 4, hi); return addAttr(out, cap, pos, 0x33, name, b, 8);
-}
-
-bool isPcl3Gui(String format) {
-  format.trim(); format.toLowerCase();
-  return format == "application/vnd.hp-pcl" || format == "application/vnd.hp-pcl3gui";
-}
-
-bool requested(const String &list, const char *name) {
-  if (list.isEmpty()) return true;
-  String wanted = name; wanted.toLowerCase();
-  int start = 0;
-  while (start < (int)list.length()) {
-    int end = list.indexOf(',', start); if (end < 0) end = list.length();
-    String item = list.substring(start, end); item.trim(); item.toLowerCase();
-    if (item == "all" || item == wanted) return true;
-    start = end + 1;
-  }
-  return false;
-}
-
-bool readLine(WiFiClient &client, String &line, unsigned long deadline) {
-  while (millis() < deadline) {
-    if (client.available()) { line = client.readStringUntil('\n'); line.trim(); return true; }
-    delay(1);
-  }
-  return false;
-}
-
-bool readExact(WiFiClient &client, uint8_t *buffer, size_t length, unsigned long timeoutMs) {
-  size_t got = 0; const unsigned long deadline = millis() + timeoutMs;
-  while (got < length && millis() < deadline) {
-    if (!client.available()) { delay(1); continue; }
-    int n = client.read(buffer + got, length - got); if (n <= 0) return false; got += (size_t)n;
-  }
-  return got == length;
-}
-
-bool readChunked(WiFiClient &client, uint8_t *buffer, size_t cap, size_t &length) {
-  length = 0;
-  while (true) {
-    String line; if (!readLine(client, line, millis() + 10000)) return false;
-    int semi = line.indexOf(';'); if (semi >= 0) line = line.substring(0, semi);
-    size_t chunk = strtoul(line.c_str(), nullptr, 16);
-    if (chunk == 0) { do { if (!readLine(client, line, millis() + 5000)) return false; } while (!line.isEmpty()); return true; }
-    if (chunk > cap - length || !readExact(client, buffer + length, chunk, 30000)) return false;
-    length += chunk;
-    uint8_t crlf[2]; if (!readExact(client, crlf, 2, 5000) || crlf[0] != '\r' || crlf[1] != '\n') return false;
-  }
-}
-}
-
-MobileIppServer::MobileIppServer(uint16_t port) : server_(port), port_(port) {}
-
-void MobileIppServer::begin(const String &printerName, const String &printerUri, JobHandler handler, MobilePrintQueue *queue) {
-  printerName_ = printerName; printerUri_ = printerUri; handler_ = handler; queue_ = queue;
-  const int scheme = printerUri.indexOf("://");
-  const int slash = scheme >= 0 ? printerUri.indexOf('/', scheme + 3) : -1;
-  printerPath_ = slash >= 0 ? printerUri.substring(slash) : "/ipp/print";
-  if (printerPath_.isEmpty()) printerPath_ = "/ipp/print";
-  server_.begin(); running_ = true;
-  Serial.printf("[IPP] Listening on TCP %u at %s\n", port_, printerUri_.c_str());
-}
-
-bool MobileIppServer::readHttpBody(WiFiClient &client, uint8_t **body, size_t &length) {
-  *body = nullptr; length = 0; client.setTimeout(5);
-  String line;
-  if (!readLine(client, line, millis() + 5000) || !line.startsWith("POST ")) return false;
-  int firstSpace = line.indexOf(' ', 5); if (firstSpace < 0) return false;
-  String target = line.substring(5, firstSpace); int query = target.indexOf('?'); if (query >= 0) target = target.substring(0, query);
-  if (target != printerPath_ && target != printerPath_ + "/" && target != "/ipp/print" && target != "/ipp/print/") return false;
-
-  size_t contentLength = 0; bool haveLength = false, chunked = false, ippContentType = false, expectContinue = false;
-  const unsigned long deadline = millis() + 5000;
-  while (readLine(client, line, deadline)) {
-    if (line.isEmpty()) break;
-    String h = line; h.toLowerCase();
-    if (h.startsWith("content-length:")) { String v = h.substring(15); v.trim(); contentLength = strtoul(v.c_str(), nullptr, 10); haveLength = true; }
-    else if (h.startsWith("content-type:")) ippContentType = h.indexOf("application/ipp") >= 0;
-    else if (h.startsWith("transfer-encoding:")) chunked = h.indexOf("chunked") >= 0;
-    else if (h.startsWith("expect:")) expectContinue = h.indexOf("100-continue") >= 0;
-  }
-  if (!ippContentType || (!haveLength && !chunked) || (haveLength && contentLength > MAX_IPP_BODY)) {
-    Serial.printf("[IPP] Bad HTTP request: ipp=%d length=%d chunked=%d cl=%u\n", ippContentType, haveLength, chunked, (unsigned)contentLength);
-    return false;
-  }
-  if (expectContinue) client.print("HTTP/1.1 100 Continue\r\n\r\n");
-
-  uint8_t *buffer = (uint8_t *)ps_malloc(MAX_IPP_BODY); if (!buffer) buffer = (uint8_t *)malloc(MAX_IPP_BODY); if (!buffer) return false;
-  bool ok = false;
-  if (chunked) ok = readChunked(client, buffer, MAX_IPP_BODY, length);
-  else { length = contentLength; ok = readExact(client, buffer, length, 30000); }
-  if (!ok || length < 8) { free(buffer); Serial.printf("[IPP] Body read failed: got=%u\n", (unsigned)length); return false; }
-  *body = buffer; return true;
-}
-
-bool MobileIppServer::buildResponse(const uint8_t *request, size_t length, uint8_t *response, size_t capacity, size_t &responseLength) {
-  responseLength = 0; if (length < 8 || capacity < 64) return false;
-  uint16_t version = get16(request); if (version != 0x0100 && version != 0x0101 && version != 0x0200) version = 0x0101;
-  const uint16_t operation = get16(request + 2); const uint32_t requestId = get32(request + 4);
-
-  String documentFormat = MobilePrintProfile::FORMAT_PCL3GUI, requestedAttributes;
-  uint32_t requestedJobId = 0; size_t documentOffset = length; bool operationGroup = false; String lastName; size_t p = 8;
-  while (p < length) {
-    const uint8_t tag = request[p++];
-    if (tag == 0x03) { documentOffset = p; break; }
-    if (tag == 0x01) { operationGroup = true; continue; }
-    if (tag == 0x02 || tag == 0x04 || tag == 0x05) continue;
-    if (p + 4 > length) return false;
-    uint16_t nameLength = get16(request + p); p += 2; if (p + nameLength + 2 > length) return false;
-    String name; for (uint16_t i = 0; i < nameLength; ++i) name += (char)request[p + i];
-    if (nameLength) lastName = name; else name = lastName; p += nameLength;
-    uint16_t valueLength = get16(request + p); p += 2; if (p + valueLength > length) return false;
-    if (name == "document-format" && valueLength < 256) { documentFormat = ""; for (uint16_t i = 0; i < valueLength; ++i) documentFormat += (char)request[p + i]; }
-    else if (name == "requested-attributes" && valueLength < 2048) { String v; for (uint16_t i = 0; i < valueLength; ++i) v += (char)request[p + i]; if (!requestedAttributes.isEmpty()) requestedAttributes += ','; requestedAttributes += v; }
-    else if (name == "job-id" && valueLength == 4) requestedJobId = get32(request + p);
-    p += valueLength;
-  }
-  if (!operationGroup) return false;
-
-  uint16_t status = ST_OK; String statusMessage; uint32_t jobId = 0;
-  if (operation == OP_PRINT_JOB) {
-    if (documentOffset >= length) { status = ST_BAD_REQUEST; statusMessage = "Print-Job requires an HP PCL 3 GUI document"; }
-    else if (!isPcl3Gui(documentFormat)) { status = ST_DOC_FORMAT; statusMessage = "Only HP PCL 3 GUI (application/vnd.hp-PCL) is supported"; }
-    else if (!handler_) { status = ST_UNAVAILABLE; statusMessage = "Print backend unavailable"; }
-    else if (!handler_(request + documentOffset, length - documentOffset, documentFormat, jobId, statusMessage)) { status = ST_NOT_POSSIBLE; if (statusMessage.isEmpty()) statusMessage = "Print job rejected"; }
-  } else if (operation == OP_VALIDATE_JOB) {
-    if (documentOffset < length) { status = ST_BAD_REQUEST; statusMessage = "Validate-Job must not contain document data"; }
-    else if (!isPcl3Gui(documentFormat)) { status = ST_DOC_FORMAT; statusMessage = "Only HP PCL 3 GUI is supported"; }
-  } else if (operation == OP_CANCEL_JOB) {
-    MobilePrintQueue::JobInfo info;
-    if (!queue_ || requestedJobId == 0 || !queue_->getJob(requestedJobId, info)) { status = ST_NOT_FOUND; statusMessage = "Job not found"; }
-    else if (!queue_->cancel(requestedJobId, statusMessage)) status = ST_NOT_POSSIBLE;
-  } else if (operation == OP_GET_JOB_ATTRIBUTES) {
-    MobilePrintQueue::JobInfo info; if (!queue_ || requestedJobId == 0 || !queue_->getJob(requestedJobId, info)) { status = ST_NOT_FOUND; statusMessage = "Job not found"; }
-  } else if (operation != OP_GET_PRINTER_ATTRIBUTES && operation != OP_GET_JOBS) { status = ST_UNSUPPORTED; statusMessage = "IPP operation not supported"; }
-
-  size_t w = 0; response[w++] = version >> 8; response[w++] = version; put16(response + w, status); w += 2; put32(response + w, requestId); w += 4; response[w++] = 0x01;
-  if (!addString(response, capacity, w, 0x47, "attributes-charset", "utf-8") || !addString(response, capacity, w, 0x48, "attributes-natural-language", "en")) return false;
-  if (!statusMessage.isEmpty() && !addString(response, capacity, w, 0x41, "status-message", statusMessage)) return false;
-
-  if (operation == OP_GET_PRINTER_ATTRIBUTES && status == ST_OK) {
-    response[w++] = 0x04;
-    if (requested(requestedAttributes, "printer-uri-supported") && !addString(response, capacity, w, 0x45, "printer-uri-supported", printerUri_)) return false;
-    if (requested(requestedAttributes, "printer-name") && !addString(response, capacity, w, 0x42, "printer-name", printerName_)) return false;
-    if (requested(requestedAttributes, "printer-info") && !addString(response, capacity, w, 0x41, "printer-info", "ESP32-S3 USB HP print server")) return false;
-    if (requested(requestedAttributes, "printer-make-and-model") && !addString(response, capacity, w, 0x42, "printer-make-and-model", "HP Smart Tank 520 - PCL 3 GUI")) return false;
-    if (requested(requestedAttributes, "printer-location") && !addString(response, capacity, w, 0x42, "printer-location", "USB")) return false;
-    if (requested(requestedAttributes, "ipp-versions-supported")) { if (!addKeyword(response, capacity, w, "ipp-versions-supported", "1.1") || !addKeyword(response, capacity, w, "ipp-versions-supported", "2.0")) return false; }
-    if (requested(requestedAttributes, "operations-supported")) {
-      if (!addEnum(response, capacity, w, "operations-supported", OP_PRINT_JOB) || !addEnum(response, capacity, w, "operations-supported", OP_VALIDATE_JOB) || !addEnum(response, capacity, w, "operations-supported", OP_CANCEL_JOB) || !addEnum(response, capacity, w, "operations-supported", OP_GET_JOB_ATTRIBUTES) || !addEnum(response, capacity, w, "operations-supported", OP_GET_JOBS) || !addEnum(response, capacity, w, "operations-supported", OP_GET_PRINTER_ATTRIBUTES)) return false;
-    }
-    if (requested(requestedAttributes, "charset-configured") && !addKeyword(response, capacity, w, "charset-configured", "utf-8")) return false;
-    if (requested(requestedAttributes, "charset-supported") && !addKeyword(response, capacity, w, "charset-supported", "utf-8")) return false;
-    if (requested(requestedAttributes, "natural-language-configured") && !addKeyword(response, capacity, w, "natural-language-configured", "en")) return false;
-    if (requested(requestedAttributes, "generated-natural-language-supported") && !addKeyword(response, capacity, w, "generated-natural-language-supported", "en")) return false;
-    if (requested(requestedAttributes, "printer-state") && !addEnum(response, capacity, w, "printer-state", 3)) return false;
-    if (requested(requestedAttributes, "printer-state-reasons") && !addKeyword(response, capacity, w, "printer-state-reasons", "none")) return false;
-    if (requested(requestedAttributes, "printer-is-accepting-jobs") && !addBool(response, capacity, w, "printer-is-accepting-jobs", true)) return false;
-    if (requested(requestedAttributes, "queued-job-count") && !addInteger(response, capacity, w, "queued-job-count", queue_ ? queue_->activeCount() : 0)) return false;
-    if (requested(requestedAttributes, "document-format-supported") && !addMime(response, capacity, w, "document-format-supported", MobilePrintProfile::FORMAT_PCL3GUI)) return false;
-    if (requested(requestedAttributes, "document-format-default") && !addMime(response, capacity, w, "document-format-default", MobilePrintProfile::FORMAT_PCL3GUI)) return false;
-    if (requested(requestedAttributes, "compression-supported") && !addKeyword(response, capacity, w, "compression-supported", "none")) return false;
-    if (requested(requestedAttributes, "color-supported") && !addBool(response, capacity, w, "color-supported", true)) return false;
-    if (requested(requestedAttributes, "copies-supported") && !addRange(response, capacity, w, "copies-supported", 1, 99)) return false;
-    if (requested(requestedAttributes, "page-ranges-supported") && !addBool(response, capacity, w, "page-ranges-supported", true)) return false;
-    if (requested(requestedAttributes, "sides-supported") && !addKeyword(response, capacity, w, "sides-supported", "one-sided")) return false;
-    if (requested(requestedAttributes, "media-supported") && !addKeyword(response, capacity, w, "media-supported", "iso_a4_210x297mm")) return false;
-    if (requested(requestedAttributes, "media-default") && !addKeyword(response, capacity, w, "media-default", "iso_a4_210x297mm")) return false;
-  } else if (operation == OP_GET_JOB_ATTRIBUTES && status == ST_OK) {
-    MobilePrintQueue::JobInfo info;
-    if (queue_ && queue_->getJob(requestedJobId, info)) {
-      response[w++] = 0x02;
-      if (requested(requestedAttributes, "job-id") && !addInteger(response, capacity, w, "job-id", info.id)) return false;
-      if (requested(requestedAttributes, "job-name") && !addString(response, capacity, w, 0x42, "job-name", "Android print job")) return false;
-      if (requested(requestedAttributes, "job-state") && !addEnum(response, capacity, w, "job-state", info.state)) return false;
-      if (requested(requestedAttributes, "document-format") && !addMime(response, capacity, w, "document-format", MobilePrintProfile::FORMAT_PCL3GUI)) return false;
-    }
-  } else if (operation == OP_GET_JOBS && status == ST_OK && queue_) {
-    MobilePrintQueue::JobInfo info;
-    for (uint8_t i = 0; i < queue_->count(); ++i) {
-      if (!queue_->getJobAt(i, info)) continue;
-      response[w++] = 0x02;
-      if (requested(requestedAttributes, "job-id") && !addInteger(response, capacity, w, "job-id", info.id)) return false;
-      if (requested(requestedAttributes, "job-uri")) { String uri = printerUri_ + "/jobs/" + String(info.id); if (!addString(response, capacity, w, 0x45, "job-uri", uri)) return false; }
-      if (requested(requestedAttributes, "job-state") && !addEnum(response, capacity, w, "job-state", info.state)) return false;
-      if (requested(requestedAttributes, "document-format") && !addMime(response, capacity, w, "document-format", MobilePrintProfile::FORMAT_PCL3GUI)) return false;
-    }
-  } else if (operation == OP_PRINT_JOB && status == ST_OK) {
-    response[w++] = 0x02;
-    if (!addInteger(response, capacity, w, "job-id", jobId)) return false;
-    String jobUri = printerUri_ + "/jobs/" + String(jobId);
-    if (!addString(response, capacity, w, 0x45, "job-uri", jobUri) || !addEnum(response, capacity, w, "job-state", MobilePrintQueue::STATE_PENDING) || !addMime(response, capacity, w, "document-format", MobilePrintProfile::FORMAT_PCL3GUI)) return false;
-  }
-
-  if (w + 1 > capacity) return false; response[w++] = 0x03; responseLength = w; return true;
-}
-
-void MobileIppServer::handleClient(WiFiClient &client) {
-  uint8_t *request = nullptr; size_t requestLength = 0; uint8_t *response = (uint8_t *)malloc(RESPONSE_CAPACITY); size_t responseLength = 0;
-  const bool ok = response && readHttpBody(client, &request, requestLength) && buildResponse(request, requestLength, response, RESPONSE_CAPACITY, responseLength);
-  if (!ok) client.print("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 16\r\n\r\nBad IPP request\n");
-  else { client.printf("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: %u\r\nConnection: close\r\n\r\n", (unsigned)responseLength); client.write(response, responseLength); client.flush(); }
-  if (request) free(request); if (response) free(response); delay(1); client.stop();
-}
-
-void MobileIppServer::poll() { if (!running_) return; WiFiClient client = server_.available(); if (client) handleClient(client); }
+MobileIppServer::MobileIppServer(uint16_t port):server_(port),port_(port){}
+void MobileIppServer::begin(const String&printerName,const String&printerUri,JobHandler handler,MobilePrintQueue*queue){printerName_=printerName;printerUri_=printerUri;handler_=handler;queue_=queue;const int scheme=printerUri.indexOf("://");const int slash=scheme>=0?printerUri.indexOf('/',scheme+3):-1;printerPath_=slash>=0?printerUri.substring(slash):"/ipp/print";if(printerPath_.isEmpty())printerPath_="/ipp/print";server_.begin();running_=true;Serial.printf("[IPP] Listening on TCP %u at %s\n",port_,printerUri_.c_str());}
+bool MobileIppServer::readHttpBody(WiFiClient&client,uint8_t**body,size_t&length){*body=nullptr;length=0;client.setTimeout(5);String line;if(!readLine(client,line,millis()+5000)||!line.startsWith("POST "))return false;int firstSpace=line.indexOf(' ',5);if(firstSpace<0)return false;String target=line.substring(5,firstSpace);int query=target.indexOf('?');if(query>=0)target=target.substring(0,query);if(target!=printerPath_&&target!=printerPath_+"/"&&target!="/ipp/print"&&target!="/ipp/print/")return false;size_t contentLength=0;bool haveLength=false,chunked=false,ippContentType=false,expectContinue=false;const unsigned long deadline=millis()+5000;while(readLine(client,line,deadline)){if(line.isEmpty())break;String h=line;h.toLowerCase();if(h.startsWith("content-length:")){String v=h.substring(15);v.trim();contentLength=strtoul(v.c_str(),nullptr,10);haveLength=true;}else if(h.startsWith("content-type:"))ippContentType=h.indexOf("application/ipp")>=0;else if(h.startsWith("transfer-encoding:"))chunked=h.indexOf("chunked")>=0;else if(h.startsWith("expect:"))expectContinue=h.indexOf("100-continue")>=0;}if(!ippContentType||(!haveLength&&!chunked)||(haveLength&&contentLength>MAX_IPP_BODY)){Serial.printf("[IPP] Bad HTTP request: ipp=%d length=%d chunked=%d cl=%u\n",ippContentType,haveLength,chunked,(unsigned)contentLength);return false;}if(expectContinue)client.print("HTTP/1.1 100 Continue\r\n\r\n");uint8_t*buffer=(uint8_t*)ps_malloc(MAX_IPP_BODY);if(!buffer)buffer=(uint8_t*)malloc(MAX_IPP_BODY);if(!buffer)return false;bool ok=false;if(chunked)ok=readChunked(client,buffer,MAX_IPP_BODY,length);else{length=contentLength;ok=readExact(client,buffer,length,30000);}if(!ok||length<8){free(buffer);Serial.printf("[IPP] Body read failed: got=%u\n",(unsigned)length);return false;}*body=buffer;return true;}
+bool MobileIppServer::buildResponse(const uint8_t*request,size_t length,uint8_t*response,size_t capacity,size_t&responseLength){responseLength=0;if(length<8||capacity<64)return false;uint16_t version=get16(request);if(version!=0x0100&&version!=0x0101&&version!=0x0200)version=0x0101;const uint16_t operation=get16(request+2);const uint32_t requestId=get32(request+4);String documentFormat=MobilePrintProfile::FORMAT_PCL3GUI,requestedAttributes;uint32_t requestedJobId=0;size_t documentOffset=length;bool operationGroup=false;String lastName;size_t p=8;while(p<length){const uint8_t tag=request[p++];if(tag==0x03){documentOffset=p;break;}if(tag==0x01){operationGroup=true;continue;}if(tag==0x02||tag==0x04||tag==0x05)continue;if(p+4>length)return false;uint16_t nameLength=get16(request+p);p+=2;if(p+nameLength+2>length)return false;String name;for(uint16_t i=0;i<nameLength;++i)name+=(char)request[p+i];if(nameLength)lastName=name;else name=lastName;p+=nameLength;uint16_t valueLength=get16(request+p);p+=2;if(p+valueLength>length)return false;if(name=="document-format"&&valueLength<256){documentFormat="";for(uint16_t i=0;i<valueLength;++i)documentFormat+=(char)request[p+i];}else if(name=="requested-attributes"&&valueLength<2048){String v;for(uint16_t i=0;i<valueLength;++i)v+=(char)request[p+i];if(!requestedAttributes.isEmpty())requestedAttributes+=',';requestedAttributes+=v;}else if(name=="job-id"&&valueLength==4)requestedJobId=get32(request+p);p+=valueLength;}if(!operationGroup)return false;uint16_t status=ST_OK;String statusMessage;uint32_t jobId=0;if(operation==OP_PRINT_JOB){if(documentOffset>=length){status=ST_BAD_REQUEST;statusMessage="Print-Job requires an HP PCL 3 GUI document";}else if(!isPcl3Gui(documentFormat)){status=ST_DOC_FORMAT;statusMessage="Only HP PCL 3 GUI (application/vnd.hp-PCL) is supported";}else if(!handler_){status=ST_UNAVAILABLE;statusMessage="Print backend unavailable";}else if(!handler_(request+documentOffset,length-documentOffset,documentFormat,jobId,statusMessage)){status=ST_NOT_POSSIBLE;if(statusMessage.isEmpty())statusMessage="Print job rejected";}}else if(operation==OP_VALIDATE_JOB){if(documentOffset<length){status=ST_BAD_REQUEST;statusMessage="Validate-Job must not contain document data";}else if(!isPcl3Gui(documentFormat)){status=ST_DOC_FORMAT;statusMessage="Only HP PCL 3 GUI is supported";}}else if(operation==OP_CANCEL_JOB){MobilePrintQueue::JobInfo info;if(!queue_||requestedJobId==0||!queue_->getJob(requestedJobId,info)){status=ST_NOT_FOUND;statusMessage="Job not found";}else if(!queue_->cancel(requestedJobId,statusMessage))status=ST_NOT_POSSIBLE;}else if(operation==OP_GET_JOB_ATTRIBUTES){MobilePrintQueue::JobInfo info;if(!queue_||requestedJobId==0||!queue_->getJob(requestedJobId,info)){status=ST_NOT_FOUND;statusMessage="Job not found";}}else if(operation!=OP_GET_PRINTER_ATTRIBUTES&&operation!=OP_GET_JOBS){status=ST_UNSUPPORTED;statusMessage="IPP operation not supported";}size_t w=0;response[w++]=version>>8;response[w++]=version;put16(response+w,status);w+=2;put32(response+w,requestId);w+=4;response[w++]=0x01;if(!addCharset(response,capacity,w,"attributes-charset","utf-8")||!addLanguage(response,capacity,w,"attributes-natural-language","en"))return false;if(!statusMessage.isEmpty()&&!addString(response,capacity,w,0x41,"status-message",statusMessage))return false;if(operation==OP_GET_PRINTER_ATTRIBUTES&&status==ST_OK){response[w++]=0x04;if(requested(requestedAttributes,"printer-uri-supported")&&!addString(response,capacity,w,0x45,"printer-uri-supported",printerUri_))return false;if(requested(requestedAttributes,"printer-name")&&!addString(response,capacity,w,0x42,"printer-name",printerName_))return false;if(requested(requestedAttributes,"printer-info")&&!addString(response,capacity,w,0x41,"printer-info","ESP32-S3 USB HP print server"))return false;if(requested(requestedAttributes,"printer-make-and-model")&&!addString(response,capacity,w,0x42,"printer-make-and-model","HP Smart Tank 520 - PCL 3 GUI"))return false;if(requested(requestedAttributes,"printer-location")&&!addString(response,capacity,w,0x42,"printer-location","USB"))return false;if(requested(requestedAttributes,"ipp-versions-supported")){if(!addKeyword(response,capacity,w,"ipp-versions-supported","1.1")||!addKeyword(response,capacity,w,"ipp-versions-supported","2.0"))return false;}if(requested(requestedAttributes,"operations-supported")){if(!addEnum(response,capacity,w,"operations-supported",OP_PRINT_JOB)||!addEnum(response,capacity,w,"operations-supported",OP_VALIDATE_JOB)||!addEnum(response,capacity,w,"operations-supported",OP_CANCEL_JOB)||!addEnum(response,capacity,w,"operations-supported",OP_GET_JOB_ATTRIBUTES)||!addEnum(response,capacity,w,"operations-supported",OP_GET_JOBS)||!addEnum(response,capacity,w,"operations-supported",OP_GET_PRINTER_ATTRIBUTES))return false;}if(requested(requestedAttributes,"charset-configured")&&!addCharset(response,capacity,w,"charset-configured","utf-8"))return false;if(requested(requestedAttributes,"charset-supported")&&!addCharset(response,capacity,w,"charset-supported","utf-8"))return false;if(requested(requestedAttributes,"natural-language-configured")&&!addLanguage(response,capacity,w,"natural-language-configured","en"))return false;if(requested(requestedAttributes,"generated-natural-language-supported")&&!addLanguage(response,capacity,w,"generated-natural-language-supported","en"))return false;if(requested(requestedAttributes,"printer-state")&&!addEnum(response,capacity,w,"printer-state",3))return false;if(requested(requestedAttributes,"printer-state-reasons")&&!addKeyword(response,capacity,w,"printer-state-reasons","none"))return false;if(requested(requestedAttributes,"printer-is-accepting-jobs")&&!addBool(response,capacity,w,"printer-is-accepting-jobs",true))return false;if(requested(requestedAttributes,"queued-job-count")&&!addInteger(response,capacity,w,"queued-job-count",queue_?queue_->activeCount():0))return false;if(requested(requestedAttributes,"document-format-supported")&&!addMime(response,capacity,w,"document-format-supported",MobilePrintProfile::FORMAT_PCL3GUI))return false;if(requested(requestedAttributes,"document-format-default")&&!addMime(response,capacity,w,"document-format-default",MobilePrintProfile::FORMAT_PCL3GUI))return false;if(requested(requestedAttributes,"compression-supported")&&!addKeyword(response,capacity,w,"compression-supported","none"))return false;if(requested(requestedAttributes,"color-supported")&&!addBool(response,capacity,w,"color-supported",true))return false;if(requested(requestedAttributes,"copies-supported")&&!addRange(response,capacity,w,"copies-supported",1,99))return false;if(requested(requestedAttributes,"page-ranges-supported")&&!addBool(response,capacity,w,"page-ranges-supported",true))return false;if(requested(requestedAttributes,"sides-supported")&&!addKeyword(response,capacity,w,"sides-supported","one-sided"))return false;if(requested(requestedAttributes,"media-supported")&&!addKeyword(response,capacity,w,"media-supported","iso_a4_210x297mm"))return false;if(requested(requestedAttributes,"media-default")&&!addKeyword(response,capacity,w,"media-default","iso_a4_210x297mm"))return false;}else if(operation==OP_GET_JOB_ATTRIBUTES&&status==ST_OK){MobilePrintQueue::JobInfo info;if(queue_&&queue_->getJob(requestedJobId,info)){response[w++]=0x02;if(requested(requestedAttributes,"job-id")&&!addInteger(response,capacity,w,"job-id",info.id))return false;if(requested(requestedAttributes,"job-name")&&!addString(response,capacity,w,0x42,"job-name","Android print job"))return false;if(requested(requestedAttributes,"job-state")&&!addEnum(response,capacity,w,"job-state",info.state))return false;if(requested(requestedAttributes,"document-format")&&!addMime(response,capacity,w,"document-format",MobilePrintProfile::FORMAT_PCL3GUI))return false;}}else if(operation==OP_GET_JOBS&&status==ST_OK&&queue_){MobilePrintQueue::JobInfo info;for(uint8_t i=0;i<queue_->count();++i){if(!queue_->getJobAt(i,info))continue;response[w++]=0x02;if(requested(requestedAttributes,"job-id")&&!addInteger(response,capacity,w,"job-id",info.id))return false;if(requested(requestedAttributes,"job-uri")){String uri=printerUri_+"/jobs/"+String(info.id);if(!addString(response,capacity,w,0x45,"job-uri",uri))return false;}if(requested(requestedAttributes,"job-state")&&!addEnum(response,capacity,w,"job-state",info.state))return false;if(requested(requestedAttributes,"document-format")&&!addMime(response,capacity,w,"document-format",MobilePrintProfile::FORMAT_PCL3GUI))return false;}}else if(operation==OP_PRINT_JOB&&status==ST_OK){response[w++]=0x02;if(!addInteger(response,capacity,w,"job-id",jobId))return false;String jobUri=printerUri_+"/jobs/"+String(jobId);if(!addString(response,capacity,w,0x45,"job-uri",jobUri)||!addEnum(response,capacity,w,"job-state",MobilePrintQueue::STATE_PENDING)||!addMime(response,capacity,w,"document-format",MobilePrintProfile::FORMAT_PCL3GUI))return false;}if(w+1>capacity)return false;response[w++]=0x03;responseLength=w;return true;}
+void MobileIppServer::handleClient(WiFiClient&client){uint8_t*request=nullptr;size_t requestLength=0;uint8_t*response=(uint8_t*)malloc(RESPONSE_CAPACITY);size_t responseLength=0;const bool ok=response&&readHttpBody(client,&request,requestLength)&&buildResponse(request,requestLength,response,RESPONSE_CAPACITY,responseLength);if(!ok)client.print("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 16\r\n\r\nBad IPP request\n");else{client.printf("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",(unsigned)responseLength);client.write(response,responseLength);client.flush();}if(request)free(request);if(response)free(response);delay(1);client.stop();}
+void MobileIppServer::poll(){if(!running_)return;WiFiClient client=server_.available();if(client)handleClient(client);}

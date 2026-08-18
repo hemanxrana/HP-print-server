@@ -1,14 +1,332 @@
 #include "mobile_ipp_server.h"
 #include <stdlib.h>
 #include <string.h>
-namespace{constexpr size_t MAX_IPP_BODY=4*1024*1024,RESPONSE_CAPACITY=8192;constexpr uint16_t PJ=2,VJ=4,CJ=8,GJA=9,GJ=10,GPA=11;constexpr uint16_t OK=0, BAD=0x0400, NOTPOSSIBLE=0x0403, NOTFOUND=0x0406, FORMAT=0x040B, UNSUPPORTED=0x0501, UNAVAILABLE=0x0502;uint16_t g16(const uint8_t*p){return((uint16_t)p[0]<<8)|p[1];}void p16(uint8_t*p,uint16_t v){p[0]=v>>8;p[1]=v;}void p32(uint8_t*p,uint32_t v){p[0]=v>>24;p[1]=v>>16;p[2]=v>>8;p[3]=v;}bool raw(uint8_t*o,size_t c,size_t&p,uint8_t t,const char*n,const uint8_t*v,size_t vl){size_t nl=strlen(n);if(nl>65535||vl>65535||p+5+nl+vl>c)return false;o[p++]=t;p16(o+p,(uint16_t)nl);p+=2;memcpy(o+p,n,nl);p+=nl;p16(o+p,(uint16_t)vl);p+=2;if(vl)memcpy(o+p,v,vl);p+=vl;return true;}bool str(uint8_t*o,size_t c,size_t&p,uint8_t t,const char*n,const String&v){return raw(o,c,p,t,n,(const uint8_t*)v.c_str(),v.length());}bool i32(uint8_t*o,size_t c,size_t&p,uint8_t t,const char*n,uint32_t v){uint8_t b[4];p32(b,v);return raw(o,c,p,t,n,b,4);}bool en(uint8_t*o,size_t c,size_t&p,const char*n,uint32_t v){return i32(o,c,p,0x23,n,v);}bool boolean(uint8_t*o,size_t c,size_t&p,const char*n,bool v){return i32(o,c,p,0x22,n,v?1:0);}bool kw(uint8_t*o,size_t c,size_t&p,const char*n,const char*v){return raw(o,c,p,0x44,n,(const uint8_t*)v,strlen(v));}bool range(uint8_t*o,size_t c,size_t&p,const char*n,uint32_t a,uint32_t b){uint8_t x[8];p32(x,a);p32(x+4,b);return raw(o,c,p,0x33,n,x,8);}bool supported(const String&f){return f=="application/PCLm"||f=="image/pwg-raster"||f=="application/pdf"||f=="image/jpeg"||f=="image/urf";}bool wants(const String&r,const char*n){if(r.isEmpty()||r=="all")return true;String x=n;int s=0;while(s<(int)r.length()){int e=r.indexOf(',',s);if(e<0)e=r.length();if(r.substring(s,e)==x)return true;s=e+1;}return false;}}
-MobileIppServer::MobileIppServer(uint16_t port):server_(port),port_(port){}
-void MobileIppServer::begin(const String&n,const String&u,JobHandler h,MobilePrintQueue*q){printerName_=n;printerUri_=u;handler_=h;queue_=q;int scheme=u.indexOf("://"),slash=scheme>=0?u.indexOf('/',scheme+3):-1;printerPath_=slash>=0?u.substring(slash):String("/ipp/print");server_.begin();running_=true;Serial.printf("[IPP] Listening on TCP %u at %s\n",port_,printerUri_.c_str());}
-bool MobileIppServer::readHttpBody(WiFiClient&c,uint8_t**body,size_t&length){*body=nullptr;length=0;c.setTimeout(5);String line=c.readStringUntil('\n');line.trim();if(!line.startsWith("POST "))return false;int sp=line.indexOf(' ',5);if(sp<0)return false;String target=line.substring(5,sp);int q=target.indexOf('?');if(q>=0)target=target.substring(0,q);if(target!=printerPath_&&target!=printerPath_+"/")return false;size_t cl=0;bool ipp=false,chunked=false,haveLength=false;unsigned long d=millis()+5000;while(millis()<d){if(!c.available()){delay(1);continue;}line=c.readStringUntil('\n');line.trim();if(line.isEmpty())break;String x=line;x.toLowerCase();if(x.startsWith("content-length:")){cl=(size_t)x.substring(15).toInt();haveLength=true;}else if(x.startsWith("content-type:")&&x.indexOf("application/ipp")>=0)ipp=true;else if(x.startsWith("transfer-encoding:")&&x.indexOf("chunked")>=0)chunked=true;}if(!ipp||!haveLength||chunked||cl<8||cl>MAX_IPP_BODY)return false;uint8_t*b=(uint8_t*)ps_malloc(cl);if(!b)b=(uint8_t*)malloc(cl);if(!b)return false;size_t got=0;d=millis()+30000;while(got<cl&&millis()<d){if(!c.available()){delay(1);continue;}int n=c.read(b+got,cl-got);if(n>0)got+=(size_t)n;}if(got!=cl){free(b);return false;}*body=b;length=cl;return true;}
-bool MobileIppServer::buildResponse(const uint8_t*rq,size_t len,uint8_t*out,size_t cap,size_t&rl){rl=0;if(len<8)return false;uint16_t ver=g16(rq),op=g16(rq+2);uint32_t req=((uint32_t)rq[4]<<24)|((uint32_t)rq[5]<<16)|((uint32_t)rq[6]<<8)|rq[7];if(ver!=0x0100&&ver!=0x0101&&ver!=0x0200)ver=0x0101;String fmt="application/octet-stream",requested,which="not-completed";uint32_t requestedJob=0,limit=0;size_t p=8,doc=len;bool opGroup=false;String lastName;while(p<len){uint8_t tag=rq[p++];if(tag==3){doc=p;break;}if(tag==1){opGroup=true;continue;}if(tag==2||tag==4)continue;if(p+4>len)return false;uint16_t nl=g16(rq+p);p+=2;if(p+nl+2>len)return false;String name;if(nl){for(uint16_t i=0;i<nl;i++)name+=(char)rq[p+i];lastName=name;}else name=lastName;p+=nl;uint16_t vl=g16(rq+p);p+=2;if(p+vl>len)return false;if(name=="document-format"&&vl>0&&vl<128){fmt="";for(uint16_t i=0;i<vl;i++)fmt+=(char)rq[p+i];}else if(name=="requested-attributes"&&vl<1024){String v;for(uint16_t i=0;i<vl;i++)v+=(char)rq[p+i];if(requested.length())requested+=',';requested+=v;}else if(name=="which-jobs"&&vl<64){which="";for(uint16_t i=0;i<vl;i++)which+=(char)rq[p+i];}else if(name=="limit"&&vl==4)limit=((uint32_t)rq[p]<<24)|((uint32_t)rq[p+1]<<16)|((uint32_t)rq[p+2]<<8)|rq[p+3];else if(name=="job-id"&&vl==4)requestedJob=((uint32_t)rq[p]<<24)|((uint32_t)rq[p+1]<<16)|((uint32_t)rq[p+2]<<8)|rq[p+3];p+=vl;}if(!opGroup)return false;if(op==GJ&&requested.isEmpty())requested="job-uri,job-id";uint16_t status=OK;String error;uint32_t jobId=0;if(op==PJ){if(doc>=len)status=BAD,error="Print-Job requires document data";else if(!supported(fmt))status=FORMAT,error="Document format not supported";else if(!handler_)status=UNAVAILABLE,error="Print backend unavailable";else if(!handler_(rq+doc,len-doc,fmt,jobId,error)){status=NOTPOSSIBLE;if(error.isEmpty())error="Document rejected";}}else if(op==VJ){if(doc<len)status=BAD,error="Validate-Job must not contain document data";else if(!supported(fmt))status=FORMAT,error="Document format not supported";}else if(op==CJ){if(!queue_||requestedJob==0){status=NOTFOUND;error="Job not found";}else if(!queue_->cancel(requestedJob,error)){status=error=="Job is already finished"?NOTPOSSIBLE:NOTFOUND;}}else if(op==GJA){MobilePrintQueue::JobInfo j;if(!queue_||requestedJob==0||!queue_->getJob(requestedJob,j)){status=NOTFOUND;error="Job not found";}}else if(op!=GJ&&op!=GPA){status=UNSUPPORTED;error="IPP operation not supported";}if(op==GJ&&which!="completed"&&which!="not-completed"){status=BAD;error="Unsupported which-jobs value";}
- size_t w=0;if(cap<32)return false;out[w++]=ver>>8;out[w++]=ver;p16(out+w,status);w+=2;p32(out+w,req);w+=4;out[w++]=1;if(!str(out,cap,w,0x47,"attributes-charset","utf-8")||!str(out,cap,w,0x48,"attributes-natural-language","en"))return false;if(!error.isEmpty()&&!str(out,cap,w,0x41,"status-message",error))return false;
- auto printerAttrs=[&]()->bool{if(w>=cap)return false;out[w++]=4;bool a=true;if(wants(requested,"printer-name"))a&=str(out,cap,w,0x42,"printer-name",printerName_);if(wants(requested,"printer-make-and-model"))a&=str(out,cap,w,0x42,"printer-make-and-model","ESP32-S3 HP Print Server");if(wants(requested,"printer-info"))a&=str(out,cap,w,0x41,"printer-info","Smartphone print server");if(wants(requested,"printer-uri-supported"))a&=str(out,cap,w,0x45,"printer-uri-supported",printerUri_);if(wants(requested,"uri-authentication-supported"))a&=kw(out,cap,w,"uri-authentication-supported","none");if(wants(requested,"uri-security-supported"))a&=kw(out,cap,w,"uri-security-supported","none");if(wants(requested,"ipp-versions-supported")){a&=kw(out,cap,w,"ipp-versions-supported","1.1");a&=kw(out,cap,w,"ipp-versions-supported","2.0");}if(wants(requested,"operations-supported")){a&=en(out,cap,w,"operations-supported",PJ);a&=en(out,cap,w,"operations-supported",VJ);a&=en(out,cap,w,"operations-supported",CJ);a&=en(out,cap,w,"operations-supported",GJA);a&=en(out,cap,w,"operations-supported",GJ);a&=en(out,cap,w,"operations-supported",GPA);}if(wants(requested,"charset-configured"))a&=str(out,cap,w,0x47,"charset-configured","utf-8");if(wants(requested,"charset-supported"))a&=str(out,cap,w,0x47,"charset-supported","utf-8");if(wants(requested,"natural-language-configured"))a&=str(out,cap,w,0x48,"natural-language-configured","en");if(wants(requested,"generated-natural-language-supported"))a&=str(out,cap,w,0x48,"generated-natural-language-supported","en");if(wants(requested,"compression-supported"))a&=kw(out,cap,w,"compression-supported","none");if(wants(requested,"pdl-override-supported"))a&=kw(out,cap,w,"pdl-override-supported","not-attempted");if(wants(requested,"document-format-default"))a&=str(out,cap,w,0x49,"document-format-default","application/PCLm");if(wants(requested,"printer-is-accepting-jobs"))a&=boolean(out,cap,w,"printer-is-accepting-jobs",queue_?queue_->activeCount()<MobilePrintQueue::MAX_JOBS:false);if(wants(requested,"printer-state"))a&=en(out,cap,w,"printer-state",queue_&&queue_->activeCount()?4:3);if(wants(requested,"printer-state-reasons"))a&=kw(out,cap,w,"printer-state-reasons","none");if(wants(requested,"printer-up-time"))a&=i32(out,cap,w,0x21,"printer-up-time",millis()/1000UL);if(wants(requested,"queued-job-count"))a&=i32(out,cap,w,0x21,"queued-job-count",queue_?queue_->activeCount():0);if(wants(requested,"document-format-supported")){a&=str(out,cap,w,0x49,"document-format-supported","image/pwg-raster");a&=str(out,cap,w,0x49,"document-format-supported","application/PCLm");a&=str(out,cap,w,0x49,"document-format-supported","application/pdf");a&=str(out,cap,w,0x49,"document-format-supported","image/jpeg");a&=str(out,cap,w,0x49,"document-format-supported","image/urf");}if(wants(requested,"media-supported"))a&=kw(out,cap,w,"media-supported","iso_a4_210x297mm");if(wants(requested,"media-default"))a&=kw(out,cap,w,"media-default","iso_a4_210x297mm");if(wants(requested,"sides-supported"))a&=kw(out,cap,w,"sides-supported","one-sided");if(wants(requested,"sides-default"))a&=kw(out,cap,w,"sides-default","one-sided");if(wants(requested,"color-supported"))a&=boolean(out,cap,w,"color-supported",true);if(wants(requested,"copies-default"))a&=i32(out,cap,w,0x21,"copies-default",1);if(wants(requested,"copies-supported"))a&=range(out,cap,w,"copies-supported",1,99);return a;};
- auto jobAttrs=[&](const MobilePrintQueue::JobInfo&j,bool filter)->bool{if(w>=cap)return false;out[w++]=2;bool a=true;String uri=printerUri_+"/job-"+String(j.id);if(wants(requested,"job-id")||!filter)a&=i32(out,cap,w,0x21,"job-id",j.id);if(wants(requested,"job-uri")||!filter)a&=str(out,cap,w,0x45,"job-uri",uri);if(wants(requested,"job-printer-uri")||!filter)a&=str(out,cap,w,0x45,"job-printer-uri",printerUri_);if(wants(requested,"job-name")||!filter)a&=str(out,cap,w,0x42,"job-name","Android mobile print job");if(wants(requested,"job-originating-user-name")||!filter)a&=str(out,cap,w,0x42,"job-originating-user-name","android");if(wants(requested,"document-format")||!filter)a&=str(out,cap,w,0x49,"document-format",j.format);if(wants(requested,"job-k-octets")||!filter)a&=i32(out,cap,w,0x21,"job-k-octets",(j.size+1023)/1024);if(wants(requested,"job-state")||!filter)a&=en(out,cap,w,"job-state",j.state);if(wants(requested,"job-state-reasons")||!filter)a&=kw(out,cap,w,"job-state-reasons",j.reason.c_str());if(wants(requested,"job-printer-up-time")||!filter)a&=i32(out,cap,w,0x21,"job-printer-up-time",millis()/1000UL);return a;};
- if(op==GPA){if(!printerAttrs())return false;}else if(op==PJ&&status==OK){MobilePrintQueue::JobInfo j;if(queue_&&queue_->getJob(jobId,j)&&!jobAttrs(j,false))return false;}else if(op==GJA&&status==OK){MobilePrintQueue::JobInfo j;if(!queue_->getJob(requestedJob,j)||!jobAttrs(j,false))return false;}else if(op==GJ&&status==OK){uint8_t n=queue_?queue_->count():0,returned=0;for(uint8_t i=0;i<n;i++){MobilePrintQueue::JobInfo j;if(!queue_->getJobAt(i,j))continue;bool terminal=j.state==MobilePrintQueue::STATE_COMPLETED||j.state==MobilePrintQueue::STATE_CANCELED||j.state==MobilePrintQueue::STATE_ABORTED;bool match=which=="completed"?terminal:!terminal;if(match&&(limit==0||returned<limit)){if(!jobAttrs(j,true))return false;++returned;}}}
- if(w+1>cap)return false;out[w++]=3;rl=w;return true;}
-void MobileIppServer::handleClient(WiFiClient&c){uint8_t*b=nullptr;size_t bl=0;uint8_t*o=(uint8_t*)malloc(RESPONSE_CAPACITY);size_t ol=0;bool ok=o&&readHttpBody(c,&b,bl)&&buildResponse(b,bl,o,RESPONSE_CAPACITY,ol);if(!ok)c.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");else{c.print("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: ");c.print(ol);c.print("\r\nConnection: close\r\n\r\n");c.write(o,ol);}if(b)free(b);if(o)free(o);c.stop();}void MobileIppServer::poll(){WiFiClient c=server_.available();if(c)handleClient(c);}
+
+namespace {
+constexpr size_t MAX_IPP_BODY = 4 * 1024 * 1024;
+constexpr size_t RESPONSE_CAPACITY = 8192;
+constexpr uint16_t PJ = 2, VJ = 4, CJ = 8, GJA = 9, GJ = 10, GPA = 11;
+constexpr uint16_t IPP_OK = 0, BAD = 0x0400, NOTPOSSIBLE = 0x0403,
+                   NOTFOUND = 0x0406, FORMAT = 0x040B,
+                   UNSUPPORTED = 0x0501, UNAVAILABLE = 0x0502;
+
+uint16_t g16(const uint8_t *p) { return ((uint16_t)p[0] << 8) | p[1]; }
+void p16(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v; }
+void p32(uint8_t *p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
+
+bool raw(uint8_t *o, size_t c, size_t &p, uint8_t t, const char *n,
+         const uint8_t *v, size_t vl) {
+  size_t nl = strlen(n);
+  if (nl > 65535 || vl > 65535 || p + 5 + nl + vl > c) return false;
+  o[p++] = t;
+  p16(o + p, (uint16_t)nl); p += 2;
+  memcpy(o + p, n, nl); p += nl;
+  p16(o + p, (uint16_t)vl); p += 2;
+  if (vl) memcpy(o + p, v, vl);
+  p += vl;
+  return true;
+}
+
+bool str(uint8_t *o, size_t c, size_t &p, uint8_t t, const char *n, const String &v) {
+  return raw(o, c, p, t, n, (const uint8_t *)v.c_str(), v.length());
+}
+
+bool i32(uint8_t *o, size_t c, size_t &p, uint8_t t, const char *n, uint32_t v) {
+  uint8_t b[4]; p32(b, v); return raw(o, c, p, t, n, b, 4);
+}
+
+bool en(uint8_t *o, size_t c, size_t &p, const char *n, uint32_t v) {
+  return i32(o, c, p, 0x23, n, v);
+}
+
+bool ippBoolean(uint8_t *o, size_t c, size_t &p, const char *n, bool v) {
+  return i32(o, c, p, 0x22, n, v ? 1 : 0);
+}
+
+bool kw(uint8_t *o, size_t c, size_t &p, const char *n, const char *v) {
+  return raw(o, c, p, 0x44, n, (const uint8_t *)v, strlen(v));
+}
+
+bool range(uint8_t *o, size_t c, size_t &p, const char *n, uint32_t a, uint32_t b) {
+  uint8_t x[8]; p32(x, a); p32(x + 4, b); return raw(o, c, p, 0x33, n, x, 8);
+}
+
+bool supported(const String &f) {
+  return f == "application/PCLm" || f == "image/pwg-raster" ||
+         f == "application/pdf" || f == "image/jpeg" || f == "image/urf";
+}
+
+bool wants(const String &r, const char *n) {
+  if (r.isEmpty() || r == "all") return true;
+  String x = n;
+  int s = 0;
+  while (s < (int)r.length()) {
+    int e = r.indexOf(',', s);
+    if (e < 0) e = r.length();
+    if (r.substring(s, e) == x) return true;
+    s = e + 1;
+  }
+  return false;
+}
+}
+
+MobileIppServer::MobileIppServer(uint16_t port) : server_(port), port_(port) {}
+
+void MobileIppServer::begin(const String &n, const String &u, JobHandler h, MobilePrintQueue *q) {
+  printerName_ = n;
+  printerUri_ = u;
+  handler_ = h;
+  queue_ = q;
+  int scheme = u.indexOf("://");
+  int slash = scheme >= 0 ? u.indexOf('/', scheme + 3) : -1;
+  printerPath_ = slash >= 0 ? u.substring(slash) : String("/ipp/print");
+  server_.begin();
+  running_ = true;
+  Serial.printf("[IPP] Listening on TCP %u at %s\n", port_, printerUri_.c_str());
+}
+
+bool MobileIppServer::readHttpBody(WiFiClient &c, uint8_t **body, size_t &length) {
+  *body = nullptr; length = 0;
+  c.setTimeout(5);
+  String line = c.readStringUntil('\n');
+  line.trim();
+  if (!line.startsWith("POST ")) return false;
+  int sp = line.indexOf(' ', 5);
+  if (sp < 0) return false;
+  String target = line.substring(5, sp);
+  int q = target.indexOf('?');
+  if (q >= 0) target = target.substring(0, q);
+  if (target != printerPath_ && target != printerPath_ + "/") return false;
+
+  size_t cl = 0;
+  bool ipp = false, chunked = false, haveLength = false;
+  unsigned long deadline = millis() + 5000;
+  while (millis() < deadline) {
+    if (!c.available()) { delay(1); continue; }
+    line = c.readStringUntil('\n');
+    line.trim();
+    if (line.isEmpty()) break;
+    String x = line;
+    x.toLowerCase();
+    if (x.startsWith("content-length:")) {
+      cl = (size_t)x.substring(15).toInt();
+      haveLength = true;
+    } else if (x.startsWith("content-type:") && x.indexOf("application/ipp") >= 0) {
+      ipp = true;
+    } else if (x.startsWith("transfer-encoding:") && x.indexOf("chunked") >= 0) {
+      chunked = true;
+    }
+  }
+  if (!ipp || !haveLength || chunked || cl < 8 || cl > MAX_IPP_BODY) return false;
+
+  uint8_t *b = (uint8_t *)ps_malloc(cl);
+  if (!b) b = (uint8_t *)malloc(cl);
+  if (!b) return false;
+  size_t got = 0;
+  deadline = millis() + 30000;
+  while (got < cl && millis() < deadline) {
+    if (!c.available()) { delay(1); continue; }
+    int n = c.read(b + got, cl - got);
+    if (n > 0) got += (size_t)n;
+  }
+  if (got != cl) { free(b); return false; }
+  *body = b; length = cl; return true;
+}
+
+bool MobileIppServer::buildResponse(const uint8_t *rq, size_t len, uint8_t *out,
+                                     size_t cap, size_t &rl) {
+  rl = 0;
+  if (len < 8) return false;
+  uint16_t ver = g16(rq), op = g16(rq + 2);
+  uint32_t req = ((uint32_t)rq[4] << 24) | ((uint32_t)rq[5] << 16) |
+                 ((uint32_t)rq[6] << 8) | rq[7];
+  if (ver != 0x0100 && ver != 0x0101 && ver != 0x0200) ver = 0x0101;
+
+  String fmt = "application/octet-stream", requested, which = "not-completed";
+  uint32_t requestedJob = 0, limit = 0;
+  size_t p = 8, doc = len;
+  bool opGroup = false;
+  String lastName;
+
+  while (p < len) {
+    uint8_t tag = rq[p++];
+    if (tag == 3) { doc = p; break; }
+    if (tag == 1) { opGroup = true; continue; }
+    if (tag == 2 || tag == 4) continue;
+    if (p + 4 > len) return false;
+    uint16_t nl = g16(rq + p); p += 2;
+    if (p + nl + 2 > len) return false;
+    String name;
+    if (nl) {
+      for (uint16_t i = 0; i < nl; i++) name += (char)rq[p + i];
+      lastName = name;
+    } else name = lastName;
+    p += nl;
+    uint16_t vl = g16(rq + p); p += 2;
+    if (p + vl > len) return false;
+    if (name == "document-format" && vl > 0 && vl < 128) {
+      fmt = ""; for (uint16_t i = 0; i < vl; i++) fmt += (char)rq[p + i];
+    } else if (name == "requested-attributes" && vl < 1024) {
+      String v; for (uint16_t i = 0; i < vl; i++) v += (char)rq[p + i];
+      if (requested.length()) requested += ','; requested += v;
+    } else if (name == "which-jobs" && vl < 64) {
+      which = ""; for (uint16_t i = 0; i < vl; i++) which += (char)rq[p + i];
+    } else if (name == "limit" && vl == 4) {
+      limit = ((uint32_t)rq[p] << 24) | ((uint32_t)rq[p + 1] << 16) |
+              ((uint32_t)rq[p + 2] << 8) | rq[p + 3];
+    } else if (name == "job-id" && vl == 4) {
+      requestedJob = ((uint32_t)rq[p] << 24) | ((uint32_t)rq[p + 1] << 16) |
+                     ((uint32_t)rq[p + 2] << 8) | rq[p + 3];
+    }
+    p += vl;
+  }
+
+  if (!opGroup) return false;
+  if (op == GJ && requested.isEmpty()) requested = "job-uri,job-id";
+  uint16_t status = IPP_OK;
+  String error;
+  uint32_t jobId = 0;
+
+  if (op == PJ) {
+    if (doc >= len) status = BAD, error = "Print-Job requires document data";
+    else if (!supported(fmt)) status = FORMAT, error = "Document format not supported";
+    else if (!handler_) status = UNAVAILABLE, error = "Print backend unavailable";
+    else if (!handler_(rq + doc, len - doc, fmt, jobId, error)) {
+      status = NOTPOSSIBLE;
+      if (error.isEmpty()) error = "Document rejected";
+    }
+  } else if (op == VJ) {
+    if (doc < len) status = BAD, error = "Validate-Job must not contain document data";
+    else if (!supported(fmt)) status = FORMAT, error = "Document format not supported";
+  } else if (op == CJ) {
+    if (!queue_ || requestedJob == 0) { status = NOTFOUND; error = "Job not found"; }
+    else if (!queue_->cancel(requestedJob, error)) {
+      status = error == "Job is already finished" ? NOTPOSSIBLE : NOTFOUND;
+    }
+  } else if (op == GJA) {
+    MobilePrintQueue::JobInfo j;
+    if (!queue_ || requestedJob == 0 || !queue_->getJob(requestedJob, j)) {
+      status = NOTFOUND; error = "Job not found";
+    }
+  } else if (op != GJ && op != GPA) {
+    status = UNSUPPORTED; error = "IPP operation not supported";
+  }
+  if (op == GJ && which != "completed" && which != "not-completed") {
+    status = BAD; error = "Unsupported which-jobs value";
+  }
+
+  size_t w = 0;
+  if (cap < 32) return false;
+  out[w++] = ver >> 8; out[w++] = ver;
+  p16(out + w, status); w += 2;
+  p32(out + w, req); w += 4;
+  out[w++] = 1;
+  if (!str(out, cap, w, 0x47, "attributes-charset", "utf-8") ||
+      !str(out, cap, w, 0x48, "attributes-natural-language", "en")) return false;
+  if (!error.isEmpty() && !str(out, cap, w, 0x41, "status-message", error)) return false;
+
+  auto printerAttrs = [&]() -> bool {
+    if (w >= cap) return false;
+    out[w++] = 4;
+    bool a = true;
+    if (wants(requested, "printer-name")) a &= str(out, cap, w, 0x42, "printer-name", printerName_);
+    if (wants(requested, "printer-make-and-model")) a &= str(out, cap, w, 0x42, "printer-make-and-model", "ESP32-S3 HP Print Server");
+    if (wants(requested, "printer-info")) a &= str(out, cap, w, 0x41, "printer-info", "Smartphone print server");
+    if (wants(requested, "printer-uri-supported")) a &= str(out, cap, w, 0x45, "printer-uri-supported", printerUri_);
+    if (wants(requested, "uri-authentication-supported")) a &= kw(out, cap, w, "uri-authentication-supported", "none");
+    if (wants(requested, "uri-security-supported")) a &= kw(out, cap, w, "uri-security-supported", "none");
+    if (wants(requested, "ipp-versions-supported")) { a &= kw(out, cap, w, "ipp-versions-supported", "1.1"); a &= kw(out, cap, w, "ipp-versions-supported", "2.0"); }
+    if (wants(requested, "operations-supported")) { a &= en(out, cap, w, "operations-supported", PJ); a &= en(out, cap, w, "operations-supported", VJ); a &= en(out, cap, w, "operations-supported", CJ); a &= en(out, cap, w, "operations-supported", GJA); a &= en(out, cap, w, "operations-supported", GJ); a &= en(out, cap, w, "operations-supported", GPA); }
+    if (wants(requested, "charset-configured")) a &= str(out, cap, w, 0x47, "charset-configured", "utf-8");
+    if (wants(requested, "charset-supported")) a &= str(out, cap, w, 0x47, "charset-supported", "utf-8");
+    if (wants(requested, "natural-language-configured")) a &= str(out, cap, w, 0x48, "natural-language-configured", "en");
+    if (wants(requested, "generated-natural-language-supported")) a &= str(out, cap, w, 0x48, "generated-natural-language-supported", "en");
+    if (wants(requested, "compression-supported")) a &= kw(out, cap, w, "compression-supported", "none");
+    if (wants(requested, "pdl-override-supported")) a &= kw(out, cap, w, "pdl-override-supported", "not-attempted");
+    if (wants(requested, "document-format-default")) a &= str(out, cap, w, 0x49, "document-format-default", "application/PCLm");
+    if (wants(requested, "printer-is-accepting-jobs")) a &= ippBoolean(out, cap, w, "printer-is-accepting-jobs", queue_ ? queue_->activeCount() < MobilePrintQueue::MAX_JOBS : false);
+    if (wants(requested, "printer-state")) a &= en(out, cap, w, "printer-state", queue_ && queue_->activeCount() ? 4 : 3);
+    if (wants(requested, "printer-state-reasons")) a &= kw(out, cap, w, "printer-state-reasons", "none");
+    if (wants(requested, "printer-up-time")) a &= i32(out, cap, w, 0x21, "printer-up-time", millis() / 1000UL);
+    if (wants(requested, "queued-job-count")) a &= i32(out, cap, w, 0x21, "queued-job-count", queue_ ? queue_->activeCount() : 0);
+    if (wants(requested, "document-format-supported")) { a &= str(out, cap, w, 0x49, "document-format-supported", "image/pwg-raster"); a &= str(out, cap, w, 0x49, "document-format-supported", "application/PCLm"); a &= str(out, cap, w, 0x49, "document-format-supported", "application/pdf"); a &= str(out, cap, w, 0x49, "document-format-supported", "image/jpeg"); a &= str(out, cap, w, 0x49, "document-format-supported", "image/urf"); }
+    if (wants(requested, "media-supported")) a &= kw(out, cap, w, "media-supported", "iso_a4_210x297mm");
+    if (wants(requested, "media-default")) a &= kw(out, cap, w, "media-default", "iso_a4_210x297mm");
+    if (wants(requested, "sides-supported")) a &= kw(out, cap, w, "sides-supported", "one-sided");
+    if (wants(requested, "sides-default")) a &= kw(out, cap, w, "sides-default", "one-sided");
+    if (wants(requested, "color-supported")) a &= ippBoolean(out, cap, w, "color-supported", true);
+    if (wants(requested, "copies-default")) a &= i32(out, cap, w, 0x21, "copies-default", 1);
+    if (wants(requested, "copies-supported")) a &= range(out, cap, w, "copies-supported", 1, 99);
+    return a;
+  };
+
+  auto jobAttrs = [&](const MobilePrintQueue::JobInfo &j, bool filter) -> bool {
+    if (w >= cap) return false;
+    out[w++] = 2; bool a = true;
+    String uri = printerUri_ + "/job-" + String(j.id);
+    if (wants(requested, "job-id") || !filter) a &= i32(out, cap, w, 0x21, "job-id", j.id);
+    if (wants(requested, "job-uri") || !filter) a &= str(out, cap, w, 0x45, "job-uri", uri);
+    if (wants(requested, "job-printer-uri") || !filter) a &= str(out, cap, w, 0x45, "job-printer-uri", printerUri_);
+    if (wants(requested, "job-name") || !filter) a &= str(out, cap, w, 0x42, "job-name", "Android mobile print job");
+    if (wants(requested, "job-originating-user-name") || !filter) a &= str(out, cap, w, 0x42, "job-originating-user-name", "android");
+    if (wants(requested, "document-format") || !filter) a &= str(out, cap, w, 0x49, "document-format", j.format);
+    if (wants(requested, "job-k-octets") || !filter) a &= i32(out, cap, w, 0x21, "job-k-octets", (j.size + 1023) / 1024);
+    if (wants(requested, "job-state") || !filter) a &= en(out, cap, w, "job-state", j.state);
+    if (wants(requested, "job-state-reasons") || !filter) a &= kw(out, cap, w, "job-state-reasons", j.reason.c_str());
+    if (wants(requested, "job-printer-up-time") || !filter) a &= i32(out, cap, w, 0x21, "job-printer-up-time", millis() / 1000UL);
+    return a;
+  };
+
+  if (op == GPA) {
+    if (!printerAttrs()) return false;
+  } else if (op == PJ && status == IPP_OK) {
+    MobilePrintQueue::JobInfo j;
+    if (queue_ && queue_->getJob(jobId, j) && !jobAttrs(j, false)) return false;
+  } else if (op == GJA && status == IPP_OK) {
+    MobilePrintQueue::JobInfo j;
+    if (!queue_->getJob(requestedJob, j) || !jobAttrs(j, false)) return false;
+  } else if (op == GJ && status == IPP_OK) {
+    uint8_t n = queue_ ? queue_->count() : 0, returned = 0;
+    for (uint8_t i = 0; i < n; i++) {
+      MobilePrintQueue::JobInfo j;
+      if (!queue_->getJobAt(i, j)) continue;
+      bool terminal = j.state == MobilePrintQueue::STATE_COMPLETED ||
+                      j.state == MobilePrintQueue::STATE_CANCELED ||
+                      j.state == MobilePrintQueue::STATE_ABORTED;
+      bool match = which == "completed" ? terminal : !terminal;
+      if (match && (limit == 0 || returned < limit)) {
+        if (!jobAttrs(j, true)) return false;
+        ++returned;
+      }
+    }
+  }
+
+  if (w + 1 > cap) return false;
+  out[w++] = 3;
+  rl = w;
+  return true;
+}
+
+void MobileIppServer::handleClient(WiFiClient &c) {
+  uint8_t *b = nullptr;
+  size_t bl = 0;
+  uint8_t *o = (uint8_t *)malloc(RESPONSE_CAPACITY);
+  size_t ol = 0;
+  bool ok = o && readHttpBody(c, &b, bl) && buildResponse(b, bl, o, RESPONSE_CAPACITY, ol);
+  if (!ok) {
+    c.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+  } else {
+    c.print("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: ");
+    c.print(ol);
+    c.print("\r\nConnection: close\r\n\r\n");
+    c.write(o, ol);
+  }
+  if (b) free(b);
+  if (o) free(o);
+  c.stop();
+}
+
+void MobileIppServer::poll() {
+  WiFiClient c = server_.available();
+  if (c) handleClient(c);
+}

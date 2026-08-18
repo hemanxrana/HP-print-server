@@ -149,11 +149,15 @@ bool UsbPrinterBackend::processNext(MobilePrintQueue&queue,String&error){
   state_=PRINTING;reason_="printing-job-"+String(jobId);StatusLed::set(StatusLed::PRINTING);
   if(sendJob(queue,jobId,error)){
     if(!queue.setState(jobId,MobilePrintQueue::STATE_COMPLETED,"usb-transfer-complete",stateError)){error=stateError;state_=ERROR;reason_=error;StatusLed::set(StatusLed::ERROR);return false;}
+    String cleanupError;
+    if(!queue.removeJob(jobId,cleanupError))Serial.printf("[PRINT] Warning: completed job cleanup failed: %s\n",cleanupError.c_str());
     state_=IDLE;reason_="printer-interface-ready";StatusLed::set(StatusLed::PRINTER_READY);
     Serial.printf("[PRINT] Job %lu transferred to USB printer; printer decides whether the data is supported\n",(unsigned long)jobId);
     return true;
   }
   queue.setState(jobId,MobilePrintQueue::STATE_ABORTED,error,stateError);
+  String cleanupError;
+  if(!queue.removeJob(jobId,cleanupError))Serial.printf("[PRINT] Warning: failed job cleanup failed: %s\n",cleanupError.c_str());
   state_=ERROR;reason_=error;StatusLed::set(StatusLed::ERROR);
   Serial.printf("[PRINT] Job %lu failed: %s\n",(unsigned long)jobId,error.c_str());
   return false;

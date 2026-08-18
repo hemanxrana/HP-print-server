@@ -7,12 +7,12 @@ public:
   enum State : uint8_t { STATE_PENDING = 3, STATE_PROCESSING = 5, STATE_CANCELED = 7, STATE_ABORTED = 8, STATE_COMPLETED = 9 };
   struct JobInfo { uint32_t id=0; size_t size=0; String format; State state=STATE_PENDING; String reason; };
   static constexpr uint8_t MAX_JOBS=8;
-  // Keep the IPP request allocation bounded so printer-information queries do
-  // not require a contiguous 4 MiB PSRAM block. PCL 3 GUI jobs are still
-  // accepted up to this limit and the queue stores them in LittleFS.
   static constexpr size_t MAX_JOB_BYTES=2*1024*1024;
   bool begin();
   bool enqueue(const uint8_t*data,size_t length,const String&format,uint32_t&jobId,String&error);
+  // Adopt a file that was already streamed to LittleFS. This avoids keeping
+  // large RAW/JetDirect jobs in RAM or PSRAM before they enter the queue.
+  bool enqueueSpoolFile(const String&sourcePath,size_t length,const String&format,uint32_t&jobId,String&error);
   bool getJob(uint32_t id,JobInfo&info) const;
   uint8_t count() const;
   uint8_t activeCount() const;

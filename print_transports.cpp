@@ -1,13 +1,113 @@
 #include "print_transports.h"
 #include <WiFi.h>
 #include <string.h>
-static bool connectClient(WiFiClient&c,const PrintTarget&t,uint16_t fallback,uint32_t timeout){c.setTimeout(timeout/1000+1);uint16_t port=t.port?t.port:fallback;if(t.address!=IPAddress(0,0,0,0))return c.connect(t.address,port,timeout);return !t.host.isEmpty()&&c.connect(t.host.c_str(),port,timeout);}
-static bool writeAll(WiFiClient&c,const uint8_t*d,size_t n){size_t sent=0;while(sent<n){size_t w=c.write(d+sent,n-sent);if(!w)return false;sent+=w;yield();}return true;}
-static bool lprAck(WiFiClient&c){unsigned long until=millis()+5000;while(!c.available()&&millis()<until)delay(1);return c.available()&&c.read()==0;}
-bool Raw9100Transport::send(const PrintTarget&t,const uint8_t*d,size_t n,uint32_t timeout){if(!d||!n)return false;WiFiClient c;if(!connectClient(c,t,9100,timeout))return false;bool ok=writeAll(c,d,n);c.flush();delay(20);c.stop();return ok;}
-bool LprTransport::send(const PrintTarget&t,const uint8_t*d,size_t n,const String&q,uint32_t timeout){if(!d||!n||q.isEmpty()||q.length()>255)return false;WiFiClient c;if(!connectClient(c,t,515,timeout))return false;uint8_t cmd=2;if(!c.write(&cmd,1)||!writeAll(c,(const uint8_t*)q.c_str(),q.length())||!c.write((uint8_t)'\n')||!lprAck(c)){c.stop();return false;}String host=WiFi.getHostname();if(host.isEmpty())host="esp32";String controlName="cfA001esp32",dataName="dfA001esp32";String control="H"+host+"\nJ"+dataName+"\nP"+host+"\nl"+dataName+"\nU"+dataName+"\nN"+dataName+"\n";cmd=2;if(!c.write(&cmd,1)){c.stop();return false;}String h=String(control.length())+" "+controlName+"\n";if(!writeAll(c,(const uint8_t*)h.c_str(),h.length())||!lprAck(c)||!writeAll(c,(const uint8_t*)control.c_str(),control.length())||!c.write((uint8_t)0)||!lprAck(c)){c.stop();return false;}cmd=3;if(!c.write(&cmd,1)){c.stop();return false;}h=String(n)+" "+dataName+"\n";if(!writeAll(c,(const uint8_t*)h.c_str(),h.length())||!lprAck(c)||!writeAll(c,d,n)||!c.write((uint8_t)0)||!lprAck(c)){c.stop();return false;}c.stop();return true;}
-static void put16(uint8_t*p,uint16_t v){p[0]=v>>8;p[1]=v;}static void put32(uint8_t*p,uint32_t v){p[0]=v>>24;p[1]=v>>16;p[2]=v>>8;p[3]=v;}
-static bool attr(uint8_t*b,size_t cap,size_t&pos,uint8_t tag,const char*name,const uint8_t*v,size_t n){size_t nl=strlen(name);if(nl>65535||n>65535||pos+5+nl+n>cap)return false;b[pos++]=tag;put16(b+pos,nl);pos+=2;memcpy(b+pos,name,nl);pos+=nl;put16(b+pos,n);pos+=2;memcpy(b+pos,v,n);pos+=n;return true;}
-static bool sattr(uint8_t*b,size_t cap,size_t&pos,uint8_t tag,const char*n,const String&v){return attr(b,cap,pos,tag,n,(const uint8_t*)v.c_str(),v.length());}
-static bool iattr(uint8_t*b,size_t cap,size_t&pos,uint8_t tag,const char*n,uint32_t v){uint8_t x[4];put32(x,v);return attr(b,cap,pos,tag,n,x,4);}
-bool IppTransport::buildPrintJobRequest(uint8_t*b,size_t cap,size_t&length,const String&uri,const String&user,uint32_t requestId,const uint8_t*d,size_t n){length=0;if(!b||!d||!uri.length()||n>cap)return false;size_t p=0;if(cap<64)return false;b[p++]=1;b[p++]=1;put16(b+p,0x0002);p+=2;put32(b+p,requestId);p+=4;b[p++]=1;if(!sattr(b,cap,p,0x47,"attributes-charset","utf-8")||!sattr(b,cap,p,0x48,"attributes-natural-language","en")||!sattr(b,cap,p,0x45,"printer-uri",uri)||!sattr(b,cap,p,0x42,"requesting-user-name",user.isEmpty()?String("android"):user)||!sattr(b,cap,p,0x49,"document-format","application/octet-stream"))return false;if(p+1+n>cap)return false;b[p++]=3;memcpy(b+p,d,n);p+=n;length=p;return true;}
+
+static bool connectClient(WiFiClient& c, const PrintTarget& t, uint16_t fallback,
+                          uint32_t timeout) {
+  c.setTimeout(timeout / 1000 + 1);
+  uint16_t port = t.port ? t.port : fallback;
+  if (t.address != IPAddress(0, 0, 0, 0)) {
+    return c.connect(t.address, port, timeout);
+  }
+  return !t.host.isEmpty() && c.connect(t.host.c_str(), port, timeout);
+}
+
+static bool writeAll(WiFiClient& c, const uint8_t* d, size_t n) {
+  size_t sent = 0;
+  while (sent < n) {
+    size_t w = c.write(d + sent, n - sent);
+    if (!w) return false;
+    sent += w;
+    yield();
+  }
+  return true;
+}
+
+bool Raw9100Transport::send(const PrintTarget& t, const uint8_t* d, size_t n,
+                            uint32_t timeout) {
+  if (!d || !n) return false;
+
+  WiFiClient c;
+  if (!connectClient(c, t, 9100, timeout)) return false;
+
+  bool ok = writeAll(c, d, n);
+  c.flush();
+  delay(20);
+  c.stop();
+  return ok;
+}
+
+static void put16(uint8_t* p, uint16_t v) {
+  p[0] = v >> 8;
+  p[1] = v;
+}
+
+static void put32(uint8_t* p, uint32_t v) {
+  p[0] = v >> 24;
+  p[1] = v >> 16;
+  p[2] = v >> 8;
+  p[3] = v;
+}
+
+static bool attr(uint8_t* b, size_t cap, size_t& pos, uint8_t tag,
+                 const char* name, const uint8_t* v, size_t n) {
+  size_t nl = strlen(name);
+  if (nl > 65535 || n > 65535 || pos + 5 + nl + n > cap) return false;
+
+  b[pos++] = tag;
+  put16(b + pos, nl);
+  pos += 2;
+  memcpy(b + pos, name, nl);
+  pos += nl;
+  put16(b + pos, n);
+  pos += 2;
+  memcpy(b + pos, v, n);
+  pos += n;
+  return true;
+}
+
+static bool sattr(uint8_t* b, size_t cap, size_t& pos, uint8_t tag,
+                  const char* n, const String& v) {
+  return attr(b, cap, pos, tag, n, (const uint8_t*)v.c_str(), v.length());
+}
+
+static bool iattr(uint8_t* b, size_t cap, size_t& pos, uint8_t tag,
+                  const char* n, uint32_t v) {
+  uint8_t x[4];
+  put32(x, v);
+  return attr(b, cap, pos, tag, n, x, 4);
+}
+
+bool IppTransport::buildPrintJobRequest(uint8_t* b, size_t cap, size_t& length,
+                                         const String& uri, const String& user,
+                                         uint32_t requestId, const uint8_t* d,
+                                         size_t n) {
+  length = 0;
+  if (!b || !d || !uri.length() || n > cap) return false;
+  size_t p = 0;
+  if (cap < 64) return false;
+
+  b[p++] = 1;
+  b[p++] = 1;
+  put16(b + p, 0x0002);
+  p += 2;
+  put32(b + p, requestId);
+  p += 4;
+  b[p++] = 1;
+
+  if (!sattr(b, cap, p, 0x47, "attributes-charset", "utf-8") ||
+      !sattr(b, cap, p, 0x48, "attributes-natural-language", "en") ||
+      !sattr(b, cap, p, 0x45, "printer-uri", uri) ||
+      !sattr(b, cap, p, 0x42, "requesting-user-name",
+             user.isEmpty() ? String("android") : user) ||
+      !sattr(b, cap, p, 0x49, "document-format", "application/octet-stream")) {
+    return false;
+  }
+
+  if (p + 1 + n > cap) return false;
+  b[p++] = 3;
+  memcpy(b + p, d, n);
+  p += n;
+  length = p;
+  return true;
+}

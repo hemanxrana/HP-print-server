@@ -2,6 +2,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include "usb_host_manager.h"
+#include "usb_printer_backend.h"
 
 // ESP32-S3 Arduino-ESP32 3.x RGB status LED support.
 // Uses the core's RGB_BUILTIN/rgbLedWrite() API; no extra library is required.
@@ -90,12 +92,6 @@ void writeLed(LedColor c) {
               (uint8_t)((uint16_t)c.b * scale / 255));
 }
 
-String htmlEscape(String s) {
-  s.replace("&", "&amp;"); s.replace("<", "&lt;");
-  s.replace(">", "&gt;"); s.replace("\"", "&quot;");
-  return s;
-}
-
 LedColor getArgColor(const char *name, LedColor fallback) {
   if (!configServer.hasArg(name)) return fallback;
   String v = configServer.arg(name); v.trim();
@@ -176,14 +172,11 @@ void ledTask(void *) {
 }
 }
 
-// Arduino-ESP32 calls initVariant() before setup(). This lets the LED module
-// register its web routes without requiring changes to the main sketch.
 void initVariant() {
   loadLedConfig();
   rgbLedWrite(RGB_BUILTIN, 0, 0, 0);
   configServer.on("/led", HTTP_GET, handleLedGet);
   configServer.on("/led", HTTP_POST, handleLedPost);
-  // Register first so the existing / handler is augmented with an LED card.
   configServer.on("/", HTTP_GET, handleLedRoot);
   if (!ledTaskStarted) {
     ledTaskStarted = true;

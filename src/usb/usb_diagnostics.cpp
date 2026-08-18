@@ -8,20 +8,19 @@ void printDevice(const UsbDeviceInfo &d, Stream &out) {
   if (d.manufacturer.length()) out.printf("[USB] Manufacturer: %s\n", d.manufacturer.c_str());
   if (d.product.length()) out.printf("[USB] Product: %s\n", d.product.c_str());
   if (d.serial.length()) out.printf("[USB] Serial: %s\n", d.serial.c_str());
-  if (!d.printer.found) {
-    out.println("[USB] Printer Class interface: not found");
+
+  if (!d.printerInterfaceCount) {
+    out.println("[USB] Printer Class interfaces: none");
     return;
   }
-  out.printf("[USB] Printer interface: %u alt=%u subclass=0x%02X protocol=0x%02X\n",
-             d.printer.interfaceNumber, d.printer.alternateSetting,
-             d.printer.subclass, d.printer.protocol);
-  if (d.printer.bulkOut.valid()) {
-    out.printf("[USB] Bulk OUT: 0x%02X maxPacket=%u\n",
-               d.printer.bulkOut.address, d.printer.bulkOut.maxPacketSize);
-  }
-  if (d.printer.bulkIn.valid()) {
-    out.printf("[USB] Bulk IN: 0x%02X maxPacket=%u\n",
-               d.printer.bulkIn.address, d.printer.bulkIn.maxPacketSize);
+
+  out.printf("[USB] Printer Class candidates: %u\n", d.printerInterfaceCount);
+  for (uint8_t i = 0; i < d.printerInterfaceCount; ++i) {
+    const UsbPrinterInterfaceInfo &p = d.printerInterfaces[i];
+    out.printf("  #%u IF=%u ALT=%u subclass=0x%02X protocol=0x%02X OUT=0x%02X IN=0x%02X%s\n",
+               i, p.interfaceNumber, p.alternateSetting, p.subclass, p.protocol,
+               p.bulkOut.address, p.bulkIn.address,
+               (p.interfaceNumber == d.printer.interfaceNumber && p.alternateSetting == d.printer.alternateSetting) ? " [ACTIVE]" : "");
   }
 }
 }

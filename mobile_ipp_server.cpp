@@ -61,9 +61,16 @@ bool readLine(WiFiClient&client,String&line,unsigned long deadline){
   while((long)(deadline-millis())>0){if(client.available()){line=client.readStringUntil('\n');line.trim();return true;}delay(1);}return false;
 }
 
+// WiFiClient::read() can transiently return 0 even after available() reported
+// data. Treat that as a short wait instead of aborting the HTTP/IPP request.
 bool readExact(WiFiClient&client,uint8_t*buffer,size_t length,unsigned long timeoutMs){
-  size_t got=0;unsigned long deadline=millis()+timeoutMs;
-  while(got<length&&(long)(deadline-millis())>0){if(!client.available()){delay(1);continue;}int n=client.read(buffer+got,length-got);if(n<=0)return false;got+=(size_t)n;}
+  size_t got=0;const unsigned long deadline=millis()+timeoutMs;
+  while(got<length&&(long)(deadline-millis())>0){
+    if(!client.available()){delay(1);continue;}
+    int n=client.read(buffer+got,length-got);
+    if(n>0){got+=(size_t)n;continue;}
+    delay(1);
+  }
   return got==length;
 }
 
@@ -74,7 +81,27 @@ bool appendChunked(WiFiClient&client,uint8_t*&buffer,size_t&capacity,size_t&leng
 }
 
 bool readChunked(WiFiClient&client,uint8_t*&buffer,size_t&capacity,size_t&length){
-  length=0;while(true){String line;if(!readLine(client,line,millis()+10000))return false;int semi=line.indexOf(';');if(semi>=0)line=line.substring(0,semi);line.trim();char*end=nullptr;unsigned long parsed=strtoul(line.c_str(),&end,16);if(end==line.c_str()||*end!='\0'||parsed>MAX_IPP_BODY-length)return false;size_t chunk=(size_t)parsed;if(chunk==0){do{if(!readLine(client,line,millis()+5000))return false;}while(!line.isEmpty());return true;}if(!appendChunked(client,buffer,capacity,length,chunk))return false;uint8_t crlf[2];if(!readExact(client,crlf,2,5000)||crlf[0]!='\r'||crlf[1]!='\n')return false;}
+  length=0;
+  while(true){
+    String line;
+    if(!readLine(client,line,millis()+10000))return false;
+    int semi=line.indexOf(';');if(semi>=0)line=line.substring(0,semi);line.trim();
+    char*end=nullptr;unsigned long parsed=strtoul(line.c_str(),&end,16);
+    if(end==line.c_str()||*end!='\0'||parsed>MAX_IPP_BODY-length)return false;
+    size_t chunk=(size_t)parsed;
+    if(chunk==0){
+      // Consume optional trailer fields and the terminating empty line.
+      do{if(!readLine(client,line,millis()+5000))return false;}while(!line.isEmpty());
+      return true;
+    }
+    if(!appendChunked(client,buffer,capacity,length,chunk))return false;
+    // RFC chunk framing uses CRLF after each chunk. Be tolerant of a lone LF
+    // from clients that otherwise send a valid IPP body.
+    uint8_t eol[2];
+    if(!readExact(client,eol,1,5000))return false;
+    if(eol[0]=='\n')continue;
+    if(eol[0]!='\r'||!readExact(client,eol+1,1,5000)||eol[1]!='\n')return false;
+  }
 }
 }
 
@@ -94,11 +121,15 @@ bool MobileIppServer::readHttpBody(WiFiClient&client,uint8_t**body,size_t&length
   const bool pathOk=target==printerPath_||target==printerPath_+"/"||target=="/ipp/print"||target=="/ipp/print/"||target=="/ipp/printer"||target=="/ipp/printer/";if(!pathOk){Serial.printf("[IPP] HTTP path rejected: %s\n",target.c_str());return false;}
   size_t contentLength=0;bool haveLength=false,chunked=false,ippContentType=false,expectContinue=false;const unsigned long deadline=millis()+5000;
   while(readLine(client,line,deadline)){if(line.isEmpty())break;String h=line;h.toLowerCase();if(h.startsWith("content-length:")){String v=h.substring(15);v.trim();contentLength=strtoul(v.c_str(),nullptr,10);haveLength=true;}else if(h.startsWith("content-type:")){String v=h.substring(13);v.trim();const int semi=v.indexOf(';');if(semi>=0)v=v.substring(0,semi);v.trim();ippContentType=v=="application/ipp";}else if(h.startsWith("transfer-encoding:"))chunked=h.indexOf("chunked")>=0;else if(h.startsWith("expect:"))expectContinue=h.indexOf("100-continue")>=0;}
-  if(!ippContentType||(!haveLength&&!chunked)||(haveLength&&contentLength>MAX_IPP_BODY)){Serial.printf("[IPP] HTTP rejected: content-type=%d content-length-present=%d chunked=%d length=%u\n",ippContentType,haveLength,chunked,(unsigned)contentLength);return false;}
+  // When Transfer-Encoding is chunked, it defines the body framing; ignore a
+  // stale Content-Length header if a client sends both.
+  if(!ippContentType||(!haveLength&&!chunked)||(chunked&&contentLength>MAX_IPP_BODY)||(!chunked&&contentLength>MAX_IPP_BODY)){Serial.printf("[IPP] HTTP rejected: content-type=%d content-length-present=%d chunked=%d length=%u\n",ippContentType,haveLength,chunked,(unsigned)contentLength);return false;}
   if(expectContinue)client.print("HTTP/1.1 100 Continue\r\n\r\n");
   uint8_t*buffer=nullptr;size_t capacity=0;
-  if(haveLength){const size_t allocSize=contentLength?contentLength:8;buffer=(uint8_t*)ps_malloc(allocSize);if(!buffer)buffer=(uint8_t*)malloc(allocSize);if(!buffer){Serial.printf("[IPP] Cannot allocate request buffer: requested=%u freePSRAM=%u freeHeap=%u\n",(unsigned)allocSize,(unsigned)ESP.getFreePsram(),(unsigned)ESP.getFreeHeap());return false;}capacity=allocSize;length=contentLength;if(!readExact(client,buffer,length,30000)){Serial.printf("[IPP] Body read failed: expected=%u\n",(unsigned)contentLength);free(buffer);return false;}}
-  else if(!readChunked(client,buffer,capacity,length)){Serial.printf("[IPP] Chunked body read failed: got=%u\n",(unsigned)length);if(buffer)free(buffer);return false;}
+  if(chunked){
+    if(!readChunked(client,buffer,capacity,length)){Serial.printf("[IPP] Chunked body read failed: got=%u\n",(unsigned)length);if(buffer)free(buffer);return false;}
+  }else{
+    const size_t allocSize=contentLength?contentLength:8;buffer=(uint8_t*)ps_malloc(allocSize);if(!buffer)buffer=(uint8_t*)malloc(allocSize);if(!buffer){Serial.printf("[IPP] Cannot allocate request buffer: requested=%u freePSRAM=%u freeHeap=%u\n",(unsigned)allocSize,(unsigned)ESP.getFreePsram(),(unsigned)ESP.getFreeHeap());return false;}capacity=allocSize;length=contentLength;if(!readExact(client,buffer,length,30000)){Serial.printf("[IPP] Body read failed: expected=%u\n",(unsigned)contentLength);free(buffer);return false;}}
   if(length<8){Serial.printf("[IPP] IPP body too short: %u bytes\n",(unsigned)length);free(buffer);return false;}
   *body=buffer;return true;
 }

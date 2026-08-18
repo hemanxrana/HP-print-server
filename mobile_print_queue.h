@@ -10,8 +10,6 @@ public:
   static constexpr size_t MAX_JOB_BYTES=2*1024*1024;
   bool begin();
   bool enqueue(const uint8_t*data,size_t length,const String&format,uint32_t&jobId,String&error);
-  // Adopt a file that was already streamed to LittleFS. This avoids keeping
-  // large RAW/JetDirect jobs in RAM or PSRAM before they enter the queue.
   bool enqueueSpoolFile(const String&sourcePath,size_t length,const String&format,uint32_t&jobId,String&error);
   bool getJob(uint32_t id,JobInfo&info) const;
   uint8_t count() const;
@@ -29,6 +27,6 @@ private:
   static constexpr const char*META_NS="print-queue";
   uint32_t nextId_=0;
   String dirFor(uint32_t id) const; String dataFor(uint32_t id) const; String metaFor(uint32_t id) const;
-  bool validFormat(const String&format) const; bool readMeta(uint32_t id,JobInfo&info) const; bool writeMeta(const JobInfo&info) const;
+  bool readMeta(uint32_t id,JobInfo&info) const; bool writeMeta(const JobInfo&info) const;
   bool ensureJobDirectory(uint32_t id) const; bool parseId(const String&name,uint32_t&id) const;
 };

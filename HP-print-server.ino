@@ -3,11 +3,14 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
-#include "printer_protocols.h"
 #include "mobile_print_profile.h"
 #include "mobile_print_queue.h"
 #include "mobile_ipp_server.h"
 #include "usb_printer_backend.h"
+
+// HP Print Server sketch layer.
+// The mobile printer identity is defined only by mobile_print_profile.h.
+// DNS-SD, the web UI and IPP therefore expose the same single format.
 
 WebServer configServer(80);
 Preferences preferences;
@@ -32,6 +35,21 @@ struct Config {
 };
 
 Config config;
+static UsbHostManager::State lastUsbState = UsbHostManager::STOPPED;
+static UsbPrinterBackend::PrinterState lastPrinterState = UsbPrinterBackend::OFFLINE;
+static bool lastWifiState = false;
+
+String esc(String s) {
+  s.replace("&", "&amp;");
+  s.replace("<", "&lt;");
+  s.replace(">", "&gt;");
+  s.replace("\"", "&quot;");
+  s.replace("'", "&#39;");
+  return s;
+}
+
+const char *formatMime() { return MobilePrintProfile::FORMAT_PCL3GUI; }
+const char *formatLabel() { return "HP PCL 3 GUI"; }
 
 void defaults() {
   config.ssid = "";
@@ -45,7 +63,10 @@ void defaults() {
 
 void loadConfig() {
   defaults();
-  if (!preferences.begin(CONFIG_NS, true)) return;
+  if (!preferences.begin(CONFIG_NS, true)) {
+    Serial.println("[CFG] Preferences read failed; using defaults");
+    return;
+  }
   config.ssid = preferences.getString("ssid", config.ssid);
   config.password = preferences.getString("pass", config.password);
   config.printerName = preferences.getString("name", config.printerName);
@@ -70,13 +91,9 @@ bool saveConfig() {
   return ok;
 }
 
-String esc(String s) {
-  s.replace("&", "&amp;");
-  s.replace("<", "&lt;");
-  s.replace(">", "&gt;");
-  s.replace("\"", "&quot;");
-  s.replace("'", "&#39;");
-  return s;
+String printerUri() {
+  return String("ipp://") + HOSTNAME + ".local:" +
+         String(MobilePrintProfile::IPP_PORT) + MobilePrintProfile::IPP_PATH;
 }
 
 bool connectWiFi() {
@@ -85,12 +102,9 @@ bool connectWiFi() {
     return false;
   }
 
-  // Do not start the configuration AP first. AP+STA fixes the radio to the
-  // AP channel and can prevent a connection to a router using another channel.
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
   WiFi.begin(config.ssid.c_str(), config.password.c_str());
-
   Serial.print("[WiFi] Connecting to ");
   Serial.println(config.ssid);
 
@@ -115,12 +129,9 @@ bool connectWiFi() {
 }
 
 bool startConfigAP() {
-  // AP is a fallback/configuration network only. It is not used when the
-  // saved router connection succeeds.
   WiFi.mode(WIFI_AP);
   WiFi.setHostname(HOSTNAME);
-  const bool ok = WiFi.softAP(AP_SSID, AP_PASSWORD, 1, false, 4);
-  if (!ok) {
+  if (!WiFi.softAP(AP_SSID, AP_PASSWORD, 1, false, 4)) {
     Serial.println("[AP] Failed to start configuration AP");
     return false;
   }
@@ -138,60 +149,66 @@ bool advertiseMobilePrinter() {
     return false;
   }
 
-  const String pdl = "image/pwg-raster,application/PCLm,application/pdf,image/jpeg,image/urf";
+  // Advertise only _ipp._tcp. Do not advertise the old _printer service.
+  if (!MDNS.addService("ipp", "tcp", MobilePrintProfile::IPP_PORT)) {
+    Serial.println("[mDNS] Failed to register _ipp._tcp");
+    return false;
+  }
+
   const String uuid = String("esp32-") + WiFi.macAddress();
   const String admin = String("http://") + HOSTNAME + ".local/";
+  const char *rp = MobilePrintProfile::IPP_PATH;
+  if (*rp == '/') ++rp;
 
-  // Android Default Print Service / Mopria discovers ordinary IPP printers
-  // through _ipp._tcp DNS-SD. These are the standard printer TXT attributes.
-  MDNS.addService("ipp", "tcp", MobilePrintProfile::IPP_PORT);
-  MDNS.addServiceTxt("ipp", "tcp", "txtvers", "1");
+  MDNS.addServiceTxt("ipp", "tcp", "txtvers", MobilePrintProfile::TXT_VERS);
   MDNS.addServiceTxt("ipp", "tcp", "qtotal", String(MobilePrintQueue::MAX_JOBS).c_str());
-  MDNS.addServiceTxt("ipp", "tcp", "rp", "ipp/print");
+  MDNS.addServiceTxt("ipp", "tcp", "rp", rp);
   MDNS.addServiceTxt("ipp", "tcp", "ty", config.printerModel.c_str());
-  MDNS.addServiceTxt("ipp", "tcp", "product", (String("(") + config.printerModel + ")").c_str());
-  MDNS.addServiceTxt("ipp", "tcp", "note", "USB print server for HP printers");
+  MDNS.addServiceTxt("ipp", "tcp", "product", MobilePrintProfile::TXT_PRODUCT);
+  MDNS.addServiceTxt("ipp", "tcp", "note", MobilePrintProfile::TXT_NOTE);
   MDNS.addServiceTxt("ipp", "tcp", "adminurl", admin.c_str());
   MDNS.addServiceTxt("ipp", "tcp", "priority", "0");
-  MDNS.addServiceTxt("ipp", "tcp", "pdl", pdl.c_str());
-  MDNS.addServiceTxt("ipp", "tcp", "URF", "W8,SRGB24,CP255,RS300-600,DM1");
+  MDNS.addServiceTxt("ipp", "tcp", "pdl", MobilePrintProfile::TXT_PDL);
   MDNS.addServiceTxt("ipp", "tcp", "mopria-certified", "2.0");
   MDNS.addServiceTxt("ipp", "tcp", "UUID", uuid.c_str());
   MDNS.addServiceTxt("ipp", "tcp", "printer-state", "3");
   MDNS.addServiceTxt("ipp", "tcp", "kind", "document,photo");
 
-  // Legacy printer discovery is useful to HP/Mopria clients as well. The
-  // service itself does not carry print traffic; IPP remains the print path.
-  MDNS.addService("printer", "tcp", 0);
-
-  Serial.print("[mDNS] ");
-  Serial.print(config.printerName);
-  Serial.println(" advertising _ipp._tcp on TCP 631");
+  Serial.printf("[mDNS] %s -> _ipp._tcp:%u %s format=%s\n",
+                config.printerName.c_str(), MobilePrintProfile::IPP_PORT,
+                MobilePrintProfile::IPP_PATH, formatMime());
   return true;
-}
-
-String printerUri() {
-  return String("ipp://") + HOSTNAME + ".local:" +
-         String(MobilePrintProfile::IPP_PORT) + MobilePrintProfile::IPP_PATH;
 }
 
 bool handleMobileJob(const uint8_t *document, size_t length,
                      const String &format, uint32_t &jobId, String &error) {
-  if (!printQueue.enqueue(document, length, format, jobId, error)) return false;
-  Serial.printf("[IPP] Accepted job %lu: %u bytes, %s\n",
-                (unsigned long)jobId, (unsigned)length, format.c_str());
+  String normalized = format;
+  normalized.trim();
+  normalized.toLowerCase();
+
+  if (normalized != MobilePrintProfile::FORMAT_PCL3GUI &&
+      normalized != MobilePrintProfile::FORMAT_PCL3GUI_ALIAS) {
+    error = String("Only ") + formatMime() + " (HP PCL 3 GUI) is supported";
+    return false;
+  }
+
+  // Store the canonical advertised MIME, even when the IPP client used the
+  // compatibility alias. This keeps queue/IPP status consistent.
+  if (!printQueue.enqueue(document, length, formatMime(), jobId, error)) return false;
+  Serial.printf("[IPP] Accepted job %lu: %u bytes format=%s\n",
+                (unsigned long)jobId, (unsigned)length, formatMime());
   return true;
 }
 
-String usbInterfaceLabel(const UsbPrinterInterfaceInfo &p, bool selected) {
-  String s = "IF " + String(p.interfaceNumber) + " / ALT " + String(p.alternateSetting) +
-             " — protocol 0x";
+String usbInterfaceLabel(const UsbPrinterInterfaceInfo &p, bool active) {
+  String s = "IF " + String(p.interfaceNumber) + " / ALT " + String(p.alternateSetting);
+  s += " / protocol 0x";
   if (p.protocol < 16) s += "0";
   s += String(p.protocol, HEX);
-  s += " — OUT 0x";
+  s += " / OUT 0x";
   if (p.bulkOut.address < 16) s += "0";
   s += String(p.bulkOut.address, HEX);
-  s += " — IN ";
+  s += " / IN ";
   if (p.bulkIn.valid()) {
     s += "0x";
     if (p.bulkIn.address < 16) s += "0";
@@ -199,76 +216,92 @@ String usbInterfaceLabel(const UsbPrinterInterfaceInfo &p, bool selected) {
   } else {
     s += "none";
   }
-  if (selected) s += " [ACTIVE]";
+  if (active) s += " [ACTIVE]";
   return s;
+}
+
+String usbStateText() {
+  switch (usbHost.state()) {
+    case UsbHostManager::STOPPED: return "Stopped";
+    case UsbHostManager::RUNNING: return "Running";
+    case UsbHostManager::ENUMERATING: return "Enumerating";
+    case UsbHostManager::DEVICE_ATTACHED: return "Device attached";
+    case UsbHostManager::PRINTER_READY: return "Printer ready";
+    case UsbHostManager::ERROR: return String("Error: ") + usbHost.lastError();
+  }
+  return "Unknown";
+}
+
+String printerStateText() {
+  switch (usbPrinterBackend.state()) {
+    case UsbPrinterBackend::OFFLINE: return "Offline";
+    case UsbPrinterBackend::IDLE: return "Idle";
+    case UsbPrinterBackend::PRINTING: return "Printing";
+    case UsbPrinterBackend::ERROR: return String("Error: ") + usbPrinterBackend.statusReason();
+  }
+  return "Unknown";
 }
 
 String dashboard() {
   String wifi;
-  if (WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED)
     wifi = "Connected — " + WiFi.localIP().toString();
-  } else if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+  else if (WiFi.getMode() == WIFI_AP)
     wifi = "Configuration AP — " + WiFi.softAPIP().toString();
-  } else {
+  else
     wifi = "Not connected";
-  }
-
-  String usbState;
-  switch (usbHost.state()) {
-    case UsbHostManager::PRINTER_READY: usbState = "Printer Class ready"; break;
-    case UsbHostManager::ERROR: usbState = "USB error: " + usbHost.lastError(); break;
-    case UsbHostManager::RUNNING: usbState = "USB host running — waiting for printer"; break;
-    default: usbState = "USB host starting/enumerating"; break;
-  }
-
-  String usbOptions;
-  if (!usbHost.device().attached || usbHost.interfaceCount() == 0) {
-    usbOptions = "<p>No printer interfaces detected yet. Connect the USB printer and refresh this page.</p>";
-  } else {
-    usbOptions += "<form method='POST' action='/usb'><label><input type='radio' name='mode' value='auto' ";
-    usbOptions += config.usbAuto ? "checked" : "";
-    usbOptions += "> Automatic — prefer standard bidirectional Printer Class (protocol 0x02)</label><br><br>";
-    for (uint8_t i = 0; i < usbHost.interfaceCount(); ++i) {
-      const UsbPrinterInterfaceInfo *p = usbHost.interfaceAt(i);
-      if (!p) continue;
-      const bool selected = !config.usbAuto &&
-                            p->interfaceNumber == config.usbInterface &&
-                            p->alternateSetting == config.usbAlt;
-      usbOptions += "<label><input type='radio' name='mode' value='manual:" +
-                    String(p->interfaceNumber) + ":" + String(p->alternateSetting) + "' ";
-      usbOptions += selected ? "checked" : "";
-      usbOptions += "> " + esc(usbInterfaceLabel(*p,
-          p->interfaceNumber == usbHost.device().printer.interfaceNumber &&
-          p->alternateSetting == usbHost.device().printer.alternateSetting)) +
-          "</label><br>";
-    }
-    usbOptions += "<br><button>Apply USB interface</button></form>";
-  }
 
   String selected = usbHost.selectedInterface()
       ? usbInterfaceLabel(*usbHost.selectedInterface(), true) : "none";
 
-  String html = R"rawliteral(<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>HP Print Server</title><style>body{font-family:system-ui,Arial;max-width:800px;margin:24px auto;padding:0 16px;background:#f5f5f5;color:#222}section{background:#fff;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 8px #0001}input{width:100%;box-sizing:border-box;padding:10px;margin:6px 0 14px;border:1px solid #aaa;border-radius:7px}input[type=radio]{width:auto;margin:6px 8px 6px 0}button{padding:11px 18px;border:0;border-radius:7px;background:#222;color:#fff;margin:5px 4px 5px 0}.status{padding:12px;background:#eee;border-radius:7px}code{word-break:break-all}</style></head><body>
-<h1>HP Print Server</h1><section><h2>Status</h2><div class='status'>Wi-Fi: )rawliteral" + esc(wifi) + R"rawliteral(<br>IPP: )rawliteral" +
-    String(ippServer.running() ? "ready" : "offline") + R"rawliteral(<br>USB: )rawliteral" + esc(usbState) +
-    R"rawliteral(<br>Printer: )rawliteral" + esc(config.printerName) + R"rawliteral(<br>Model: )rawliteral" +
-    esc(config.printerModel) + R"rawliteral(<br>Active jobs: )rawliteral" + String(printQueue.activeCount()) +
-    " / " + String(MobilePrintQueue::MAX_JOBS) + R"rawliteral(<br>Retained jobs: )rawliteral" +
-    String(printQueue.count()) + R"rawliteral(</div></section><section><h2>Wi-Fi</h2><form method='POST' action='/save'>
-<label>SSID</label><input name='ssid' value=')rawliteral" + esc(config.ssid) + R"rawliteral(' maxlength='32'>
-<label>Password</label><input type='password' name='password' placeholder='Leave blank to keep current password'>
-<button>Save &amp; restart</button></form><p><a href='/scan'>Scan nearby networks</a></p></section>
-<section><h2>Printer</h2><form method='POST' action='/save'><label>Printer name</label><input name='printerName' value=')rawliteral" +
-    esc(config.printerName) + R"rawliteral('><label>Printer model</label><input name='printerModel' value=')rawliteral" +
-    esc(config.printerModel) + R"rawliteral('><button>Save printer information</button></form></section>
-<section><h2>USB Printer Interface</h2><p>Detected device: )rawliteral" +
-    (usbHost.device().attached ? String("VID 0x") + String(usbHost.device().vid, HEX) + " / PID 0x" + String(usbHost.device().pid, HEX) : String("none")) +
-    R"rawliteral(</p><p>Active: <b>)rawliteral" + esc(selected) + R"rawliteral(</b></p>)rawliteral" + usbOptions + R"rawliteral(
-<form method='POST' action='/usb/test'><button>Test Print</button></form><p>Test Print uses the production USB backend and selected interface.</p></section>
-<section><h2>Mobile printing</h2><p>Android Default Print Service / Mopria discovery: <b>DNS-SD + IPP</b></p>
-<p>IPP endpoint: <code>)rawliteral" + printerUri() + R"rawliteral(</code></p><p>Accepted formats: PWG Raster, PCLm, PDF, JPEG, URF.</p>
-<p>Phone and ESP32 must be on the same Wi-Fi network for router-based discovery.</p></section></body></html>)rawliteral";
+  String usbOptions;
+  if (!usbHost.device().attached || usbHost.interfaceCount() == 0) {
+    usbOptions = "<p>No USB printer interfaces detected.</p>";
+  } else {
+    usbOptions = "<form method='POST' action='/usb'>";
+    usbOptions += "<label><input type='radio' name='mode' value='auto' " +
+                  String(config.usbAuto ? "checked" : "") + "> Automatic</label><br>";
+    for (uint8_t i = 0; i < usbHost.interfaceCount(); ++i) {
+      const UsbPrinterInterfaceInfo *p = usbHost.interfaceAt(i);
+      if (!p) continue;
+      const bool checked = !config.usbAuto &&
+                           p->interfaceNumber == config.usbInterface &&
+                           p->alternateSetting == config.usbAlt;
+      const bool active = usbHost.selectedInterface() == p;
+      usbOptions += "<label><input type='radio' name='mode' value='manual:" +
+                    String(p->interfaceNumber) + ":" + String(p->alternateSetting) + "' " +
+                    String(checked ? "checked" : "") + "> " +
+                    esc(usbInterfaceLabel(*p, active)) + "</label><br>";
+    }
+    usbOptions += "<br><button type='submit'>Apply USB interface</button></form>";
+  }
+
+  String html;
+  html.reserve(9000);
+  html += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>HP Print Server</title>");
+  html += F("<style>body{font-family:system-ui,Arial;max-width:820px;margin:24px auto;padding:0 16px;background:#f5f5f5;color:#222}section{background:#fff;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 8px #0001}input{box-sizing:border-box;padding:10px;margin:6px 0 14px;border:1px solid #aaa;border-radius:7px;width:100%}input[type=radio]{width:auto;margin-right:8px}button{padding:11px 18px;border:0;border-radius:7px;background:#222;color:#fff}.status{padding:12px;background:#eee;border-radius:7px}code{word-break:break-all}</style></head><body><h1>HP Print Server</h1>");
+  html += "<section><h2>Status</h2><div class='status'>Wi-Fi: " + esc(wifi);
+  html += "<br>IPP: " + String(ippServer.running() ? "ready" : "offline");
+  html += "<br>USB host: " + esc(usbStateText());
+  html += "<br>Printer backend: " + esc(printerStateText());
+  html += "<br>Printer: " + esc(config.printerName);
+  html += "<br>Model: " + esc(config.printerModel);
+  html += "<br>Jobs: " + String(printQueue.activeCount()) + " active / " + String(printQueue.count()) + " retained</div></section>";
+
+  html += "<section><h2>Wi-Fi</h2><form method='POST' action='/save'><label>SSID</label><input name='ssid' value='" + esc(config.ssid) + "' maxlength='32'><label>Password</label><input type='password' name='password' placeholder='Leave blank to keep current password'><button type='submit'>Save &amp; restart</button></form><p><a href='/scan'>Scan nearby networks</a></p></section>";
+  html += "<section><h2>Printer identity</h2><form method='POST' action='/save'><label>Name</label><input name='printerName' value='" + esc(config.printerName) + "'><label>Model</label><input name='printerModel' value='" + esc(config.printerModel) + "'><button type='submit'>Save printer information</button></form></section>";
+
+  html += "<section><h2>USB printer interface</h2><p>Device: ";
+  html += usbHost.device().attached
+      ? "VID 0x" + String(usbHost.device().vid, HEX) + " / PID 0x" + String(usbHost.device().pid, HEX)
+      : "none";
+  html += "</p><p>Active: <b>" + esc(selected) + "</b></p>" + usbOptions;
+  html += "<form method='POST' action='/usb/test'><button type='submit'>Test Print</button></form></section>";
+
+  html += "<section><h2>Mobile printing</h2><p><b>Format: " + String(formatLabel()) + "</b><br><code>" + String(formatMime()) + "</code></p>";
+  html += "<p>DNS-SD: <code>_ipp._tcp</code><br>IPP URI: <code>" + printerUri() + "</code></p>";
+  html += "<p>This server advertises and accepts only HP PCL 3 GUI. PDF, PCLm, PWG Raster, JPEG and URF are not advertised or accepted.</p>";
+  html += "<p>Phone and ESP32 must be on the same Wi-Fi network for router-based discovery.</p></section></body></html>";
   return html;
 }
 
@@ -298,12 +331,12 @@ void handleUsbSave() {
     return;
   }
 
-  String mode = configServer.arg("mode");
+  const String mode = configServer.arg("mode");
   if (mode == "auto") {
     config.usbAuto = true;
   } else if (mode.startsWith("manual:")) {
-    int first = mode.indexOf(':');
-    int second = mode.indexOf(':', first + 1);
+    const int first = mode.indexOf(':');
+    const int second = mode.indexOf(':', first + 1);
     if (second < 0) {
       configServer.send(400, "text/plain", "Invalid USB interface selection\n");
       return;
@@ -330,11 +363,11 @@ void handleUsbTestPrint() {
     configServer.send(503, "text/plain", String("Test print failed: ") + error + "\n");
     return;
   }
-  configServer.send(200, "text/html", "<p>Test print data was accepted by the USB transfer layer.</p><p>Check the physical printer for the page.</p><p><a href='/'>Back</a></p>");
+  configServer.send(200, "text/html", "<p>Test print accepted by the USB transfer layer.</p><p><a href='/'>Back</a></p>");
 }
 
 void handleScan() {
-  int n = WiFi.scanNetworks(false, true);
+  const int n = WiFi.scanNetworks(false, true);
   String html = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head><body><h1>Wi-Fi networks</h1><ul>";
   for (int i = 0; i < n; ++i) {
     String ssid = WiFi.SSID(i);
@@ -347,42 +380,73 @@ void handleScan() {
 }
 
 void handleHealth() {
-  String body = "wifi=" + String(WiFi.status() == WL_CONNECTED ? "connected" : "not-connected") + "\n";
+  String body;
+  body += "format=" + String(formatMime()) + "\n";
+  body += "format_label=" + String(formatLabel()) + "\n";
+  body += "wifi=" + String(WiFi.status() == WL_CONNECTED ? "connected" : "not-connected") + "\n";
   body += "ip=" + WiFi.localIP().toString() + "\n";
   body += "ap=" + WiFi.softAPIP().toString() + "\n";
   body += "ipp=" + String(ippServer.running() ? "ready" : "offline") + "\n";
+  body += "ipp_uri=" + printerUri() + "\n";
   body += "usb=" + String(usbPrinterBackend.online() ? "printer-ready" : "not-ready") + "\n";
   body += "usb_reason=" + usbPrinterBackend.statusReason() + "\n";
+  body += "usb_host=" + usbStateText() + "\n";
   body += "usb_selection=" + String(usbHost.automaticInterfaceSelection() ? "auto" : "manual") + "\n";
   if (usbHost.selectedInterface()) {
     body += "usb_interface=" + String(usbHost.selectedInterface()->interfaceNumber) + "\n";
     body += "usb_alt=" + String(usbHost.selectedInterface()->alternateSetting) + "\n";
+    body += "usb_protocol=0x" + String(usbHost.selectedInterface()->protocol, HEX) + "\n";
     body += "usb_out=0x" + String(usbHost.selectedInterface()->bulkOut.address, HEX) + "\n";
+    if (usbHost.selectedInterface()->bulkIn.valid())
+      body += "usb_in=0x" + String(usbHost.selectedInterface()->bulkIn.address, HEX) + "\n";
   }
+  body += "printer_state=" + printerStateText() + "\n";
   body += "active_jobs=" + String(printQueue.activeCount()) + "\n";
   body += "retained_jobs=" + String(printQueue.count()) + "\n";
-  configServer.send(200, "text/plain", body);
+  configServer.send(200, "text/plain; charset=utf-8", body);
+}
+
+void logStateChanges() {
+  if (usbHost.state() != lastUsbState) {
+    lastUsbState = usbHost.state();
+    Serial.println("[USB] State -> " + usbStateText());
+    if (lastUsbState == UsbHostManager::ERROR)
+      Serial.println("[USB] Error: " + usbHost.lastError());
+  }
+
+  if (usbPrinterBackend.state() != lastPrinterState) {
+    lastPrinterState = usbPrinterBackend.state();
+    Serial.println("[PRINTER] State -> " + printerStateText());
+  }
+
+  const bool wifi = WiFi.status() == WL_CONNECTED;
+  if (wifi != lastWifiState) {
+    lastWifiState = wifi;
+    Serial.println(wifi ? "[WiFi] State -> CONNECTED" : "[WiFi] State -> DISCONNECTED");
+    if (wifi) Serial.println("[WiFi] IP: " + WiFi.localIP().toString());
+  }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== HP Print Server / ESP32-S3 / Mobile-first ===");
+  Serial.println();
+  Serial.println("=== HP Print Server / ESP32-S3 / Mobile-first ===");
+  Serial.printf("[FORMAT] %s (%s)\n", formatLabel(), formatMime());
 
   loadConfig();
   usbHost.setInterfaceSelection(config.usbAuto, config.usbInterface, config.usbAlt);
 
-  if (!printQueue.begin()) Serial.println("[Queue] Persistent queue unavailable");
+  if (!printQueue.begin())
+    Serial.println("[Queue] Persistent queue unavailable");
+
   if (!usbPrinterBackend.begin())
     Serial.println("[USB] Host start failed: " + usbPrinterBackend.statusReason());
 
-  // Station mode is always preferred. The AP is only a fallback when there
-  // are no credentials or the router cannot be reached.
-  bool wifi = connectWiFi();
+  const bool wifi = connectWiFi();
   if (!wifi) startConfigAP();
 
-  // Start IPP on both STA and fallback AP. This makes direct AP printing
-  // possible while still making the normal router path the preferred mode.
+  // Same profile in all layers: DNS-SD pdl, web UI and IPP.
   ippServer.begin(config.printerName, printerUri(), handleMobileJob, &printQueue);
   advertiseMobilePrinter();
 
@@ -410,6 +474,7 @@ void loop() {
   configServer.handleClient();
   ippServer.poll();
   usbPrinterBackend.poll();
+  logStateChanges();
 
   const UsbPrinterInterfaceInfo *p = usbHost.selectedInterface();
   const bool rawReady = p && p->protocol == 0x02 && p->usableForRawPrint();

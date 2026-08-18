@@ -14,7 +14,7 @@ public:
   bool getJob(uint32_t id,JobInfo&info) const;
   uint8_t count() const;
   uint8_t activeCount() const;
-  bool getJobAt(uint8_t index,JobInfo&info) const;
+  uint8_t getJobAt(uint8_t index,JobInfo&info) const;
   bool setState(uint32_t id,State state,const String&reason,String&error);
   bool cancel(uint32_t id,String&error);
   bool readJob(uint32_t id,Stream&out,String&error) const;
@@ -29,4 +29,5 @@ private:
   String dirFor(uint32_t id) const; String dataFor(uint32_t id) const; String metaFor(uint32_t id) const;
   bool readMeta(uint32_t id,JobInfo&info) const; bool writeMeta(const JobInfo&info) const;
   bool ensureJobDirectory(uint32_t id) const; bool parseId(const String&name,uint32_t&id) const;
+  void purgeFinishedJobs();
 };

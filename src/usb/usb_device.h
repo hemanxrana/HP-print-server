@@ -20,9 +20,15 @@ struct UsbPrinterInterfaceInfo {
   uint8_t protocol = 0;
   UsbEndpointInfo bulkOut;
   UsbEndpointInfo bulkIn;
+
+  bool usableForRawPrint() const {
+    return found && bulkOut.valid() && bulkOut.isBulk() && !bulkOut.isIn();
+  }
 };
 
 struct UsbDeviceInfo {
+  static constexpr uint8_t MAX_PRINTER_INTERFACES = 8;
+
   bool attached = false;
   uint16_t vid = 0;
   uint16_t pid = 0;
@@ -31,5 +37,11 @@ struct UsbDeviceInfo {
   String manufacturer;
   String product;
   String serial;
+
+  uint8_t printerInterfaceCount = 0;
+  UsbPrinterInterfaceInfo printerInterfaces[MAX_PRINTER_INTERFACES];
+
+  // Compatibility/current-selection view. This is always one of the entries
+  // in printerInterfaces[] when a printer interface has been selected.
   UsbPrinterInterfaceInfo printer;
 };

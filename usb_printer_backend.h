@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include "mobile_print_queue.h"
-#include "src/usb/usb_host_manager.h"
+#include "usb_host_manager.h"
 
 class UsbPrinterBackend {
 public:

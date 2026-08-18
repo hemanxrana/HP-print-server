@@ -130,7 +130,11 @@ bool UsbPrinterBackend::sendJob(MobilePrintQueue&queue,uint32_t jobId,String&err
   Serial.printf("[PRINT] Sending job %lu (%u bytes, format=%s) via IF=%u ALT=%u protocol=0x%02X OUT=0x%02X\n",
                 (unsigned long)jobId,(unsigned)info.size,info.format.c_str(),p->interfaceNumber,p->alternateSetting,p->protocol,p->bulkOut.address);
   UsbOutputStream output(host_);
-  if(!queue.readJob(jobId,output,error))return false;
+  const bool readOk=queue.readJob(jobId,output,error);
+  if(!readOk){
+    if(output.error().length())error=output.error();
+    return false;
+  }
   if(output.error().length()){error=output.error();return false;}
   return true;
 }

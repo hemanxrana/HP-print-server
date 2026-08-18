@@ -1,448 +1,262 @@
 #include "mobile_ipp_server.h"
+#include "mobile_print_profile.h"
 #include <stdlib.h>
 #include <string.h>
 
 namespace {
 constexpr size_t MAX_IPP_BODY = 4 * 1024 * 1024;
 constexpr size_t RESPONSE_CAPACITY = 8192;
-constexpr uint16_t PJ = 2, VJ = 4, CJ = 8, GJA = 9, GJ = 10, GPA = 11;
-constexpr uint16_t IPP_OK = 0, BAD = 0x0400, NOTPOSSIBLE = 0x0403,
-                   NOTFOUND = 0x0406, FORMAT = 0x040B,
-                   UNSUPPORTED = 0x0501, UNAVAILABLE = 0x0502;
+constexpr uint16_t OP_PRINT_JOB = 0x0002;
+constexpr uint16_t OP_VALIDATE_JOB = 0x0004;
+constexpr uint16_t OP_CANCEL_JOB = 0x0008;
+constexpr uint16_t OP_GET_JOB_ATTRIBUTES = 0x0009;
+constexpr uint16_t OP_GET_JOBS = 0x000A;
+constexpr uint16_t OP_GET_PRINTER_ATTRIBUTES = 0x000B;
+constexpr uint16_t ST_OK = 0x0000;
+constexpr uint16_t ST_BAD_REQUEST = 0x0400;
+constexpr uint16_t ST_NOT_POSSIBLE = 0x0403;
+constexpr uint16_t ST_NOT_FOUND = 0x0406;
+constexpr uint16_t ST_DOC_FORMAT = 0x040B;
+constexpr uint16_t ST_UNSUPPORTED = 0x0501;
+constexpr uint16_t ST_UNAVAILABLE = 0x0502;
 
-uint16_t g16(const uint8_t *p) { return ((uint16_t)p[0] << 8) | p[1]; }
-void p16(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v; }
-void p32(uint8_t *p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
+uint16_t u16(const uint8_t *p) { return ((uint16_t)p[0] << 8) | p[1]; }
+uint32_t u32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
+void put16(uint8_t *p, uint16_t v) { p[0] = v >> 8; p[1] = v; }
+void put32(uint8_t *p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
 
-bool raw(uint8_t *o, size_t c, size_t &p, uint8_t t, const char *n,
-         const uint8_t *v, size_t vl) {
-  size_t nl = strlen(n);
-  if (nl > 65535 || vl > 65535 || p + 5 + nl + vl > c) return false;
-  o[p++] = t;
-  p16(o + p, (uint16_t)nl); p += 2;
-  memcpy(o + p, n, nl); p += nl;
-  p16(o + p, (uint16_t)vl); p += 2;
-  if (vl) memcpy(o + p, v, vl);
-  p += vl;
+bool attr(uint8_t *o, size_t cap, size_t &p, uint8_t tag, const char *name, const uint8_t *value, size_t len) {
+  const size_t nl = strlen(name);
+  if (nl > 65535 || len > 65535 || p + 5 + nl + len > cap) return false;
+  o[p++] = tag; put16(o + p, (uint16_t)nl); p += 2;
+  memcpy(o + p, name, nl); p += nl; put16(o + p, (uint16_t)len); p += 2;
+  if (len) memcpy(o + p, value, len); p += len;
   return true;
 }
 
-bool str(uint8_t *o, size_t c, size_t &p, uint8_t t, const char *n, const String &v) {
-  return raw(o, c, p, t, n, (const uint8_t *)v.c_str(), v.length());
+bool text(uint8_t *o, size_t cap, size_t &p, uint8_t tag, const char *name, const String &value) {
+  return attr(o, cap, p, tag, name, (const uint8_t *)value.c_str(), value.length());
+}
+bool keyword(uint8_t *o, size_t cap, size_t &p, const char *name, const char *value) {
+  return attr(o, cap, p, 0x44, name, (const uint8_t *)value, strlen(value));
+}
+bool enumAttr(uint8_t *o, size_t cap, size_t &p, const char *name, uint32_t value) {
+  uint8_t b[4]; put32(b, value); return attr(o, cap, p, 0x23, name, b, 4);
+}
+bool integerAttr(uint8_t *o, size_t cap, size_t &p, const char *name, uint32_t value) {
+  uint8_t b[4]; put32(b, value); return attr(o, cap, p, 0x21, name, b, 4);
+}
+bool boolAttr(uint8_t *o, size_t cap, size_t &p, const char *name, bool value) {
+  uint8_t b = value ? 1 : 0; return attr(o, cap, p, 0x22, name, &b, 1);
+}
+bool rangeAttr(uint8_t *o, size_t cap, size_t &p, const char *name, uint32_t lo, uint32_t hi) {
+  uint8_t b[8]; put32(b, lo); put32(b + 4, hi); return attr(o, cap, p, 0x33, name, b, 8);
 }
 
-bool i32(uint8_t *o, size_t c, size_t &p, uint8_t t, const char *n, uint32_t v) {
-  uint8_t b[4]; p32(b, v); return raw(o, c, p, t, n, b, 4);
+bool pcl3Gui(const String &format) {
+  String f = format; f.trim(); f.toLowerCase();
+  return f == "application/vnd.hp-pcl" || f == "application/vnd.hp-pcl3gui";
 }
 
-bool en(uint8_t *o, size_t c, size_t &p, const char *n, uint32_t v) {
-  return i32(o, c, p, 0x23, n, v);
-}
-
-bool ippBoolean(uint8_t *o, size_t c, size_t &p, const char *n, bool v) {
-  return i32(o, c, p, 0x22, n, v ? 1 : 0);
-}
-
-bool kw(uint8_t *o, size_t c, size_t &p, const char *n, const char *v) {
-  return raw(o, c, p, 0x44, n, (const uint8_t *)v, strlen(v));
-}
-
-bool range(uint8_t *o, size_t c, size_t &p, const char *n, uint32_t a, uint32_t b) {
-  uint8_t x[8]; p32(x, a); p32(x + 4, b); return raw(o, c, p, 0x33, n, x, 8);
-}
-
-bool supported(const String &f) {
-  String x = f;
-  x.toLowerCase();
-  return x == "application/pclm" || x == "image/pwg-raster" ||
-         x == "application/pdf" || x == "image/jpeg" || x == "image/urf" ||
-         x == "application/octet-stream";
-}
-
-bool wants(const String &r, const char *n) {
-  if (r.isEmpty() || r == "all") return true;
-  String x = n;
-  int s = 0;
-  while (s < (int)r.length()) {
-    int e = r.indexOf(',', s);
-    if (e < 0) e = r.length();
-    String item = r.substring(s, e);
-    item.trim();
-    if (item == x) return true;
-    s = e + 1;
+bool requested(const String &list, const char *name) {
+  if (list.isEmpty() || list == "all") return true;
+  String n = name; n.toLowerCase();
+  int start = 0;
+  while (start < (int)list.length()) {
+    int end = list.indexOf(',', start); if (end < 0) end = list.length();
+    String item = list.substring(start, end); item.trim(); item.toLowerCase();
+    if (item == n) return true;
+    start = end + 1;
   }
   return false;
+}
+
+bool readLine(WiFiClient &c, String &line, unsigned long deadline) {
+  while (millis() < deadline) {
+    if (c.available()) { line = c.readStringUntil('\n'); line.trim(); return true; }
+    delay(1);
+  }
+  return false;
+}
+
+bool readChunkedBody(WiFiClient &c, uint8_t *body, size_t cap, size_t &length) {
+  length = 0;
+  while (true) {
+    String line;
+    if (!readLine(c, line, millis() + 10000)) return false;
+    int semi = line.indexOf(';'); if (semi >= 0) line = line.substring(0, semi);
+    const size_t chunk = strtoul(line.c_str(), nullptr, 16);
+    if (chunk == 0) {
+      do { if (!readLine(c, line, millis() + 5000)) return false; } while (!line.isEmpty());
+      return true;
+    }
+    if (chunk > cap - length) return false;
+    size_t got = 0;
+    while (got < chunk) {
+      if (!c.available()) { delay(1); continue; }
+      int n = c.read(body + length + got, chunk - got); if (n <= 0) return false; got += (size_t)n;
+    }
+    length += chunk;
+    unsigned long deadline = millis() + 5000;
+    while (c.available() < 2 && millis() < deadline) delay(1);
+    if (c.read() != '\r' || c.read() != '\n') return false;
+  }
 }
 }
 
 MobileIppServer::MobileIppServer(uint16_t port) : server_(port), port_(port) {}
 
-void MobileIppServer::begin(const String &n, const String &u, JobHandler h, MobilePrintQueue *q) {
-  printerName_ = n;
-  printerUri_ = u;
-  handler_ = h;
-  queue_ = q;
-  int scheme = u.indexOf("://");
-  int slash = scheme >= 0 ? u.indexOf('/', scheme + 3) : -1;
-  printerPath_ = slash >= 0 ? u.substring(slash) : String("/ipp/print");
-  server_.begin();
-  running_ = true;
+void MobileIppServer::begin(const String &name, const String &uri, JobHandler handler, MobilePrintQueue *queue) {
+  printerName_ = name; printerUri_ = uri; handler_ = handler; queue_ = queue;
+  const int scheme = uri.indexOf("://");
+  const int slash = scheme >= 0 ? uri.indexOf('/', scheme + 3) : -1;
+  printerPath_ = slash >= 0 ? uri.substring(slash) : String("/ipp/print");
+  server_.begin(); running_ = true;
   Serial.printf("[IPP] Listening on TCP %u at %s\n", port_, printerUri_.c_str());
 }
 
 bool MobileIppServer::readHttpBody(WiFiClient &c, uint8_t **body, size_t &length) {
-  *body = nullptr;
-  length = 0;
-  c.setTimeout(5);
+  *body = nullptr; length = 0; c.setTimeout(5);
+  String line;
+  if (!readLine(c, line, millis() + 5000) || !line.startsWith("POST ")) return false;
+  const int sp = line.indexOf(' ', 5); if (sp < 0) return false;
+  String target = line.substring(5, sp); const int q = target.indexOf('?'); if (q >= 0) target = target.substring(0, q);
+  if (target != printerPath_ && target != printerPath_ + "/" && target != "/ipp/print" && target != "/ipp/print/") return false;
 
-  String line = c.readStringUntil('\n');
-  line.trim();
-  if (!line.startsWith("POST ")) return false;
-
-  int sp = line.indexOf(' ', 5);
-  if (sp < 0) return false;
-  String target = line.substring(5, sp);
-  int q = target.indexOf('?');
-  if (q >= 0) target = target.substring(0, q);
-
-  // Accept the normal IPP path and a trailing slash. Some mobile clients
-  // probe the endpoint with a slightly different path before settling on it.
-  if (target != printerPath_ && target != printerPath_ + "/" && target != "/ipp/print" && target != "/ipp/print/") {
-    Serial.printf("[IPP] Reject HTTP path: %s\n", target.c_str());
-    return false;
-  }
-
-  size_t cl = 0;
-  bool ipp = false;
-  bool chunked = false;
-  bool haveLength = false;
-  bool expectContinue = false;
-
-  unsigned long deadline = millis() + 5000;
-  while (millis() < deadline) {
-    if (!c.available()) { delay(1); continue; }
-    line = c.readStringUntil('\n');
-    line.trim();
+  size_t contentLength = 0; bool haveLength = false, chunked = false, isIpp = false, expect = false;
+  const unsigned long deadline = millis() + 5000;
+  while (readLine(c, line, deadline)) {
     if (line.isEmpty()) break;
+    String h = line; h.toLowerCase();
+    if (h.startsWith("content-length:")) { String v = h.substring(15); v.trim(); contentLength = strtoul(v.c_str(), nullptr, 10); haveLength = true; }
+    else if (h.startsWith("content-type:")) isIpp = h.indexOf("application/ipp") >= 0;
+    else if (h.startsWith("transfer-encoding:")) chunked = h.indexOf("chunked") >= 0;
+    else if (h.startsWith("expect:")) expect = h.indexOf("100-continue") >= 0;
+  }
+  if (!isIpp || (!haveLength && !chunked) || contentLength > MAX_IPP_BODY) {
+    Serial.printf("[IPP] Bad HTTP request: ipp=%d length=%d chunked=%d cl=%u\n", isIpp, haveLength, chunked, (unsigned)contentLength);
+    return false;
+  }
+  if (expect) c.print("HTTP/1.1 100 Continue\r\n\r\n");
 
-    String x = line;
-    x.toLowerCase();
-    if (x.startsWith("content-length:")) {
-      String value = x.substring(15);
-      value.trim();
-      cl = (size_t)value.toInt();
-      haveLength = true;
-    } else if (x.startsWith("content-type:")) {
-      String value = x.substring(13);
-      value.trim();
-      if (value.indexOf("application/ipp") >= 0) ipp = true;
-    } else if (x.startsWith("transfer-encoding:")) {
-      if (x.indexOf("chunked") >= 0) chunked = true;
-    } else if (x.startsWith("expect:")) {
-      if (x.indexOf("100-continue") >= 0) expectContinue = true;
+  uint8_t *b = (uint8_t *)ps_malloc(MAX_IPP_BODY); if (!b) b = (uint8_t *)malloc(MAX_IPP_BODY); if (!b) return false;
+  size_t got = 0; bool ok = true;
+  if (chunked) ok = readChunkedBody(c, b, MAX_IPP_BODY, got);
+  else {
+    const unsigned long bodyDeadline = millis() + 30000;
+    while (got < contentLength && millis() < bodyDeadline) {
+      if (!c.available()) { delay(1); continue; }
+      int n = c.read(b + got, contentLength - got); if (n > 0) got += (size_t)n;
     }
+    ok = got == contentLength;
   }
-
-  if (!ipp || !haveLength || chunked || cl < 8 || cl > MAX_IPP_BODY) {
-    Serial.printf("[IPP] Bad HTTP request: ipp=%d length=%d chunked=%d cl=%u\n",
-                  ipp, haveLength, chunked, (unsigned)cl);
-    return false;
-  }
-
-  // Android/NetPrinter can use Expect: 100-continue before sending the IPP body.
-  if (expectContinue) {
-    c.print("HTTP/1.1 100 Continue\r\n\r\n");
-  }
-
-  uint8_t *b = (uint8_t *)ps_malloc(cl);
-  if (!b) b = (uint8_t *)malloc(cl);
-  if (!b) return false;
-
-  size_t got = 0;
-  deadline = millis() + 30000;
-  while (got < cl && millis() < deadline) {
-    if (!c.available()) { delay(1); continue; }
-    int n = c.read(b + got, cl - got);
-    if (n > 0) got += (size_t)n;
-  }
-  if (got != cl) {
-    free(b);
-    Serial.printf("[IPP] Body timeout: got=%u expected=%u\n", (unsigned)got, (unsigned)cl);
-    return false;
-  }
-
-  *body = b;
-  length = cl;
-  return true;
+  if (!ok || got < 8) { free(b); Serial.printf("[IPP] Body read failed: got=%u\n", (unsigned)got); return false; }
+  *body = b; length = got; return true;
 }
 
-bool MobileIppServer::buildResponse(const uint8_t *rq, size_t len, uint8_t *out,
-                                     size_t cap, size_t &rl) {
-  rl = 0;
-  if (len < 8) return false;
-
-  uint16_t ver = g16(rq);
-  uint16_t op = g16(rq + 2);
-  uint32_t req = ((uint32_t)rq[4] << 24) | ((uint32_t)rq[5] << 16) |
-                 ((uint32_t)rq[6] << 8) | rq[7];
-  if (ver != 0x0100 && ver != 0x0101 && ver != 0x0200) ver = 0x0101;
-
-  String fmt = "application/octet-stream";
-  String requested;
-  String which = "not-completed";
-  uint32_t requestedJob = 0;
-  uint32_t limit = 0;
-  size_t p = 8;
-  size_t doc = len;
-  bool opGroup = false;
-  String lastName;
+bool MobileIppServer::buildResponse(const uint8_t *rq, size_t len, uint8_t *out, size_t cap, size_t &rl) {
+  rl = 0; if (len < 8 || cap < 64) return false;
+  uint16_t version = u16(rq); if (version != 0x0100 && version != 0x0101 && version != 0x0200) version = 0x0101;
+  const uint16_t op = u16(rq + 2); const uint32_t requestId = u32(rq + 4);
+  String format = MobilePrintProfile::FORMAT_PCL3GUI, requestedAttrs, whichJobs = "not-completed";
+  uint32_t requestedJob = 0; size_t documentOffset = len; bool sawOperationGroup = false; String lastName; size_t p = 8;
 
   while (p < len) {
-    uint8_t tag = rq[p++];
-    if (tag == 3) { doc = p; break; }
-    if (tag == 1) { opGroup = true; continue; }
-    if (tag == 2 || tag == 4) continue;
+    const uint8_t tag = rq[p++];
+    if (tag == 0x03) { documentOffset = p; break; }
+    if (tag == 0x01) { sawOperationGroup = true; continue; }
+    if (tag == 0x02 || tag == 0x04 || tag == 0x05) continue;
     if (p + 4 > len) return false;
-
-    uint16_t nl = g16(rq + p);
-    p += 2;
-    if (p + nl + 2 > len) return false;
-
-    String name;
-    if (nl) {
-      for (uint16_t i = 0; i < nl; i++) name += (char)rq[p + i];
-      lastName = name;
-    } else {
-      name = lastName;
-    }
-    p += nl;
-
-    uint16_t vl = g16(rq + p);
-    p += 2;
-    if (p + vl > len) return false;
-
-    if (name == "document-format" && vl > 0 && vl < 128) {
-      fmt = "";
-      for (uint16_t i = 0; i < vl; i++) fmt += (char)rq[p + i];
-    } else if (name == "requested-attributes" && vl < 1024) {
-      String v;
-      for (uint16_t i = 0; i < vl; i++) v += (char)rq[p + i];
-      if (requested.length()) requested += ',';
-      requested += v;
-    } else if (name == "which-jobs" && vl < 64) {
-      which = "";
-      for (uint16_t i = 0; i < vl; i++) which += (char)rq[p + i];
-    } else if (name == "limit" && vl == 4) {
-      limit = ((uint32_t)rq[p] << 24) | ((uint32_t)rq[p + 1] << 16) |
-              ((uint32_t)rq[p + 2] << 8) | rq[p + 3];
-    } else if (name == "job-id" && vl == 4) {
-      requestedJob = ((uint32_t)rq[p] << 24) | ((uint32_t)rq[p + 1] << 16) |
-                     ((uint32_t)rq[p + 2] << 8) | rq[p + 3];
-    }
+    const uint16_t nl = u16(rq + p); p += 2; if (p + nl + 2 > len) return false;
+    String name; for (uint16_t i = 0; i < nl; ++i) name += (char)rq[p + i]; if (nl) lastName = name; else name = lastName; p += nl;
+    const uint16_t vl = u16(rq + p); p += 2; if (p + vl > len) return false;
+    if (name == "document-format" && vl < 256) { format = ""; for (uint16_t i = 0; i < vl; ++i) format += (char)rq[p + i]; }
+    else if (name == "requested-attributes" && vl < 1024) { String v; for (uint16_t i = 0; i < vl; ++i) v += (char)rq[p + i]; if (requestedAttrs.length()) requestedAttrs += ','; requestedAttrs += v; }
+    else if (name == "which-jobs" && vl < 64) { whichJobs = ""; for (uint16_t i = 0; i < vl; ++i) whichJobs += (char)rq[p + i]; }
+    else if (name == "job-id" && vl == 4) requestedJob = u32(rq + p);
     p += vl;
   }
+  if (!sawOperationGroup) return false;
+  if (op == OP_GET_JOB_ATTRIBUTES && requestedJob == 0) return false;
+  if (op == OP_GET_JOBS && requestedAttrs.isEmpty()) requestedAttrs = "job-id,job-uri,job-state,job-state-reasons,job-name,document-format";
 
-  if (!opGroup) return false;
-  if (op == GJ && requested.isEmpty()) requested = "job-uri,job-id";
+  uint16_t status = ST_OK; String statusMessage; uint32_t jobId = 0;
+  if (op == OP_PRINT_JOB) {
+    if (documentOffset >= len) { status = ST_BAD_REQUEST; statusMessage = "Print-Job requires a PCL 3 GUI document"; }
+    else if (!pcl3Gui(format)) { status = ST_DOC_FORMAT; statusMessage = "Only application/vnd.hp-PCL (HP PCL 3 GUI) is supported"; }
+    else if (!handler_) { status = ST_UNAVAILABLE; statusMessage = "Print backend unavailable"; }
+    else if (!handler_(rq + documentOffset, len - documentOffset, format, jobId, statusMessage)) { status = ST_NOT_POSSIBLE; if (statusMessage.isEmpty()) statusMessage = "Document rejected by print backend"; }
+  } else if (op == OP_VALIDATE_JOB) {
+    if (documentOffset < len) { status = ST_BAD_REQUEST; statusMessage = "Validate-Job must not contain document data"; }
+    else if (!pcl3Gui(format)) { status = ST_DOC_FORMAT; statusMessage = "Only HP PCL 3 GUI is supported"; }
+  } else if (op == OP_CANCEL_JOB) {
+    MobilePrintQueue::JobInfo info;
+    if (!queue_ || requestedJob == 0 || !queue_->getJob(requestedJob, info)) { status = ST_NOT_FOUND; statusMessage = "Job not found"; }
+    else { String e; if (!queue_->cancel(requestedJob, e)) { status = ST_NOT_POSSIBLE; statusMessage = e; } }
+  } else if (op == OP_GET_JOB_ATTRIBUTES) {
+    MobilePrintQueue::JobInfo info; if (!queue_ || !queue_->getJob(requestedJob, info)) { status = ST_NOT_FOUND; statusMessage = "Job not found"; }
+  } else if (op != OP_GET_PRINTER_ATTRIBUTES && op != OP_GET_JOBS) { status = ST_UNSUPPORTED; statusMessage = "IPP operation not supported"; }
 
-  Serial.printf("[IPP] op=0x%04X ver=%u.%u body=%u format=%s\n",
-                op, ver >> 8, ver & 0xff, (unsigned)len, fmt.c_str());
+  size_t w = 0; out[w++] = version >> 8; out[w++] = version; put16(out + w, status); w += 2; put32(out + w, requestId); w += 4; out[w++] = 0x01;
+  if (!text(out, cap, w, 0x47, "attributes-charset", "utf-8") || !text(out, cap, w, 0x48, "attributes-natural-language", "en")) return false;
+  if (!statusMessage.isEmpty() && !text(out, cap, w, 0x41, "status-message", statusMessage)) return false;
 
-  uint16_t status = IPP_OK;
-  String error;
-  uint32_t jobId = 0;
-
-  if (op == PJ) {
-    if (doc >= len) status = BAD, error = "Print-Job requires document data";
-    else if (!supported(fmt)) status = FORMAT, error = "Document format not supported";
-    else if (!handler_) status = UNAVAILABLE, error = "Print backend unavailable";
-    else if (!handler_(rq + doc, len - doc, fmt, jobId, error)) {
-      status = NOTPOSSIBLE;
-      if (error.isEmpty()) error = "Document rejected";
+  if (op == OP_GET_PRINTER_ATTRIBUTES && status == ST_OK) {
+    out[w++] = 0x04;
+    if (requested(requestedAttrs, "printer-name") && !text(out, cap, w, 0x42, "printer-name", printerName_)) return false;
+    if (requested(requestedAttrs, "printer-make-and-model") && !text(out, cap, w, 0x42, "printer-make-and-model", "HP Smart Tank 520 - HP PCL 3 GUI")) return false;
+    if (requested(requestedAttrs, "printer-info") && !text(out, cap, w, 0x41, "printer-info", "ESP32-S3 USB print server")) return false;
+    if (requested(requestedAttrs, "printer-uri-supported") && !text(out, cap, w, 0x45, "printer-uri-supported", printerUri_)) return false;
+    if (requested(requestedAttrs, "uri-authentication-supported") && !keyword(out, cap, w, "uri-authentication-supported", "none")) return false;
+    if (requested(requestedAttrs, "uri-security-supported") && !keyword(out, cap, w, "uri-security-supported", "none")) return false;
+    if (requested(requestedAttrs, "ipp-versions-supported") && !keyword(out, cap, w, "ipp-versions-supported", "1.1")) return false;
+    if (requested(requestedAttrs, "document-format-supported") && !attr(out, cap, w, 0x49, "document-format-supported", (const uint8_t *)MobilePrintProfile::FORMAT_PCL3GUI, strlen(MobilePrintProfile::FORMAT_PCL3GUI))) return false;
+    if (requested(requestedAttrs, "document-format-default") && !attr(out, cap, w, 0x49, "document-format-default", (const uint8_t *)MobilePrintProfile::FORMAT_PCL3GUI, strlen(MobilePrintProfile::FORMAT_PCL3GUI))) return false;
+    if (requested(requestedAttrs, "printer-state") && !enumAttr(out, cap, w, "printer-state", 3)) return false;
+    if (requested(requestedAttrs, "printer-state-reasons") && !keyword(out, cap, w, "printer-state-reasons", "none")) return false;
+    if (requested(requestedAttrs, "printer-is-accepting-jobs") && !boolAttr(out, cap, w, "printer-is-accepting-jobs", handler_ != nullptr)) return false;
+    if (requested(requestedAttrs, "queued-job-count") && !integerAttr(out, cap, w, "queued-job-count", queue_ ? queue_->activeCount() : 0)) return false;
+    if (requested(requestedAttrs, "copies-supported") && !rangeAttr(out, cap, w, "copies-supported", 1, 99)) return false;
+    if (requested(requestedAttrs, "color-supported") && !boolAttr(out, cap, w, "color-supported", true)) return false;
+    if (requested(requestedAttrs, "operations-supported")) {
+      if (!enumAttr(out, cap, w, "operations-supported", OP_PRINT_JOB) || !enumAttr(out, cap, w, "operations-supported", OP_VALIDATE_JOB) || !enumAttr(out, cap, w, "operations-supported", OP_CANCEL_JOB) || !enumAttr(out, cap, w, "operations-supported", OP_GET_JOB_ATTRIBUTES) || !enumAttr(out, cap, w, "operations-supported", OP_GET_JOBS) || !enumAttr(out, cap, w, "operations-supported", OP_GET_PRINTER_ATTRIBUTES)) return false;
     }
-  } else if (op == VJ) {
-    if (doc < len) status = BAD, error = "Validate-Job must not contain document data";
-    else if (!supported(fmt)) status = FORMAT, error = "Document format not supported";
-  } else if (op == CJ) {
-    if (!queue_ || requestedJob == 0) {
-      status = NOTFOUND;
-      error = "Job not found";
-    } else if (!queue_->cancel(requestedJob, error)) {
-      status = error == "Job is already finished" ? NOTPOSSIBLE : NOTFOUND;
+  } else if (op == OP_PRINT_JOB && status == ST_OK) {
+    out[w++] = 0x02; if (!integerAttr(out, cap, w, "job-id", jobId)) return false;
+    String jobUri = printerUri_ + "/" + String(jobId); if (!text(out, cap, w, 0x45, "job-uri", jobUri)) return false;
+    if (!enumAttr(out, cap, w, "job-state", MobilePrintQueue::STATE_PENDING)) return false;
+  } else if (op == OP_GET_JOB_ATTRIBUTES && status == ST_OK) {
+    MobilePrintQueue::JobInfo info;
+    if (queue_ && queue_->getJob(requestedJob, info)) {
+      out[w++] = 0x02; if (!integerAttr(out, cap, w, "job-id", info.id)) return false;
+      String jobUri = printerUri_ + "/" + String(info.id); if (!text(out, cap, w, 0x45, "job-uri", jobUri)) return false;
+      if (!enumAttr(out, cap, w, "job-state", info.state)) return false;
+      if (!keyword(out, cap, w, "job-state-reasons", info.reason.length() ? info.reason.c_str() : "none")) return false;
+      if (!attr(out, cap, w, 0x49, "document-format", (const uint8_t *)info.format.c_str(), info.format.length())) return false;
     }
-  } else if (op == GJA) {
-    MobilePrintQueue::JobInfo j;
-    if (!queue_ || requestedJob == 0 || !queue_->getJob(requestedJob, j)) {
-      status = NOTFOUND;
-      error = "Job not found";
-    }
-  } else if (op != GJ && op != GPA) {
-    status = UNSUPPORTED;
-    error = "IPP operation not supported";
-  }
-
-  if (op == GJ && which != "completed" && which != "not-completed" && which != "all") {
-    status = BAD;
-    error = "Unsupported which-jobs value";
-  }
-
-  size_t w = 0;
-  if (cap < 32) return false;
-  out[w++] = ver >> 8;
-  out[w++] = ver;
-  p16(out + w, status); w += 2;
-  p32(out + w, req); w += 4;
-  out[w++] = 1;
-
-  if (!str(out, cap, w, 0x47, "attributes-charset", "utf-8") ||
-      !str(out, cap, w, 0x48, "attributes-natural-language", "en")) return false;
-  if (!error.isEmpty() && !str(out, cap, w, 0x41, "status-message", error)) return false;
-
-  auto printerAttrs = [&]() -> bool {
-    if (w >= cap) return false;
-    out[w++] = 4;
-    bool a = true;
-
-    if (wants(requested, "printer-name")) a &= str(out, cap, w, 0x42, "printer-name", printerName_);
-    if (wants(requested, "printer-make-and-model")) a &= str(out, cap, w, 0x42, "printer-make-and-model", "ESP32-S3 HP Print Server");
-    if (wants(requested, "printer-info")) a &= str(out, cap, w, 0x41, "printer-info", "Smartphone print server");
-    if (wants(requested, "printer-uri-supported")) a &= str(out, cap, w, 0x45, "printer-uri-supported", printerUri_);
-    if (wants(requested, "uri-authentication-supported")) a &= kw(out, cap, w, "uri-authentication-supported", "none");
-    if (wants(requested, "uri-security-supported")) a &= kw(out, cap, w, "uri-security-supported", "none");
-
-    if (wants(requested, "ipp-versions-supported")) {
-      a &= kw(out, cap, w, "ipp-versions-supported", "1.1");
-      a &= kw(out, cap, w, "ipp-versions-supported", "2.0");
-    }
-
-    if (wants(requested, "operations-supported")) {
-      a &= en(out, cap, w, "operations-supported", PJ);
-      a &= en(out, cap, w, "operations-supported", VJ);
-      a &= en(out, cap, w, "operations-supported", CJ);
-      a &= en(out, cap, w, "operations-supported", GJA);
-      a &= en(out, cap, w, "operations-supported", GJ);
-      a &= en(out, cap, w, "operations-supported", GPA);
-    }
-
-    if (wants(requested, "charset-configured")) a &= str(out, cap, w, 0x47, "charset-configured", "utf-8");
-    if (wants(requested, "charset-supported")) a &= str(out, cap, w, 0x47, "charset-supported", "utf-8");
-    if (wants(requested, "natural-language-configured")) a &= str(out, cap, w, 0x48, "natural-language-configured", "en");
-    if (wants(requested, "generated-natural-language-supported")) a &= str(out, cap, w, 0x48, "generated-natural-language-supported", "en");
-    if (wants(requested, "compression-supported")) a &= kw(out, cap, w, "compression-supported", "none");
-    if (wants(requested, "pdl-override-supported")) a &= kw(out, cap, w, "pdl-override-supported", "not-attempted");
-
-    if (wants(requested, "document-format-default")) a &= str(out, cap, w, 0x49, "document-format-default", "image/pwg-raster");
-
-    // USB printing is already working, so discovery must not depend on the
-    // optional persistent queue. A RAM-only queue is sufficient to advertise
-    // the printer as accepting jobs.
-    if (wants(requested, "printer-is-accepting-jobs")) {
-      bool accepting = handler_ != nullptr && (!queue_ || queue_->activeCount() < MobilePrintQueue::MAX_JOBS);
-      a &= ippBoolean(out, cap, w, "printer-is-accepting-jobs", accepting);
-    }
-
-    if (wants(requested, "printer-state")) {
-      a &= en(out, cap, w, "printer-state", (queue_ && queue_->activeCount()) ? 4 : 3);
-    }
-    if (wants(requested, "printer-state-reasons")) a &= kw(out, cap, w, "printer-state-reasons", "none");
-    if (wants(requested, "printer-up-time")) a &= i32(out, cap, w, 0x21, "printer-up-time", millis() / 1000UL);
-    if (wants(requested, "queued-job-count")) a &= i32(out, cap, w, 0x21, "queued-job-count", queue_ ? queue_->activeCount() : 0);
-
-    if (wants(requested, "document-format-supported")) {
-      a &= str(out, cap, w, 0x49, "document-format-supported", "image/pwg-raster");
-      a &= str(out, cap, w, 0x49, "document-format-supported", "application/PCLm");
-      a &= str(out, cap, w, 0x49, "document-format-supported", "application/pdf");
-      a &= str(out, cap, w, 0x49, "document-format-supported", "image/jpeg");
-      a &= str(out, cap, w, 0x49, "document-format-supported", "image/urf");
-    }
-
-    if (wants(requested, "media-supported")) a &= kw(out, cap, w, "media-supported", "iso_a4_210x297mm");
-    if (wants(requested, "media-default")) a &= kw(out, cap, w, "media-default", "iso_a4_210x297mm");
-    if (wants(requested, "sides-supported")) a &= kw(out, cap, w, "sides-supported", "one-sided");
-    if (wants(requested, "sides-default")) a &= kw(out, cap, w, "sides-default", "one-sided");
-    if (wants(requested, "color-supported")) a &= ippBoolean(out, cap, w, "color-supported", true);
-    if (wants(requested, "copies-default")) a &= i32(out, cap, w, 0x21, "copies-default", 1);
-    if (wants(requested, "copies-supported")) a &= range(out, cap, w, "copies-supported", 1, 99);
-    return a;
-  };
-
-  auto jobAttrs = [&](const MobilePrintQueue::JobInfo &j, bool filter) -> bool {
-    if (w >= cap) return false;
-    out[w++] = 2;
-    bool a = true;
-    String uri = printerUri_ + "/job-" + String(j.id);
-    if (wants(requested, "job-id") || !filter) a &= i32(out, cap, w, 0x21, "job-id", j.id);
-    if (wants(requested, "job-uri") || !filter) a &= str(out, cap, w, 0x45, "job-uri", uri);
-    if (wants(requested, "job-printer-uri") || !filter) a &= str(out, cap, w, 0x45, "job-printer-uri", printerUri_);
-    if (wants(requested, "job-name") || !filter) a &= str(out, cap, w, 0x42, "job-name", "Android mobile print job");
-    if (wants(requested, "job-originating-user-name") || !filter) a &= str(out, cap, w, 0x42, "job-originating-user-name", "android");
-    if (wants(requested, "document-format") || !filter) a &= str(out, cap, w, 0x49, "document-format", j.format);
-    if (wants(requested, "job-k-octets") || !filter) a &= i32(out, cap, w, 0x21, "job-k-octets", (j.size + 1023) / 1024);
-    if (wants(requested, "job-state") || !filter) a &= en(out, cap, w, "job-state", j.state);
-    if (wants(requested, "job-state-reasons") || !filter) a &= kw(out, cap, w, "job-state-reasons", j.reason.c_str());
-    if (wants(requested, "job-printer-up-time") || !filter) a &= i32(out, cap, w, 0x21, "job-printer-up-time", millis() / 1000UL);
-    return a;
-  };
-
-  if (op == GPA) {
-    if (!printerAttrs()) return false;
-  } else if (op == PJ && status == IPP_OK) {
-    MobilePrintQueue::JobInfo j;
-    if (queue_ && queue_->getJob(jobId, j) && !jobAttrs(j, false)) return false;
-  } else if (op == GJA && status == IPP_OK) {
-    MobilePrintQueue::JobInfo j;
-    if (!queue_ || !queue_->getJob(requestedJob, j) || !jobAttrs(j, false)) return false;
-  } else if (op == GJ && status == IPP_OK) {
-    uint8_t n = queue_ ? queue_->count() : 0;
-    uint8_t returned = 0;
-    for (uint8_t i = 0; i < n; i++) {
-      MobilePrintQueue::JobInfo j;
-      if (!queue_->getJobAt(i, j)) continue;
-      bool terminal = j.state == MobilePrintQueue::STATE_COMPLETED ||
-                      j.state == MobilePrintQueue::STATE_CANCELED ||
-                      j.state == MobilePrintQueue::STATE_ABORTED;
-      bool match = which == "completed" ? terminal : !terminal;
-      if (which == "all") match = true;
-      if (match && (limit == 0 || returned < limit)) {
-        if (!jobAttrs(j, true)) return false;
-        ++returned;
-      }
+  } else if (op == OP_GET_JOBS && status == ST_OK && queue_) {
+    for (uint8_t i = 0; i < queue_->count() && i < MobilePrintQueue::MAX_JOBS; ++i) {
+      MobilePrintQueue::JobInfo info; if (!queue_->getJobAt(i, info)) continue;
+      if (whichJobs == "completed" && info.state != MobilePrintQueue::STATE_COMPLETED) continue;
+      if (whichJobs == "not-completed" && info.state == MobilePrintQueue::STATE_COMPLETED) continue;
+      out[w++] = 0x02;
+      if (!integerAttr(out, cap, w, "job-id", info.id)) return false;
+      String jobUri = printerUri_ + "/" + String(info.id); if (!text(out, cap, w, 0x45, "job-uri", jobUri)) return false;
+      if (!enumAttr(out, cap, w, "job-state", info.state)) return false;
+      if (!attr(out, cap, w, 0x49, "document-format", (const uint8_t *)info.format.c_str(), info.format.length())) return false;
     }
   }
 
-  if (w + 1 > cap) return false;
-  out[w++] = 3;
-  rl = w;
-  return true;
+  if (w + 1 > cap) return false; out[w++] = 0x03; rl = w; return true;
 }
 
-void MobileIppServer::handleClient(WiFiClient &c) {
-  uint8_t *b = nullptr;
-  size_t bl = 0;
-  uint8_t *o = (uint8_t *)malloc(RESPONSE_CAPACITY);
-  size_t ol = 0;
-
-  bool ok = o && readHttpBody(c, &b, bl) && buildResponse(b, bl, o, RESPONSE_CAPACITY, ol);
-
-  if (!ok) {
-    // Keep the HTTP layer valid. Clients such as NetPrinter and Android can
-    // then distinguish an IPP error from a dead TCP/HTTP endpoint.
-    c.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-    Serial.println("[IPP] HTTP 400 - malformed/non-IPP request");
-  } else {
-    c.print("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: ");
-    c.print(ol);
-    c.print("\r\nConnection: close\r\n\r\n");
-    c.write(o, ol);
-    Serial.printf("[IPP] HTTP 200, IPP response=%u bytes\n", (unsigned)ol);
-  }
-
-  if (b) free(b);
-  if (o) free(o);
-  c.stop();
+void MobileIppServer::handleClient(WiFiClient &client) {
+  static uint8_t response[RESPONSE_CAPACITY]; uint8_t *request = nullptr; size_t requestLength = 0;
+  const bool httpOk = readHttpBody(client, &request, requestLength); size_t responseLength = 0;
+  const bool ippOk = httpOk && buildResponse(request, requestLength, response, sizeof(response), responseLength);
+  if (!ippOk) client.print("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+  else { client.print("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: "); client.print(responseLength); client.print("\r\nConnection: close\r\n\r\n"); client.write(response, responseLength); }
+  if (request) free(request); client.stop();
 }
 
-void MobileIppServer::poll() {
-  WiFiClient c = server_.available();
-  if (c) handleClient(c);
-}
+void MobileIppServer::poll() { WiFiClient client = server_.available(); if (client) handleClient(client); }

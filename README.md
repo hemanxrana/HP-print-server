@@ -1,80 +1,95 @@
 # HP Print Server
 
-Arduino IDE firmware for an ESP32-S3 print server designed primarily for **smartphone printing** to USB-connected HP printers.
+Arduino IDE firmware for an **ESP32-S3** wireless print server, with an emphasis on USB-connected HP printers and smartphone printing.
 
-## Smartphone-first architecture
+## Arduino IDE layout
+
+The project is intentionally **flat**: all `.ino`, `.cpp`, and `.h` files required by the firmware live in the sketch root. There is no nested `src/usb` source tree and no duplicate USB headers.
+
+Open:
+
+```text
+HP-print-server.ino
+```
+
+in Arduino IDE. Arduino will compile the companion `.cpp` files in the same directory.
+
+## Target stack
 
 ```text
 Android / Mopria / Default Print Service
-        |
-        | DNS-SD _ipp._tcp
-        | IPP over TCP/631
-        v
-ESP32-S3 IPP endpoint /ipp/print
-        |
-        | persistent LittleFS job store
-        v
- pending -> processing -> completed / canceled / aborted
-        |
-        v
- USB Host -> HP printer backend
+          |
+          | DNS-SD _ipp._tcp
+          | IPP over TCP/631
+          v
+ESP32-S3 IPP server + persistent LittleFS queue
+          |
+          | USB Host
+          v
+USB Printer Class interface selection
+          |
+          | Bulk OUT
+          v
+HP printer
 ```
 
-The network side is intentionally independent from the printer-side transport. This lets the ESP32 present a standards-based IPP printer to a phone while the eventual backend handles the USB-connected HP device.
+The USB implementation enumerates the printer descriptors, discovers Printer Class interfaces and Bulk endpoints, scores the available interfaces, and allows an advanced manual interface/alternate-setting selection from the web UI.
 
-## Target printer: HP Smart Tank 520
+For normal HP printers the automatic selector prefers the standard bidirectional Printer Class protocol (`0x02`). Other Printer Class protocols are detected and exposed, but the current raw-PCL backend only sends jobs through a usable raw-print interface.
 
-HP's current specifications list **no built-in wireless networking**, one Hi-Speed USB 2.0 device connection, and **HP PCL 3 GUI / HP PCLm** print languages. Therefore the ESP32-S3 must provide the wireless network service, USB Host transport, and a document path that produces a format the printer accepts.
+## Main features
 
-Accepting a PDF or PWG Raster job over IPP is therefore only the network-ingress half of the project. The firmware deliberately does **not** claim that a physical page printed until a printer backend reports that state.
-
-## Implemented on `chore/initial-project-skeleton`
-
-- Arduino IDE / ESP32-S3 sketch
+- ESP32-S3 Arduino IDE firmware
 - Wi-Fi station mode with fallback configuration AP
-- persistent Wi-Fi and printer configuration using Preferences
-- mobile configuration web page and Wi-Fi scanner
-- DNS-SD `_ipp._tcp` advertisement with `rp=ipp/print`
-- IPP 1.1/2.0 request handling over HTTP
-- `Print-Job`
-- `Validate-Job`
-- `Cancel-Job`
-- `Get-Job-Attributes`
-- `Get-Jobs`
-- `Get-Printer-Attributes`
-- requested-attributes handling for the implemented attribute set
-- `which-jobs` and `limit` handling for Get-Jobs
+- persistent Wi-Fi/printer configuration using Preferences
+- browser-based configuration and Wi-Fi scanner
+- DNS-SD `_ipp._tcp` advertisement
+- IPP smartphone-facing server
 - persistent multi-job LittleFS spool
-- up to 8 active jobs, with terminal jobs retained for IPP history
-- reboot recovery: a job left in `processing` is returned to `pending`
-- cancellation and persistent job-state reasons
-- 4 MiB per-document safety limit
-- accepted mobile formats: PWG Raster, PCLm, PDF, JPEG and URF
-- strict HTTP request-path/content-type/content-length checks
-- no false `completed` state before a real backend reports completion
-- retained printer-discovery layer for mDNS, SSDP, WSD and targeted SNMP
-- retained RAW 9100 and LPR transport interfaces
-- corrected IPP transport request encoder for outbound printer-to-printer use
+- PWG Raster, PCLm, PDF, JPEG and URF ingress formats
+- USB Host enumeration and descriptor inspection
+- automatic USB Printer Class interface selection
+- manual USB interface + alternate-setting selection
+- dynamic Bulk OUT endpoint discovery
+- USB device disconnect/reconnect handling
+- production USB Bulk OUT transfer path
+- PCL test-print endpoint using the production USB backend
+- retained RAW 9100, LPR, outbound IPP, mDNS, SSDP, WSD and SNMP transport/discovery helpers
+- `/health` status endpoint
+- `/simulate` network-to-USB pipeline diagnostic
 
-The IPP behavior follows the IPP operation and job-state model in RFC 8011: Validate-Job does not create a job, Get-Jobs supports completed/not-completed selection, Cancel-Job transitions a live job to canceled, and Get-Job-Attributes exposes the retained job object.
+## USB source files
 
-## Current boundary
+All USB files are at the sketch root:
 
-The current firmware is a **working network-facing print-server layer**, not yet a complete physical HP printer driver.
+- `usb_device.h`
+- `usb_host_manager.h/.cpp`
+- `usb_printer_backend.h/.cpp`
+- `usb_diagnostics.h/.cpp`
 
-Still required for real paper output:
+This flat layout is deliberate. Do not recreate `src/usb` or keep a second copy of these headers; Arduino IDE can otherwise compile/include inconsistent versions.
 
-1. ESP32-S3 USB Host initialization and enumeration of the Smart Tank 520.
-2. USB endpoint/interface identification and bulk transport.
-3. HP PCLm/PCL 3 GUI-compatible rendering/translation where the phone does not already supply a printer-compatible document.
-4. A backend worker that changes jobs from `pending` to `processing` and finally `completed` or `aborted` based on real USB/printer status.
-5. Hardware testing with the actual Smart Tank 520.
+## Arduino ESP32 core
 
-HP documents the Smart Tank 520 as supporting PCLm, which is why PCLm is the preferred direct mobile-to-HP path.
+The project CI targets **Arduino-ESP32 3.3.10**.
 
-## Configuration
+For the ESP32-S3 USB-host portion, use 3.3.10 first. Arduino-ESP32 3.3.11 has a known USB-host enumeration regression in configurations where the enumeration-filter feature is enabled; this firmware includes an allow-all enumeration-filter callback when that feature is present, but 3.3.10 remains the baseline for this project.
 
-First boot creates:
+## Build
+
+1. Install Arduino IDE.
+2. Install **esp32 by Espressif Systems** from Boards Manager.
+3. Use Arduino-ESP32 **3.3.10** for the baseline build.
+4. Select the ESP32-S3 board matching your hardware.
+5. Open `HP-print-server.ino`.
+6. Compile and upload.
+7. Open Serial Monitor at **115200 baud**.
+
+The repository also contains an Arduino CLI CI workflow that installs ESP32 core 3.3.10 and compiles the sketch as an ESP32-S3 target.
+
+## First boot
+
+The configuration AP is:
 
 ```text
 SSID:     HP-Print-Server
@@ -87,32 +102,29 @@ Open:
 http://192.168.4.1/
 ```
 
-Configure the normal Wi-Fi network and printer information. Configuration survives reboot.
+Configure the Wi-Fi network and printer information. The USB interface page appears once a Printer Class device is enumerated.
 
-The AP password remains a development default and should be made configurable before production use.
+## USB selection
 
-## Arduino IDE build
+**Automatic** is the normal setting. The firmware discovers interface numbers, alternate settings and endpoint addresses from the USB descriptors; endpoint addresses are never hard-coded in the configuration.
 
-1. Install Arduino IDE.
-2. Install **esp32 by Espressif Systems** through Boards Manager.
-3. Select the ESP32-S3 board definition matching the physical board.
-4. Open `HP-print-server.ino`.
-5. Compile and upload.
-6. Open Serial Monitor at 115200 baud.
+Manual selection is intended for diagnostics and printers that expose multiple Printer Class interfaces.
 
-## Project files
+A selected interface must have a valid Bulk OUT endpoint before it can be used for raw printing.
 
-- `HP-print-server.ino` — application, configuration UI, Wi-Fi and service startup
-- `mobile_ipp_server.h/.cpp` — HTTP + IPP smartphone-facing server
-- `mobile_print_queue.h/.cpp` — persistent multi-job spool and recovery
-- `mobile_print_profile.h` — mobile IPP/DNS-SD profile
-- `discovery_engine.h/.cpp` — mDNS, SSDP, WSD and targeted SNMP discovery
-- `print_transports.h/.cpp` — RAW 9100, LPR and outbound IPP transport helpers
-- `ipp_server.h/.cpp` — legacy IPP compatibility layer; mobile printing uses `mobile_ipp_server`
-- `printer_protocols.h` — transport/discovery enums
+## Important status semantics
 
-## Verification
+A network IPP job is not marked completed merely because it was accepted by the TCP/IP layer. The queue remains pending until the USB backend successfully transfers the complete document. A failed USB transfer moves the job to an aborted/error state.
 
-The current source was re-reviewed after implementation specifically for the failure modes found during the earlier simulation: single-job storage, incorrect IPP operation handling, missing Get-Jobs, incorrect job-state semantics, cancellation, reboot recovery, queue capacity, requested attributes, Get-Jobs filtering, and false completion. The previously removed discovery/transport files were also restored so the protocol roadmap is not silently lost.
+USB transfer acknowledgement means that the USB host accepted the transfer; it is not proof that the printer physically produced a page.
 
-A physical Arduino build and end-to-end Android print test still require the ESP32-S3 development board and Arduino ESP32 toolchain. The repository should therefore be treated as **network-layer implementation complete, hardware backend not yet complete**, rather than as a finished printer driver.
+## Current limitations
+
+- The raw USB backend currently targets Printer Class protocol `0x02` (standard bidirectional raw/PCL-style printing).
+- Printer Class protocol `0x04` is detected but is not yet implemented as a full IPP-over-USB transport.
+- Document conversion/rendering is not a general-purpose PDF/PWG-to-HP-PCL engine; the phone's supplied format must be supported by the selected backend path.
+- Physical page verification requires printer-side status/feedback and is not inferred from USB transfer completion alone.
+
+## Repository history
+
+The current Arduino-ready structure consolidates the latest USB interface-selection work rather than preserving the older nested `src/usb` layout. Earlier development branches are retained as historical references, while the Arduino-ready branch is the source of truth for the flat sketch structure.

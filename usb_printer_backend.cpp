@@ -4,10 +4,19 @@
 
 namespace {
 constexpr uint16_t RAW_PORT = 9100;
-constexpr uint32_t RAW_IDLE_TIMEOUT_MS = 30000;
-constexpr uint32_t RAW_JOB_DRAIN_MS = 1500;
+// A RAW client is allowed to pause for a long time while the host application
+// prepares more data. 30 seconds was too aggressive for large/slow print jobs.
+constexpr uint32_t RAW_IDLE_TIMEOUT_MS = 300000;
+// Keep the connection open briefly after the final USB transfer so the printer
+// can drain its USB receive pipeline. This does not modify the print stream.
+constexpr uint32_t RAW_JOB_DRAIN_MS = 3000;
 constexpr uint32_t RAW_CLOSE_GUARD_MS = 250;
-constexpr size_t RAW_RX_CHUNK = 8192;
+// Keep USB transfers comfortably sized. The USB host controller handles the
+// endpoint MPS internally, but smaller transfers avoid making one TCP burst
+// dependent on a single large USB transaction.
+constexpr size_t RAW_RX_CHUNK = 4096;
+constexpr size_t RAW_USB_CHUNK = 1024;
+constexpr uint32_t RAW_USB_TIMEOUT_MS = 30000;
 
 WiFiServer rawServer(RAW_PORT);
 WiFiClient rawClient;
@@ -22,18 +31,28 @@ bool selectedInterfaceUsable(const UsbHostManager &host) {
 }
 
 bool sendUsbChunk(UsbHostManager &host, const uint8_t *data, size_t length, String &error) {
-  size_t accepted = 0;
-  if (!host.bulkWrite(data, length, accepted, 10000, error)) return false;
-  if (accepted != length) {
-    error = "USB Bulk OUT short write: " + String((unsigned)accepted) + "/" + String((unsigned)length);
-    return false;
+  if (!data || !length) return true;
+
+  size_t offset = 0;
+  while (offset < length) {
+    const size_t part = min(RAW_USB_CHUNK, length - offset);
+    size_t accepted = 0;
+    if (!host.bulkWrite(data + offset, part, accepted, RAW_USB_TIMEOUT_MS, error)) return false;
+    if (accepted != part) {
+      error = "USB Bulk OUT short write: " + String((unsigned)accepted) + "/" + String((unsigned)part);
+      return false;
+    }
+    offset += part;
+    // Do not starve the Arduino task/Wi-Fi stack while a large RAW job is
+    // being forwarded as many USB transfers.
+    yield();
   }
   return true;
 }
 
 void finishRawConnection(UsbPrinterBackend *backend, const char *reason) {
   // TCP FIN is not a USB printer completion indication. Give the printer time
-  // to drain the final USB transfer before releasing the network connection.
+  // to drain the final USB transfers before releasing the network connection.
   // No FF/PJL/UEL/form-feed is injected: RAW remains byte-for-byte transparent.
   if (backend) backend->finishRawJob();
   delay(RAW_CLOSE_GUARD_MS);
@@ -56,7 +75,7 @@ void handleRawServer(UsbPrinterBackend *backend) {
       }
       rawClient = incoming;
       rawClient.setNoDelay(true);
-      rawClient.setTimeout(30000);
+      rawClient.setTimeout(RAW_IDLE_TIMEOUT_MS);
       rawLastDataMs = millis();
       rawBytesReceived = 0;
       Serial.println("[RAW] TCP 9100 client connected; transparent USB pass-through");
@@ -89,7 +108,9 @@ void handleRawServer(UsbPrinterBackend *backend) {
   if (!rawClient.connected()) {
     finishRawConnection(backend, "connection-closed");
   } else if (millis() - rawLastDataMs >= RAW_IDLE_TIMEOUT_MS) {
-    finishRawConnection(backend, "idle-timeout");
+    // Safety cutoff only. Normal jobs finish when the sender closes the TCP
+    // stream; a 5-minute pause is tolerated before we assume a dead client.
+    finishRawConnection(backend, "idle-timeout-5min");
   }
 }
 
@@ -196,7 +217,7 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
     return false;
   }
 
-  // Never complete a RAW job per 8 KiB chunk. Keep it PRINTING until the TCP
+  // Never complete a RAW job per TCP/USB chunk. Keep it PRINTING until the TCP
   // stream ends and the final USB pipeline drain has completed.
   reason_ = "raw-job-in-progress";
   return true;

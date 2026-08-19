@@ -1,0 +1,32 @@
+name: Clean dashboard descriptions
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/cleanup-dashboard-descriptions.yml'
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove dashboard section explanations
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('HP-print-server.ino')
+          s=p.read_text()
+          old='''<div id="scanState" class="hint">Select a USB interface above. Wi-Fi scanning is independent of the USB interface.</div>'''
+          if old not in s:
+              raise SystemExit('Target explanation not found; refusing to modify file')
+          s=s.replace(old,'',1)
+          p.write_text(s)
+          PY
+      - name: Commit change
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add HP-print-server.ino
+          git commit -m 'Simplify dashboard section descriptions'
+          git push

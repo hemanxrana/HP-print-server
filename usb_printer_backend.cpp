@@ -98,7 +98,8 @@ void startRawServerIfNeeded(){
     }
   }
 }
-}
+
+} // namespace
 
 bool UsbPrinterBackend::begin(){
   StatusLed::begin();

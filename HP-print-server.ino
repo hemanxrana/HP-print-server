@@ -221,10 +221,24 @@ void sendJsonStatus() {
 void handleInterfaceMode() {
   const String mode = configServer.hasArg("mode") ? configServer.arg("mode") : "printer";
   if (mode == "scanner") {
+    bool scannerDetected = false;
+    for (uint8_t i = 0; i < usbHost.device().interfaceCount; ++i) {
+      if (usbHost.device().interfaces[i].isScanner()) {
+        scannerDetected = true;
+        break;
+      }
+    }
+    if (!scannerDetected) {
+      scannerInterfaceSelected = false;
+      configServer.send(404, "application/json", "{\"error\":\"Scanner interface not detected\"}");
+      return;
+    }
     scannerInterfaceSelected = true;
-    usbHost.setInterfaceSelection(false, USB_SCAN_INTERFACE, USB_SCAN_ALT);
-    Serial.printf("[USB] Interface mode changed: scanner IF=%u ALT=%u\n", USB_SCAN_INTERFACE, USB_SCAN_ALT);
-    configServer.send(200, "application/json", "{\"mode\":\"scanner\",\"interface\":0,\"alternate\":0}");
+    // Keep the existing /interface.json selection API. Scanner selection is
+    // descriptor/UI state only; RAW printing remains on the Printer Class
+    // interface and is never redirected to a scanner interface.
+    Serial.println("[USB] Interface mode changed: scanner (descriptor detected; RAW printer path unchanged)");
+    configServer.send(200, "application/json", "{\"mode\":\"scanner\"}");
     return;
   }
 
@@ -232,6 +246,14 @@ void handleInterfaceMode() {
   usbHost.setInterfaceSelection(false, RAW_PRINT_INTERFACE, RAW_PRINT_ALT);
   Serial.printf("[USB] Interface mode changed: printer IF=%u ALT=%u\n", RAW_PRINT_INTERFACE, RAW_PRINT_ALT);
   configServer.send(200, "application/json", "{\"mode\":\"printer\",\"interface\":1,\"alternate\":0}");
+}
+
+static String endpointDetails(const UsbEndpointInfo &ep, const char *label) {
+  if (!ep.valid()) return String(label) + " none";
+  return String(label) + " 0x" + String(ep.address, HEX)
+      + " attr=0x" + String(ep.attributes, HEX)
+      + " MPS=" + String(ep.maxPacketSize)
+      + " interval=" + String(ep.interval);
 }
 
 String dashboard() {
@@ -247,10 +269,28 @@ String dashboard() {
     const UsbPrinterInterfaceInfo &pi = usbHost.device().printer;
     printerInterfaceDetails = String("Interface ") + String(pi.interfaceNumber)
         + " · Alternate " + String(pi.alternateSetting)
-        + " · Subclass 0x" + String(pi.subclass, HEX)
+        + " · Class 0x07 · Subclass 0x" + String(pi.subclass, HEX)
         + " · Protocol 0x" + String(pi.protocol, HEX)
-        + " · OUT 0x" + String(pi.bulkOut.address, HEX)
-        + " · IN 0x" + String(pi.bulkIn.address, HEX);
+        + " · " + endpointDetails(pi.bulkOut, "Bulk OUT")
+        + " · " + endpointDetails(pi.bulkIn, "Bulk IN");
+  }
+
+  String scannerInterfaceDetails = "Not detected";
+  if (printerAttached) {
+    for (uint8_t i = 0; i < usbHost.device().interfaceCount; ++i) {
+      const UsbInterfaceInfo &si = usbHost.device().interfaces[i];
+      if (!si.isScanner()) continue;
+      scannerInterfaceDetails = String("Interface ") + String(si.interfaceNumber)
+          + " · Alternate " + String(si.alternateSetting)
+          + " · Class 0x" + String(si.classCode, HEX)
+          + " · Subclass 0x" + String(si.subclass, HEX)
+          + " · Protocol 0x" + String(si.protocol, HEX)
+          + " · " + endpointDetails(si.bulkOut, "Bulk OUT")
+          + " · " + endpointDetails(si.bulkIn, "Bulk IN")
+          + " · " + endpointDetails(si.interruptOut, "Interrupt OUT")
+          + " · " + endpointDetails(si.interruptIn, "Interrupt IN");
+      break;
+    }
   }
 
   String html;
@@ -282,7 +322,9 @@ body:before{content:"";position:fixed;inset:0;pointer-events:none;background:lin
 </div>
 
 <div class="section glass"><div class="sectionHead"><div><h2>USB Interface</h2><p>Select the USB interface to use. The selected interface is highlighted and its available descriptor information is shown below.</p></div></div>
-<div class="selectWrap"><select id="usbInterfaceSelect" aria-label="USB interface"><option value="printer">Printer</option><option value="scanner">Scanner</option></select></div>
+<div class="selectWrap"><select id="usbInterfaceSelect" aria-label="USB interface"><option value="printer">Printer</option><option value="scanner")HTML";
+  html += scannerInterfaceDetails == "Not detected" ? " disabled" : "";
+  html += R"HTML(>Scanner</option></select></div>
 <div id="usbInterfaceDetails" class="interfaceDetails" style="margin-top:14px;padding:15px;border-radius:16px;background:rgba(255,255,255,.42);border:1px solid rgba(255,255,255,.72)"></div>
 </div>
 
@@ -302,8 +344,10 @@ let interfaceMode=')HTML";
 const printerDetails=')HTML";
   html += jsonEsc(String("Name: ") + deviceName + " · VID: 0x" + String(usbHost.device().vid,HEX) + " · PID: 0x" + String(usbHost.device().pid,HEX) + " · " + printerInterfaceDetails);
   html += R"HTML(';
-const scannerDetails='Not detected — no scanner interface information is exposed by the current USB descriptor model.';
-function updateUsbInterface(){const scanner=interfaceMode==='scanner';const select=$('usbInterfaceSelect');select.value=interfaceMode;$('usbInterfaceDetails').innerHTML=scanner?'<strong>Scanner</strong><br>'+scannerDetails:'<strong>Printer</strong><br>'+printerDetails;select.style.borderColor=scanner?'rgba(0,122,255,.55)':'rgba(0,122,255,.55)';}
+const scannerDetails=')HTML";
+  html += jsonEsc(String("Name: ") + deviceName + " · VID: 0x" + String(usbHost.device().vid,HEX) + " · PID: 0x" + String(usbHost.device().pid,HEX) + " · " + scannerInterfaceDetails);
+  html += R"HTML(';
+function updateUsbInterface(){const scanner=interfaceMode==='scanner';const select=$('usbInterfaceSelect');select.value=scanner?'scanner':'printer';$('usbInterfaceDetails').innerHTML=scanner?'<strong>Scanner</strong><br>'+scannerDetails:'<strong>Printer</strong><br>'+printerDetails;}
 async function setInterfaceMode(mode){if(mode===interfaceMode){updateUsbInterface();return;}const old=interfaceMode;interfaceMode=mode;updateUsbInterface();try{const r=await fetch('/interface.json?mode='+encodeURIComponent(mode)+'&ts='+Date.now());if(!r.ok)throw new Error();const s=await r.json();interfaceMode=s.mode;updateUsbInterface();showToast(interfaceMode==='scanner'?'Scanner interface selected':'Printer interface selected');refreshStatus();}catch(e){interfaceMode=old;updateUsbInterface();showToast('USB interface change failed');}}
 $('usbInterfaceSelect').addEventListener('change',e=>setInterfaceMode(e.target.value));
 $('ssidSelect').addEventListener('change',()=>{$('ssid').value=$('ssidSelect').value;});

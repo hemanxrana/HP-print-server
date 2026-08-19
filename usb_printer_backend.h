@@ -13,25 +13,29 @@ public:
   const String &statusReason() const { return reason_; }
   const UsbDeviceInfo &device() const { return host_.device(); }
 
-  // USB Printer Class status, sourced from the descriptor-selected status
-  // interface via GET_PORT_STATUS on EP0.
+  // USB Printer Class GET_PORT_STATUS, sourced from the descriptor-selected
+  // status interface. The raw byte is interpreted here using the USB Printer
+  // Class definition: bit 5=paper empty, bit 4=selected, bit 3=not error.
   bool usbStatusValid() const { return host_.portStatusValid(); }
   uint8_t usbPortStatus() const { return host_.portStatusValue(); }
-  bool usbStatusError() const { return host_.portStatusError(); }
-  bool usbStatusSelected() const { return host_.portStatusSelected(); }
-  bool usbPaperEmpty() const { return host_.portStatusPaperEmpty(); }
+  bool usbStatusError() const { return usbStatusValid() && !(usbPortStatus() & 0x08); }
+  bool usbStatusSelected() const { return usbStatusValid() && (usbPortStatus() & 0x10); }
+  bool usbPaperEmpty() const { return usbStatusValid() && (usbPortStatus() & 0x20); }
   bool usbStatusUsesSeparateInterface() const { return host_.hasSeparateStatusInterface(); }
 
   // Send an already-rendered raw print stream byte-for-byte to USB Bulk OUT.
   bool sendDirect(const uint8_t *data, size_t length, String &error);
 
-  // Called when a TCP/9100 job has ended. This deliberately does not alter the
-  // document or append a form-feed/PJL command; RAW mode must remain byte exact.
+  // Called after TCP 9100 has been fully drained. This never adds print data.
   void finishRawJob();
 
 private:
+  UsbPrinterBackend(const UsbPrinterBackend &) = delete;
+  UsbPrinterBackend &operator=(const UsbPrinterBackend &) = delete;
+
   UsbHostManager &host_;
   PrinterState state_ = OFFLINE;
   String reason_ = "usb-host-not-initialized";
   bool configured_ = false;
+  uint64_t jobBytes_ = 0;
 };

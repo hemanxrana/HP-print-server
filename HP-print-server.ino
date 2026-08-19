@@ -345,14 +345,50 @@ void loop() {
   usbHost.poll();
   usbPrinterBackend.poll();
 
-  if (millis() - lastStatus > 5000) {
+  if (millis() - lastStatus > 1000) {
     lastStatus = millis();
-    Serial.printf("[STATUS] WiFi=%d IP=%s USB=%d printer=%s raw=%s usbport=0x%02X\n",
-                  (int)WiFi.status(),
-                  WiFi.localIP().toString().c_str(),
-                  (int)usbHost.state(),
-                  printerStateText().c_str(),
-                  usbPrinterBackend.rawClientConnected() ? "connected" : "idle",
-                  usbHost.portStatusValid() ? usbHost.portStatusValue() : 0);
+
+    const int wifiState = (int)WiFi.status();
+    const String ip = WiFi.localIP().toString();
+    const int usbState = (int)usbHost.state();
+    const String printerState = printerStateText();
+    const bool rawConnected = usbPrinterBackend.rawClientConnected();
+    const uint8_t usbPort =
+        usbHost.portStatusValid() ? usbHost.portStatusValue() : 0;
+
+    static bool initialized = false;
+    static int lastWifiState = -1;
+    static String lastIp;
+    static int lastUsbState = -1;
+    static String lastPrinterState;
+    static bool lastRawConnected = false;
+    static uint8_t lastUsbPort = 0;
+
+    const bool changed =
+        !initialized ||
+        wifiState != lastWifiState ||
+        ip != lastIp ||
+        usbState != lastUsbState ||
+        printerState != lastPrinterState ||
+        rawConnected != lastRawConnected ||
+        usbPort != lastUsbPort;
+
+    if (changed) {
+      Serial.printf("[STATUS] WiFi=%d IP=%s USB=%d printer=%s raw=%s usbport=0x%02X\n",
+                    wifiState,
+                    ip.c_str(),
+                    usbState,
+                    printerState.c_str(),
+                    rawConnected ? "connected" : "idle",
+                    usbPort);
+
+      lastWifiState = wifiState;
+      lastIp = ip;
+      lastUsbState = usbState;
+      lastPrinterState = printerState;
+      lastRawConnected = rawConnected;
+      lastUsbPort = usbPort;
+      initialized = true;
+    }
   }
 }

@@ -23,6 +23,23 @@ bool selectedInterfaceUsable(const UsbHostManager &host) {
   return p && p->usableForRawPrint();
 }
 
+bool statusSaysReady(const UsbPrinterBackend &backend) {
+  // GET_PORT_STATUS is optional information for some printers. Until a valid
+  // response has arrived, do not falsely take a working printer offline.
+  if (!backend.usbStatusValid()) return true;
+  return backend.usbStatusSelected() &&
+         !backend.usbPaperEmpty() &&
+         !backend.usbStatusError();
+}
+
+const char *statusReason(const UsbPrinterBackend &backend) {
+  if (!backend.usbStatusValid()) return "status-not-yet-available";
+  if (backend.usbStatusError()) return "usb-printer-reports-error";
+  if (backend.usbPaperEmpty()) return "usb-printer-reports-paper-empty";
+  if (!backend.usbStatusSelected()) return "usb-printer-reports-not-selected";
+  return "usb-printer-ready";
+}
+
 bool sendUsbChunk(UsbHostManager &host, const uint8_t *data, size_t length, String &error) {
   if (!data || !length) return true;
   size_t offset = 0;
@@ -56,7 +73,8 @@ void handleRawServer(UsbPrinterBackend *backend) {
     WiFiClient incoming = rawServer.available();
     if (incoming) {
       if (!backend->online()) {
-        Serial.println("[RAW] Printer not ready; rejecting TCP 9100 connection");
+        Serial.printf("[RAW] Printer not ready; rejecting TCP 9100 connection: %s\n",
+                      backend->statusReason().c_str());
         incoming.stop();
         return;
       }
@@ -70,10 +88,9 @@ void handleRawServer(UsbPrinterBackend *backend) {
     return;
   }
 
-  // TCP connected() may become false immediately after the sender sends FIN,
-  // while bytes already received by lwIP are still waiting in the RX buffer.
-  // Therefore a closed socket is NOT a completion indication until every
-  // currently buffered byte has been forwarded to USB.
+  // Drain everything currently buffered before treating TCP FIN as the end
+  // of the transport. TCP close is not allowed to discard bytes already in
+  // lwIP's receive buffer.
   bool movedData = false;
   while (rawClient.available() > 0) {
     const size_t available = (size_t)rawClient.available();
@@ -99,10 +116,11 @@ void handleRawServer(UsbPrinterBackend *backend) {
   const bool closed = !rawClient.connected();
   const bool pending = rawClient.available() > 0;
 
-  // Only finish after the TCP peer is closed AND the ESP32 socket has no data
-  // left to drain. This fixes the previous end-of-job data-loss window.
+  // Finish only after the peer is closed AND no receive data remains. Every
+  // chunk is synchronously confirmed by the USB transfer layer before it is
+  // counted, so the byte counter represents bytes actually accepted by USB.
   if (closed && !pending) {
-    finishRawConnection(backend, "connection-closed");
+    finishRawConnection(backend, "connection-closed-and-drained");
   } else if (!movedData && millis() - rawLastDataMs >= RAW_IDLE_TIMEOUT_MS) {
     finishRawConnection(backend, "idle-timeout-5min");
   }
@@ -134,6 +152,7 @@ bool UsbPrinterBackend::begin() {
   configured_ = true;
   state_ = OFFLINE;
   reason_ = "waiting-for-usb-printer";
+  jobBytes_ = 0;
   return true;
 }
 
@@ -154,6 +173,9 @@ void UsbPrinterBackend::poll() {
     }
   }
 
+  // Never override an active RAW transfer from the asynchronous status poll.
+  // The status is still sampled and will be reflected as soon as the job
+  // reaches the transport boundary.
   if (state_ == PRINTING) {
     StatusLed::set(StatusLed::PRINTING);
     StatusLed::update();
@@ -162,21 +184,33 @@ void UsbPrinterBackend::poll() {
 
   switch (host_.state()) {
     case UsbHostManager::PRINTER_READY:
-      state_ = selectedInterfaceUsable(host_) ? IDLE : ERROR;
-      reason_ = selectedInterfaceUsable(host_) ? "printer-interface-ready" : "selected-interface-has-no-bulk-output";
-      StatusLed::set(state_ == IDLE ? StatusLed::PRINTER_READY : StatusLed::ERROR);
+      if (!selectedInterfaceUsable(host_)) {
+        state_ = ERROR;
+        reason_ = "selected-interface-has-no-bulk-output";
+      } else if (!statusSaysReady(*this)) {
+        state_ = usbStatusError() ? ERROR : OFFLINE;
+        reason_ = statusReason(*this);
+      } else {
+        state_ = IDLE;
+        reason_ = usbStatusValid() ? "usb-printer-ready" : "printer-interface-ready";
+      }
+      StatusLed::set(state_ == IDLE ? StatusLed::PRINTER_READY :
+                     (state_ == ERROR ? StatusLed::ERROR : StatusLed::WAITING_FOR_PRINTER));
       break;
+
     case UsbHostManager::DEVICE_ATTACHED:
     case UsbHostManager::ENUMERATING:
       state_ = OFFLINE;
       reason_ = "enumerating-usb-device";
       StatusLed::set(StatusLed::WAITING_FOR_PRINTER);
       break;
+
     case UsbHostManager::ERROR:
       state_ = ERROR;
       reason_ = host_.lastError();
       StatusLed::set(StatusLed::ERROR);
       break;
+
     default:
       state_ = OFFLINE;
       reason_ = host_.lastError().length() ? host_.lastError() : "waiting-for-usb-printer";
@@ -208,15 +242,41 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
     StatusLed::set(StatusLed::ERROR);
     return false;
   }
+  jobBytes_ += length;
   reason_ = "raw-job-in-progress";
   return true;
 }
 
 void UsbPrinterBackend::finishRawJob() {
-  if (state_ == PRINTING) {
-    delay(RAW_JOB_DRAIN_MS);
+  if (state_ != PRINTING) return;
+
+  // USB transfer completion guarantees that the ESP32 USB host accepted every
+  // byte. Keep the existing short drain guard so a following TCP connection
+  // cannot immediately collide with a printer that is still consuming its
+  // final USB packets. GET_PORT_STATUS is used after this boundary to report
+  // paper/error/selected state, but it has no BUSY bit and therefore cannot
+  // truthfully be used as a document-complete signal.
+  delay(RAW_JOB_DRAIN_MS);
+
+  if (usbStatusValid() && usbStatusError()) {
+    state_ = ERROR;
+    reason_ = "usb-printer-reports-error-after-job";
+    StatusLed::set(StatusLed::ERROR);
+  } else if (usbStatusValid() && (usbPaperEmpty() || !usbStatusSelected())) {
+    state_ = OFFLINE;
+    reason_ = statusReason(*this);
+    StatusLed::set(StatusLed::WAITING_FOR_PRINTER);
+  } else {
     state_ = IDLE;
-    reason_ = "printer-interface-ready";
+    reason_ = usbStatusValid() ? "usb-printer-ready" : "printer-interface-ready";
     StatusLed::set(StatusLed::PRINTER_READY);
   }
+
+  Serial.printf("[RAW] USB transport complete: %llu bytes; final USB status=%s%s%s%s\n",
+                (unsigned long long)jobBytes_,
+                usbStatusValid() ? "valid" : "unavailable",
+                usbStatusValid() ? " selected=" : "",
+                usbStatusValid() ? (usbStatusSelected() ? "yes" : "no") : "",
+                usbStatusValid() ? (usbStatusError() ? " error=yes" : " error=no") : "");
+  jobBytes_ = 0;
 }

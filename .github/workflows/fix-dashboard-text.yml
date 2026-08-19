@@ -3,27 +3,39 @@ on:
   push:
     paths:
       - '.github/workflows/fix-dashboard-text.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   fix:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Remove explanatory dashboard text
+      - name: Remove explanatory dashboard text and fix scan UI syntax
         run: |
           python3 - <<'PY'
           from pathlib import Path
           p=Path('HP-print-server.ino')
-          s=p.read_text()
-          s=s.replace('<div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan Wi-Fi</button></div>\n<div class="selectWrap"', '<div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan Wi-Fi</button></div>\n<div id="scanState" class="hint" style="display:none"></div><div class="selectWrap"', 1)
-          s=s.replace("const b=$('scanBtn'),select=$('ssidSelect'),state=$('scanState');", "const b=$('scanBtn'),select=$('ssidSelect'),state=$('scanState');", 1)
-          p.write_text(s)
+          s=p.read_text(encoding='utf-8')
+          # Keep section headings; remove only explanatory paragraphs if present.
+          for text in [
+              'Choose which USB interface is selected on the connected multifunction device. The scanner selection is kept separate from the printer path used for RAW 9100 printing.',
+              'USB printer interface and RAW printing status',
+              'USB printer state and connection details.',
+              'Network connection and RAW 9100 service information.',
+              'Connection and print-server status.',
+          ]:
+              s=s.replace('<p>'+text+'</p>','')
+          # The current dashboard has no section-description paragraphs; keep its headings and controls.
+          # Fix the missing statement separator in the Wi-Fi scan handler if present.
+          s=s.replace("b.textContent='Scanning…'select.innerHTML", "b.textContent='Scanning…';select.innerHTML")
+          p.write_text(s,encoding='utf-8')
           PY
       - name: Commit
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add HP-print-server.ino
-          git commit -m 'Remove dashboard section explanation text'
+          if git diff --cached --quiet; then echo 'No dashboard changes needed'; exit 0; fi
+          git commit -m 'Clean dashboard section descriptions'
           git push

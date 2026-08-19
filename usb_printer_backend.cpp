@@ -1,7 +1,6 @@
 #include "usb_printer_backend.h"
 #include "status_led.h"
 #include <WiFi.h>
-#include <ESPmDNS.h>
 
 namespace {
 constexpr uint16_t RAW_PORT = 9100;
@@ -12,7 +11,6 @@ constexpr size_t RAW_RX_CHUNK = 8192;
 WiFiServer rawServer(RAW_PORT);
 WiFiClient rawClient;
 bool rawServerStarted = false;
-bool rawDiscoveryAdvertised = false;
 unsigned long rawLastDataMs = 0;
 uint64_t rawBytesReceived = 0;
 static uint8_t rawChunk[RAW_RX_CHUNK];
@@ -33,7 +31,7 @@ bool sendUsbChunk(UsbHostManager &host, const uint8_t *data, size_t length, Stri
 }
 
 void finishRawConnection(UsbPrinterBackend *backend, const char *reason) {
-  // Do not inject FF/PJL/other bytes. A TCP/9100 server is a transparent
+  // Do not inject FF/PJL/other bytes. TCP/9100 remains a transparent
   // transport and must not change the application's print language.
   if (backend) backend->finishRawJob();
   if (rawClient) rawClient.stop();
@@ -102,15 +100,6 @@ void startRawServerIfNeeded() {
     rawServer.setNoDelay(true);
     rawServerStarted = true;
     Serial.println("[RAW] JetDirect/AppSocket listening on TCP 9100");
-  }
-
-  // This is NOT IPP discovery. It only identifies the raw print data stream.
-  if (!rawDiscoveryAdvertised && WiFi.getMode() != WIFI_OFF) {
-    if (MDNS.addService("pdl-datastream", "tcp", RAW_PORT)) {
-      MDNS.addServiceTxt("pdl-datastream", "tcp", "txtvers", "1");
-      MDNS.addServiceTxt("pdl-datastream", "tcp", "note", "RAW 9100");
-      rawDiscoveryAdvertised = true;
-    }
   }
 }
 } // namespace
@@ -203,6 +192,7 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
     StatusLed::set(StatusLed::ERROR);
     return false;
   }
+
   // Keep the backend in PRINTING until the TCP/9100 connection ends. This
   // prevents the raw job from being treated as complete between 8 KiB chunks.
   reason_ = "raw-job-in-progress";

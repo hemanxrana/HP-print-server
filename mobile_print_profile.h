@@ -7,7 +7,10 @@
 namespace MobilePrintProfile {
 
 static constexpr const char *PROFILE_NAME = "SMART_TANK_540";
+static constexpr const char *DISPLAY_NAME = "HP Smart Tank 540";
 static constexpr const char *MODEL = "HP Smart Tank 540 series";
+static constexpr const char *HOSTNAME = "hp-smart-tank-540";
+static constexpr const char *AP_SSID = "HP Smart Tank 540";
 static constexpr const char *SERVICE_TYPE = "_ipp._tcp";
 static constexpr const char *SERVICE_SUBTYPE = "_print._sub._ipp._tcp";
 static constexpr uint16_t IPP_PORT = 631;

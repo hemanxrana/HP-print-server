@@ -42,4 +42,12 @@ struct UsbDeviceInfo {
   UsbPrinterInterfaceInfo printerInterfaces[MAX_PRINTER_INTERFACES];
 
   UsbPrinterInterfaceInfo printer;
+
+  // Separate USB Printer Class interface used for status polling when the
+  // device exposes one. No WinUSB/vendor REST layer is involved.
+  bool statusInterfaceFound = false;
+  uint8_t statusInterfaceNumber = 0;
+  uint8_t statusAlternateSetting = 0;
+  uint8_t portStatus = 0;
+  bool portStatusValid = false;
 };

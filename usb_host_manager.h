@@ -27,6 +27,14 @@ public:
   uint8_t interfaceCount() const { return device_.printerInterfaceCount; }
   const UsbPrinterInterfaceInfo *interfaceAt(uint8_t index) const;
 
+  // Request an asynchronous USB Printer Class GET_PORT_STATUS refresh.
+  // The request is executed by the USB host client task so the client handle
+  // is never used concurrently by the web/main loop.
+  void requestStatusRefresh();
+  bool statusValid() const { return device_.portStatusValid; }
+  uint8_t portStatus() const { return device_.portStatus; }
+  bool statusInterfaceAvailable() const { return device_.statusInterfaceFound; }
+
   bool bulkWrite(const uint8_t *data, size_t length, size_t &accepted,
                  uint32_t timeoutMs, String &error);
 

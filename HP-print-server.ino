@@ -260,7 +260,7 @@ body:before{content:"";position:fixed;inset:0;pointer-events:none;background:lin
 <div class="mode glass" aria-label="USB interface"><button id="scanMode" onclick="setInterfaceMode('scanner')"><span class="modeIcon">⌕</span>Scanner interface</button><button id="printMode" class="active" onclick="setInterfaceMode('printer')"><span class="modeIcon">▣</span>Printer interface</button></div>
 
 <div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan Wi-Fi</button></div>
-<div class="selectWrap" style="margin-top:11px"><select id="ssidSelect"><option value="">Select a Wi-Fi network…</option></select></div>
+<div id="scanState" class="hint" style="display:none"></div><div class="selectWrap" style="margin-top:11px"><select id="ssidSelect"><option value="">Select a Wi-Fi network…</option></select></div>
 <form class="wifiForm" method="POST" action="/save"><div class="field"><label for="ssid">Wi-Fi network</label><input id="ssid" name="ssid" value=")HTML";
   html += esc(config.ssid);
   html += R"HTML(" maxlength="32" autocomplete="off" placeholder="Select a network or enter a hidden SSID"></div><div class="field"><label for="password">Password</label><input id="password" type="password" name="password" placeholder="Leave blank to keep the saved password"></div><div class="actions"><button class="btn" type="submit">Save Wi-Fi &amp; restart</button><span class="hint">Hidden networks can be entered manually.</span></div></form></div>

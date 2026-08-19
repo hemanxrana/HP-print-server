@@ -12,6 +12,7 @@ public:
   bool online() const { return state_ == IDLE || state_ == PRINTING; }
   const String &statusReason() const { return reason_; }
   const UsbDeviceInfo &device() const { return host_.device(); }
+  bool rawClientConnected() const;
 
   // USB Printer Class GET_PORT_STATUS, sourced from the descriptor-selected
   // status interface. The raw byte is interpreted here using the USB Printer

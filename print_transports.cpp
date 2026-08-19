@@ -11,44 +11,31 @@ static bool connectClient(WiFiClient& c, const PrintTarget& t, uint16_t fallback
 
 static bool writeAll(WiFiClient& c, const uint8_t* d, size_t n) {
   size_t sent = 0;
-  while (sent < n) {
-    size_t w = c.write(d + sent, n - sent);
-    if (!w) return false;
-    sent += w;
-    yield();
-  }
+  while (sent < n) { size_t w = c.write(d + sent, n - sent); if (!w) return false; sent += w; yield(); }
   return true;
 }
 
 static bool writeStream(WiFiClient& c, Stream& source, size_t n) {
-  uint8_t buffer[1460];
-  size_t remaining = n;
+  uint8_t buffer[1460]; size_t remaining = n;
   while (remaining) {
     size_t want = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
     size_t got = source.readBytes((char*)buffer, want);
     if (got != want || !writeAll(c, buffer, got)) return false;
-    remaining -= got;
-    yield();
+    remaining -= got; yield();
   }
   return true;
 }
 
 bool Raw9100Transport::send(const PrintTarget& t, const uint8_t* d, size_t n, uint32_t timeout) {
   if (!d || !n) return false;
-  WiFiClient c;
-  if (!connectClient(c, t, 9100, timeout)) return false;
-  bool ok = writeAll(c, d, n);
-  c.flush(); delay(20); c.stop();
-  return ok;
+  WiFiClient c; if (!connectClient(c, t, 9100, timeout)) return false;
+  bool ok = writeAll(c, d, n); c.flush(); delay(20); c.stop(); return ok;
 }
 
 bool Raw9100Transport::sendStream(const PrintTarget& t, Stream& source, size_t n, uint32_t timeout) {
   if (!n) return false;
-  WiFiClient c;
-  if (!connectClient(c, t, 9100, timeout)) return false;
-  bool ok = writeStream(c, source, n);
-  c.flush(); delay(20); c.stop();
-  return ok;
+  WiFiClient c; if (!connectClient(c, t, 9100, timeout)) return false;
+  bool ok = writeStream(c, source, n); c.flush(); delay(20); c.stop(); return ok;
 }
 
 static void put16(uint8_t* p, uint16_t v) { p[0] = v >> 8; p[1] = v; }
@@ -58,20 +45,31 @@ static bool attr(uint8_t* b, size_t cap, size_t& pos, uint8_t tag, const char* n
   size_t nl = strlen(name);
   if (nl > 65535 || n > 65535 || pos + 5 + nl + n > cap) return false;
   b[pos++] = tag; put16(b + pos, nl); pos += 2; memcpy(b + pos, name, nl); pos += nl;
-  put16(b + pos, n); pos += 2; if (n) memcpy(b + pos, v, n); pos += n;
-  return true;
+  put16(b + pos, n); pos += 2; if (n) memcpy(b + pos, v, n); pos += n; return true;
 }
 
 static bool sattr(uint8_t* b, size_t cap, size_t& pos, uint8_t tag, const char* n, const String& v) {
   return attr(b, cap, pos, tag, n, (const uint8_t*)v.c_str(), v.length());
 }
 
+bool IppTransport::buildPrintJobRequest(uint8_t* b, size_t cap, size_t& length,
+                                         const String& uri, const String& user,
+                                         uint32_t requestId, const uint8_t* d, size_t n) {
+  length = 0;
+  if (!b || !d || !uri.length() || n > cap || cap < 128) return false;
+  size_t p = 0; b[p++] = 1; b[p++] = 1; put16(b + p, 0x0002); p += 2; put32(b + p, requestId); p += 4; b[p++] = 1;
+  if (!sattr(b, cap, p, 0x47, "attributes-charset", "utf-8") ||
+      !sattr(b, cap, p, 0x48, "attributes-natural-language", "en") ||
+      !sattr(b, cap, p, 0x45, "printer-uri", uri) ||
+      !sattr(b, cap, p, 0x42, "requesting-user-name", user.isEmpty() ? String("android") : user) ||
+      !sattr(b, cap, p, 0x49, "document-format", "application/octet-stream")) return false;
+  if (p + 1 + n > cap) return false; b[p++] = 3; memcpy(b + p, d, n); p += n; length = p; return true;
+}
+
 static bool buildIppHeader(uint8_t* b, size_t cap, size_t& length, const String& uri,
                            const String& user, uint32_t requestId, const String& documentFormat) {
-  length = 0;
-  if (!b || !uri.length() || cap < 128) return false;
-  size_t p = 0;
-  b[p++] = 1; b[p++] = 1; put16(b + p, 0x0002); p += 2; put32(b + p, requestId); p += 4; b[p++] = 1;
+  length = 0; if (!b || !uri.length() || cap < 128) return false;
+  size_t p = 0; b[p++] = 1; b[p++] = 1; put16(b + p, 0x0002); p += 2; put32(b + p, requestId); p += 4; b[p++] = 1;
   const String fmt = documentFormat.isEmpty() ? String("application/octet-stream") : documentFormat;
   if (!sattr(b, cap, p, 0x47, "attributes-charset", "utf-8") ||
       !sattr(b, cap, p, 0x48, "attributes-natural-language", "en") ||
@@ -107,28 +105,18 @@ static bool sendIppStream(const PrintTarget& target, const String& printerUri, c
                           const String& documentFormat, Stream& source, size_t documentLength,
                           uint32_t timeoutMs, uint16_t* ippStatus) {
   if (!documentLength || printerUri.isEmpty()) return false;
-  WiFiClient c;
-  if (!connectClient(c, target, 631, timeoutMs)) return false;
-  c.setTimeout(timeoutMs / 1000 + 1);
-
+  WiFiClient c; if (!connectClient(c, target, 631, timeoutMs)) return false; c.setTimeout(timeoutMs / 1000 + 1);
   uint8_t header[1024]; size_t headerLength = 0;
   if (!buildIppHeader(header, sizeof(header), headerLength, printerUri, user, millis() | 1UL, documentFormat)) { c.stop(); return false; }
-
-  int scheme = printerUri.indexOf("://");
-  int slash = scheme >= 0 ? printerUri.indexOf('/', scheme + 3) : -1;
-  String path = slash >= 0 ? printerUri.substring(slash) : String("/ipp/print");
-  if (path.isEmpty()) path = "/ipp/print";
-
+  int scheme = printerUri.indexOf("://"); int slash = scheme >= 0 ? printerUri.indexOf('/', scheme + 3) : -1;
+  String path = slash >= 0 ? printerUri.substring(slash) : String("/ipp/print"); if (path.isEmpty()) path = "/ipp/print";
   c.print("POST "); c.print(path); c.print(" HTTP/1.1\r\nHost: ");
   if (target.host.length()) c.print(target.host); else c.print(target.address.toString());
-  c.print("\r\nContent-Type: application/ipp\r\nContent-Length: ");
-  c.print((unsigned long)(headerLength + documentLength));
+  c.print("\r\nContent-Type: application/ipp\r\nContent-Length: "); c.print((unsigned long)(headerLength + documentLength));
   c.print("\r\nConnection: close\r\n\r\n");
   if (!writeAll(c, header, headerLength) || !writeStream(c, source, documentLength)) { c.stop(); return false; }
-  c.flush();
-  if (!readHttpStatus(c, timeoutMs)) { c.stop(); return false; }
-  bool ok = readIppResponseStatus(c, ippStatus, timeoutMs); c.stop();
-  return ok && (!ippStatus || *ippStatus == 0x0000);
+  c.flush(); if (!readHttpStatus(c, timeoutMs)) { c.stop(); return false; }
+  bool ok = readIppResponseStatus(c, ippStatus, timeoutMs); c.stop(); return ok && (!ippStatus || *ippStatus == 0x0000);
 }
 
 bool IppTransport::sendStream(const PrintTarget& target, const String& printerUri, const String& user,
@@ -149,9 +137,7 @@ bool IppTransport::send(const PrintTarget& target, const String& printerUri, con
     int peek() override { return p_ < n_ ? d_[p_] : -1; }
     void flush() override {}
     size_t write(uint8_t) override { return 0; }
-    size_t readBytes(char* b, size_t n) override {
-      size_t k = n < n_ - p_ ? n : n_ - p_; if (k) memcpy(b, d_ + p_, k); p_ += k; return k;
-    }
+    size_t readBytes(char* b, size_t n) override { size_t k = n < n_ - p_ ? n : n_ - p_; if (k) memcpy(b, d_ + p_, k); p_ += k; return k; }
   private:
     const uint8_t* d_; size_t n_; size_t p_ = 0;
   } source(document, documentLength);

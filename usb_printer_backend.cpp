@@ -4,155 +4,19 @@
 #include <ESPmDNS.h>
 
 namespace {
-constexpr uint16_t RAW_PORT = 9100;
-constexpr uint32_t RAW_IDLE_TIMEOUT_MS = 30000;
-constexpr size_t RAW_RX_CHUNK = 8192;
-
-WiFiServer rawServer(RAW_PORT);
-WiFiClient rawClient;
-bool rawServerStarted=false;
-bool rawDiscoveryAdvertised=false;
-unsigned long rawLastDataMs=0;
-uint64_t rawBytesReceived=0;
-static uint8_t rawChunk[RAW_RX_CHUNK];
-
-bool selectedInterfaceUsable(const UsbHostManager &host){
-  const UsbPrinterInterfaceInfo *p=host.selectedInterface();
-  return p && p->usableForRawPrint();
+constexpr uint16_t RAW_PORT=9100;
+constexpr uint32_t RAW_IDLE_TIMEOUT_MS=30000;
+constexpr size_t RAW_RX_CHUNK=8192;
+constexpr size_t STREAM_CHUNK=8192;
+WiFiServer rawServer(RAW_PORT); WiFiClient rawClient; bool rawServerStarted=false,rawDiscoveryAdvertised=false; unsigned long rawLastDataMs=0; uint64_t rawBytesReceived=0; static uint8_t rawChunk[RAW_RX_CHUNK];
+bool selectedInterfaceUsable(const UsbHostManager&host){const UsbPrinterInterfaceInfo*p=host.selectedInterface();return p&&p->usableForRawPrint();}
+bool sendUsbChunk(UsbHostManager&host,const uint8_t*data,size_t length,String&error){size_t accepted=0;if(!host.bulkWrite(data,length,accepted,10000,error))return false;if(accepted!=length){error="USB Bulk OUT short write: "+String((unsigned)accepted)+"/"+String((unsigned)length);return false;}return true;}
+void finishRawConnection(const char*reason){if(rawClient)rawClient.stop();Serial.printf("[RAW] TCP 9100 job ended (%s, %llu bytes)\n",reason,(unsigned long long)rawBytesReceived);rawBytesReceived=0;}
+void handleRawServer(UsbPrinterBackend*backend){if(!rawServerStarted)return;if(!rawClient){WiFiClient incoming=rawServer.available();if(incoming){if(!backend->online()){Serial.println("[RAW] Printer not ready; rejecting TCP 9100 connection");incoming.stop();return;}rawClient=incoming;rawClient.setNoDelay(true);rawLastDataMs=millis();rawBytesReceived=0;Serial.println("[RAW] TCP 9100 client connected; direct USB pass-through (no flash spool)");}return;}size_t drained=0;while(rawClient.available()&&drained<sizeof(rawChunk)){size_t available=(size_t)rawClient.available();size_t want=min(available,sizeof(rawChunk)-drained);int got=rawClient.read(rawChunk+drained,want);if(got<=0)break;drained+=(size_t)got;}if(drained){String error;if(!backend->sendDirect(rawChunk,drained,error)){Serial.printf("[RAW] USB pass-through failed after %llu bytes: %s\n",(unsigned long long)rawBytesReceived,error.c_str());rawClient.stop();rawBytesReceived=0;return;}rawBytesReceived+=drained;rawLastDataMs=millis();}if(!rawClient.connected())finishRawConnection("connection-closed");else if(millis()-rawLastDataMs>=RAW_IDLE_TIMEOUT_MS)finishRawConnection("idle-timeout");}
+void startRawServerIfNeeded(){if(WiFi.status()!=WL_CONNECTED&&WiFi.getMode()!=WIFI_AP&&WiFi.getMode()!=WIFI_AP_STA)return;if(!rawServerStarted){rawServer.begin();rawServer.setNoDelay(true);rawServerStarted=true;Serial.println("[RAW] JetDirect/AppSocket listening on TCP 9100");}if(!rawDiscoveryAdvertised&&WiFi.getMode()!=WIFI_OFF){if(MDNS.addService("pdl-datastream","tcp",RAW_PORT)){MDNS.addServiceTxt("pdl-datastream","tcp","txtvers","1");rawDiscoveryAdvertised=true;}}}
 }
-
-bool sendUsbChunk(UsbHostManager &host,const uint8_t *data,size_t length,String &error){
-  size_t accepted=0;
-  if(!host.bulkWrite(data,length,accepted,10000,error)) return false;
-  if(accepted!=length){
-    error="USB Bulk OUT short write: "+String((unsigned)accepted)+"/"+String((unsigned)length);
-    return false;
-  }
-  return true;
-}
-
-void finishRawConnection(const char *reason){
-  if(rawClient) rawClient.stop();
-  Serial.printf("[RAW] TCP 9100 job ended (%s, %llu bytes)\n",reason,(unsigned long long)rawBytesReceived);
-  rawBytesReceived=0;
-}
-
-void handleRawServer(UsbPrinterBackend *backend){
-  if(!rawServerStarted) return;
-
-  if(!rawClient){
-    WiFiClient incoming=rawServer.available();
-    if(incoming){
-      if(!backend->online()){
-        Serial.println("[RAW] Printer not ready; rejecting TCP 9100 connection");
-        incoming.stop();
-        return;
-      }
-      rawClient=incoming;
-      rawClient.setNoDelay(true);
-      rawLastDataMs=millis();
-      rawBytesReceived=0;
-      Serial.println("[RAW] TCP 9100 client connected; direct USB pass-through (no flash spool)");
-    }
-    return;
-  }
-
-  // Fixed-size RAM only. The complete job is never accumulated.
-  size_t drained=0;
-  while(rawClient.available() && drained < sizeof(rawChunk)){
-    const size_t available=(size_t)rawClient.available();
-    const size_t want=min(available,sizeof(rawChunk)-drained);
-    const int got=rawClient.read(rawChunk+drained,want);
-    if(got<=0) break;
-    drained += (size_t)got;
-  }
-
-  if(drained){
-    String error;
-    if(!backend->sendDirect(rawChunk,drained,error)){
-      Serial.printf("[RAW] USB pass-through failed after %llu bytes: %s\n",(unsigned long long)rawBytesReceived,error.c_str());
-      rawClient.stop();
-      rawBytesReceived=0;
-      return;
-    }
-    rawBytesReceived += drained;
-    rawLastDataMs=millis();
-  }
-
-  if(!rawClient.connected()) finishRawConnection("connection-closed");
-  else if(millis()-rawLastDataMs>=RAW_IDLE_TIMEOUT_MS) finishRawConnection("idle-timeout");
-}
-
-void startRawServerIfNeeded(){
-  if(WiFi.status()!=WL_CONNECTED && WiFi.getMode()!=WIFI_AP && WiFi.getMode()!=WIFI_AP_STA) return;
-  if(!rawServerStarted){
-    rawServer.begin();
-    rawServer.setNoDelay(true);
-    rawServerStarted=true;
-    Serial.println("[RAW] JetDirect/AppSocket listening on TCP 9100");
-  }
-  if(!rawDiscoveryAdvertised && WiFi.getMode()!=WIFI_OFF){
-    if(MDNS.addService("pdl-datastream","tcp",RAW_PORT)){
-      MDNS.addServiceTxt("pdl-datastream","tcp","txtvers","1");
-      rawDiscoveryAdvertised=true;
-    }
-  }
-}
-
-} // namespace
-
-bool UsbPrinterBackend::begin(){
-  StatusLed::begin();
-  StatusLed::set(StatusLed::BOOT);
-  if(!host_.begin()){
-    configured_=false;
-    state_=OFFLINE;
-    reason_=host_.lastError();
-    StatusLed::set(StatusLed::ERROR);
-    return false;
-  }
-  configured_=true;
-  state_=OFFLINE;
-  reason_="waiting-for-usb-printer";
-  return true;
-}
-
-void UsbPrinterBackend::poll(){
-  startRawServerIfNeeded();
-  handleRawServer(this);
-  if(!configured_){StatusLed::set(StatusLed::ERROR);StatusLed::update();return;}
-  if(state_==PRINTING){StatusLed::set(StatusLed::PRINTING);StatusLed::update();return;}
-  if(WiFi.status()==WL_CONNECTED) StatusLed::set(StatusLed::WIFI_CONNECTED);
-  switch(host_.state()){
-    case UsbHostManager::PRINTER_READY:
-      state_=selectedInterfaceUsable(host_)?IDLE:ERROR;
-      reason_=selectedInterfaceUsable(host_)?"printer-interface-ready":"selected-interface-has-no-bulk-output";
-      StatusLed::set(state_==IDLE?StatusLed::PRINTER_READY:StatusLed::ERROR);
-      break;
-    case UsbHostManager::DEVICE_ATTACHED:
-    case UsbHostManager::ENUMERATING:
-      state_=OFFLINE;reason_="enumerating-usb-device";StatusLed::set(StatusLed::WAITING_FOR_PRINTER);break;
-    case UsbHostManager::ERROR:
-      state_=ERROR;reason_=host_.lastError();StatusLed::set(StatusLed::ERROR);break;
-    default:
-      state_=OFFLINE;reason_=host_.lastError().length()?host_.lastError():"waiting-for-usb-printer";StatusLed::set(StatusLed::WAITING_FOR_PRINTER);break;
-  }
-  StatusLed::update();
-}
-
-bool UsbPrinterBackend::sendDirect(const uint8_t *data,size_t length,String &error){
-  if(!data||!length){error="Empty print data";return false;}
-  const UsbPrinterInterfaceInfo *p=host_.selectedInterface();
-  if(!p||!p->usableForRawPrint()){error="Selected USB interface has no usable Bulk OUT endpoint";return false;}
-  if(state_!=IDLE&&state_!=PRINTING){error=reason_;return false;}
-  state_=PRINTING;
-  const bool ok=sendUsbChunk(host_,data,length,error);
-  if(!ok){state_=ERROR;reason_=error;StatusLed::set(StatusLed::ERROR);return false;}
-  state_=IDLE;reason_="printer-interface-ready";
-  return true;
-}
-
-bool UsbPrinterBackend::processNext(MobilePrintQueue &,String &error){
-  error="No persistent print queue: pass-through mode sends data directly";
-  return false;
-}
+bool UsbPrinterBackend::begin(){StatusLed::begin();StatusLed::set(StatusLed::BOOT);if(!host_.begin()){configured_=false;state_=OFFLINE;reason_=host_.lastError();StatusLed::set(StatusLed::ERROR);return false;}configured_=true;state_=OFFLINE;reason_="waiting-for-usb-printer";return true;}
+void UsbPrinterBackend::poll(){startRawServerIfNeeded();handleRawServer(this);if(!configured_){StatusLed::set(StatusLed::ERROR);StatusLed::update();return;}if(state_==PRINTING){StatusLed::set(StatusLed::PRINTING);StatusLed::update();return;}if(WiFi.status()==WL_CONNECTED)StatusLed::set(StatusLed::WIFI_CONNECTED);switch(host_.state()){case UsbHostManager::PRINTER_READY:state_=selectedInterfaceUsable(host_)?IDLE:ERROR;reason_=selectedInterfaceUsable(host_)?"printer-interface-ready":"selected-interface-has-no-bulk-output";StatusLed::set(state_==IDLE?StatusLed::PRINTER_READY:StatusLed::ERROR);break;case UsbHostManager::DEVICE_ATTACHED:case UsbHostManager::ENUMERATING:state_=OFFLINE;reason_="enumerating-usb-device";StatusLed::set(StatusLed::WAITING_FOR_PRINTER);break;case UsbHostManager::ERROR:state_=ERROR;reason_=host_.lastError();StatusLed::set(StatusLed::ERROR);break;default:state_=OFFLINE;reason_=host_.lastError().length()?host_.lastError():"waiting-for-usb-printer";StatusLed::set(StatusLed::WAITING_FOR_PRINTER);break;}StatusLed::update();}
+bool UsbPrinterBackend::sendDirect(const uint8_t*data,size_t length,String&error){if(!data||!length){error="Empty print data";return false;}const UsbPrinterInterfaceInfo*p=host_.selectedInterface();if(!p||!p->usableForRawPrint()){error="Selected USB interface has no usable Bulk OUT endpoint";return false;}if(state_!=IDLE&&state_!=PRINTING){error=reason_;return false;}state_=PRINTING;bool ok=sendUsbChunk(host_,data,length,error);if(!ok){state_=ERROR;reason_=error;StatusLed::set(StatusLed::ERROR);return false;}state_=IDLE;reason_="printer-interface-ready";return true;}
+bool UsbPrinterBackend::sendStream(Stream&source,size_t length,String&error){if(!length){error="Empty print document";return false;}const UsbPrinterInterfaceInfo*p=host_.selectedInterface();if(!p||!p->usableForRawPrint()){error="Selected USB interface has no usable Bulk OUT endpoint";return false;}if(state_!=IDLE&&state_!=PRINTING){error=reason_;return false;}static uint8_t buffer[STREAM_CHUNK];size_t remaining=length;uint64_t sent=0;state_=PRINTING;while(remaining){size_t want=min(remaining,sizeof(buffer));size_t got=0;unsigned long deadline=millis()+60000UL;while(got<want&&(long)(deadline-millis())>0){int n=source.readBytes((char*)buffer+got,want-got);if(n>0){got+=(size_t)n;deadline=millis()+60000UL;}else yield();}if(got!=want){error="IPP document stream ended early at "+String((unsigned long long)sent)+"/"+String((unsigned long long)length)+" bytes";state_=ERROR;reason_=error;StatusLed::set(StatusLed::ERROR);return false;}if(!sendUsbChunk(host_,buffer,got,error)){state_=ERROR;reason_=error;StatusLed::set(StatusLed::ERROR);return false;}remaining-=got;sent+=got;yield();}state_=IDLE;reason_="printer-interface-ready";return true;}
+bool UsbPrinterBackend::processNext(MobilePrintQueue&,String&error){error="No persistent print queue: pass-through mode sends data directly";return false;}

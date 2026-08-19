@@ -5,6 +5,7 @@
 #include "driver/rmt.h"
 #include "usb_host_manager.h"
 #include "mobile_print_queue.h"
+#include "mobile_print_profile.h"
 
 // These objects are owned by the main Arduino sketch.
 extern WebServer configServer;
@@ -43,7 +44,7 @@ void logStatus(){static uint32_t lastLog=0;static uint8_t lastState=255;static i
 void logStatus(){}
 #endif
 void ledTask(void*){while(true){uint8_t s=scenario();bool blink=(s==0||s==3||s==4);uint32_t period=(s==0)?SLOW_BLINK_MS:BLINK_MS;bool on=!blink||((millis()/period)%2==0);writePixel(colors[s],on);logStatus();vTaskDelay(pdMS_TO_TICKS(100));}}
-String page(){const char*labels[]={"Wi-Fi disconnected / configuration","Wi-Fi connected","Printer ready","Printing","Error"};String h=R"rawliteral(<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>LED Status</title><style>body{font-family:system-ui;max-width:720px;margin:24px auto;padding:0 16px;background:#f5f5f5}section{background:white;padding:20px;margin:14px 0;border-radius:12px}label{display:block;margin:14px 0}input{padding:6px}button{padding:10px 18px;border:0;border-radius:7px;background:#222;color:white}</style></head><body><h1>Status LED</h1><p>Change the RGB color used for each server scenario. The onboard addressable RGB LED is driven directly; no extra Arduino library is required.</p><form method='POST' action='/led/save'>)rawliteral";for(uint8_t i=0;i<5;++i)h+="<label>"+String(labels[i])+" <input type='color' name='c"+String(i)+"' value='"+colorHex(colors[i])+"'></label>";h+=R"rawliteral(<button>Save LED colors</button></form><p><a href='/'>Back to HP Print Server</a></p></body></html>)rawliteral";return h;}
+String page(){const char*labels[]={"Wi-Fi disconnected / configuration","Wi-Fi connected","Printer ready","Printing","Error"};String h=R"rawliteral(<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>LED Status</title><style>body{font-family:system-ui;max-width:720px;margin:24px auto;padding:0 16px;background:#f5f5f5}section{background:white;padding:20px;margin:14px 0;border-radius:12px}label{display:block;margin:14px 0}input{padding:6px}button{padding:10px 18px;border:0;border-radius:7px;background:#222;color:white}</style></head><body><h1>Status LED</h1><p>Change the RGB color used for each server scenario. The onboard addressable RGB LED is driven directly; no extra Arduino library is required.</p><form method='POST' action='/led/save'>)rawliteral";for(uint8_t i=0;i<5;++i)h+="<label>"+String(labels[i])+" <input type='color' name='c"+String(i)+"' value='"+colorHex(colors[i])+"'></label>";h+=R"rawliteral(<button>Save LED colors</button></form><p><a href='/'>Back to HP Smart Tank 540</a></p></body></html>)rawliteral";return h;}
 void handleLed(){configServer.send(200,"text/html; charset=utf-8",page());}
 void handleLedSave(){for(uint8_t i=0;i<5;++i){String k=String("c")+i;if(configServer.hasArg(k)){Rgb c;if(parseHex(configServer.arg(k),c))colors[i]=c;}}saveColors();Serial.println("[LED] Color configuration saved");configServer.sendHeader("Location","/led");configServer.send(303,"text/plain","Saved");}
 }

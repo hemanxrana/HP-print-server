@@ -1,0 +1,29 @@
+name: Fix dashboard text
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-dashboard-text.yml'
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove explanatory dashboard text
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('HP-print-server.ino')
+          s=p.read_text()
+          s=s.replace('<div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan Wi-Fi</button></div>\n<div class="selectWrap"', '<div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan Wi-Fi</button></div>\n<div id="scanState" class="hint" style="display:none"></div><div class="selectWrap"', 1)
+          s=s.replace("const b=$('scanBtn'),select=$('ssidSelect'),state=$('scanState');", "const b=$('scanBtn'),select=$('ssidSelect'),state=$('scanState');", 1)
+          p.write_text(s)
+          PY
+      - name: Commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add HP-print-server.ino
+          git commit -m 'Remove dashboard section explanation text'
+          git push

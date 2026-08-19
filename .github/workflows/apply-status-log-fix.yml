@@ -1,21 +1,19 @@
 name: Apply status logging fix
 
 on:
-  push:
-    branches: [main]
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: write
 
 jobs:
   patch:
-    if: github.actor != 'github-actions[bot]'
+    if: github.event.comment.body == '/apply-status-log-fix' && github.event.issue.pull_request == null
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Patch status logging
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -84,15 +82,13 @@ jobs:
           p.write_text(ns, encoding='utf-8')
           PY
 
-          grep -n -A45 -B3 'const bool changed' HP-print-server.ino
-
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add HP-print-server.ino
           git commit -m 'fix: log status only when changed'
           git push
 
-          rm -f .github/workflows/apply-status-log-fix.yml
-          git add .github/workflows/apply-status-log-fix.yml
+          rm -f .github/workflows/apply-status-log-fix.yml .github/status-fix-trigger.txt
+          git add -A
           git commit -m 'chore: remove one-shot status patch workflow'
           git push

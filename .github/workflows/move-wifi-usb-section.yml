@@ -1,42 +1,35 @@
-name: Move Wi-Fi USB section to bottom
+name: Repair and place Wi-Fi USB interface controls
 
 on:
-  pull_request_target:
-    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
-  move-section:
+  repair-dashboard:
     runs-on: ubuntu-latest
     if: github.actor != 'github-actions[bot]'
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
-      - name: Move USB interface toggle into Wi-Fi & USB Interface
+      - name: Repair dashboard markup and layout
         shell: python
         run: |
           from pathlib import Path
-          p = Path('HP-print-server.ino')
-          s = p.read_text(encoding='utf-8')
+          p=Path('HP-print-server.ino')
+          s=p.read_text(encoding='utf-8')
 
-          mode = '''<div class="mode glass" aria-label="USB interface"><button id="scanMode" onclick="setInterfaceMode('scanner')"><span class="modeIcon">⌕</span>Scanner interface</button><button id="printMode" class="active" onclick="setInterfaceMode('printer')"><span class="modeIcon">▣</span>Printer interface</button></div>'''
-          if mode not in s:
-              raise SystemExit('USB interface toggle not found, or it is already moved')
-          s = s.replace(mode + '\n\n', '', 1)
+          s=s.replace('\ndiv>\n\n<div class="sectionHead" style="margin-top:18px;margin-bottom:10px"><div><h2>Printer Status</h2>',
+                      '\n\n<div class="sectionHead" style="margin-top:18px;margin-bottom:10px"><div><h2>Printer Status</h2>', 1)
 
-          wifi = '<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan Wi-Fi</button></div>'
-          if wifi not in s:
-              raise SystemExit('Wi-Fi & USB Interface section not found')
+          broken='''<div class="mode glass" aria-label="USB interface"><button id="scanMode" onclick="setInterfaceMode(\'scanner\')"><span class="modeIcon">⌕</span>Scanner interface</button><button id="printMode" class="active" onclick="setInterfaceMode(\'printer\')"><span class="modeIcon">▣</span>Printer interface</button>\n<div id="scanState"'''
+          fixed='''<div class="mode glass" aria-label="USB interface"><button id="scanMode" onclick="setInterfaceMode(\'scanner\')"><span class="modeIcon">⌕</span>Scanner interface</button><button id="printMode" class="active" onclick="setInterfaceMode(\'printer\')"><span class="modeIcon">▣</span>Printer interface</button></div>\n<div id="scanState"'''
+          s=s.replace(broken,fixed,1)
 
-          insert = wifi + '''\n<div class="label" style="margin-bottom:8px">USB Interface</div>\n''' + mode
-          s = s.replace(wifi, insert, 1)
-          p.write_text(s, encoding='utf-8')
+          p.write_text(s,encoding='utf-8')
 
-      - name: Verify dashboard layout
+      - name: Verify
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -45,19 +38,17 @@ jobs:
           end=s.find('</main><div id="toast" class="toast">')
           mode='<div class="mode glass" aria-label="USB interface">'
           assert wifi >= 0 and end > wifi
-          inside=s[wifi:end]
-          assert mode in inside
-          assert 'USB Interface</div>' in inside
-          assert s.find(mode) > wifi
-          assert s.find(mode) < end
-          assert s.find(mode) == s.find(mode, wifi)
-          print('verified: USB interface toggle is inside the bottom Wi-Fi & USB Interface section')
+          assert mode in s[wifi:end]
+          assert mode not in s[:wifi]
+          assert '</button></div>\n<div id="scanState"' in s[wifi:end]
+          assert '\ndiv>\n\n<div class="sectionHead"' not in s
+          print('verified: toggle is inside Wi-Fi & USB Interface and markup is balanced')
           PY
 
-      - name: Commit change to PR branch
+      - name: Commit repair
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add HP-print-server.ino
-          git diff --cached --quiet || git commit -m 'Move USB interface toggle into Wi-Fi settings'
-          git push origin HEAD:${{ github.event.pull_request.head.ref }}
+          git diff --cached --quiet || git commit -m 'Repair dashboard USB interface layout'
+          git push

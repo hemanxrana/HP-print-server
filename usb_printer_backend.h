@@ -22,8 +22,6 @@ public:
   bool usbPaperEmpty() const { return host_.portStatusPaperEmpty(); }
   bool usbStatusUsesSeparateInterface() const { return host_.hasSeparateStatusInterface(); }
 
-  bool rawClientConnected() const;
-
   // Send an already-rendered raw print stream byte-for-byte to USB Bulk OUT.
   bool sendDirect(const uint8_t *data, size_t length, String &error);
 

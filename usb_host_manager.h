@@ -29,11 +29,10 @@ public:
   uint8_t interfaceCount() const { return device_.printerInterfaceCount; }
   const UsbPrinterInterfaceInfo *interfaceAt(uint8_t index) const;
 
-  // RAW printing path.
   bool bulkWrite(const uint8_t *data, size_t length, size_t &accepted,
                  uint32_t timeoutMs, String &error);
 
-  // USB Printer Class GET_PORT_STATUS. The request is performed by the USB
+  // USB Printer Class GET_PORT_STATUS. The request is submitted by the USB
   // client task so it cannot interfere with the Arduino/Wi-Fi task.
   bool portStatusValid() const { return device_.portStatus.valid; }
   uint8_t portStatusValue() const { return device_.portStatus.value; }
@@ -42,6 +41,9 @@ public:
   bool portStatusPaperEmpty() const { return device_.portStatus.paperEmpty; }
   const UsbPortStatus &portStatus() const { return device_.portStatus; }
   bool hasSeparateStatusInterface() const { return device_.statusInterfaceSeparate; }
+
+  // Called only by the USB transfer completion callback.
+  void onPortStatusTransfer(bool valid, uint8_t value, const String &error);
 
   void onEnumerated(const UsbDeviceInfo &info);
   void onDetached();

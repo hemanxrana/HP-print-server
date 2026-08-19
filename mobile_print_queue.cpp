@@ -1,35 +1,39 @@
 #include "mobile_print_queue.h"
-#include <Preferences.h>
-#include <stdlib.h>
-namespace {
-String fieldValue(const String& line,const char* key){String p=String(key)+"=";return line.startsWith(p)?line.substring(p.length()):String();}
-// LittleFS needs metadata/directory blocks in addition to the document bytes.
-// Keep a safety margin so a job is rejected cleanly instead of filling the FS
-// and leaving a half-created spool file behind.
-constexpr size_t FS_SAFETY_MARGIN = 16 * 1024;
-bool hasSpoolSpace(size_t bytes){
-  const size_t total=LittleFS.totalBytes();
-  const size_t used=LittleFS.usedBytes();
-  if(total<=used)return false;
-  const size_t freeBytes=total-used;
-  return bytes <= freeBytes && (freeBytes-bytes) >= FS_SAFETY_MARGIN;
+
+bool MobilePrintQueue::begin(){
+  // No flash spool is used. This prevents LittleFS wear and eliminates
+  // filesystem-full failures from transparent print jobs.
+  return true;
 }
+
+bool MobilePrintQueue::enqueue(const uint8_t*,size_t,const String&,uint32_t&,String&error){
+  error="Persistent print queue disabled: jobs are streamed directly to USB";
+  return false;
 }
-String MobilePrintQueue::dirFor(uint32_t id)const{return String(ROOT)+"/"+String(id);} String MobilePrintQueue::dataFor(uint32_t id)const{return dirFor(id)+"/document.bin";} String MobilePrintQueue::metaFor(uint32_t id)const{return dirFor(id)+"/meta.txt";}
-bool MobilePrintQueue::ensureJobDirectory(uint32_t id)const{if(!LittleFS.exists(ROOT)&&!LittleFS.mkdir(ROOT))return false;return LittleFS.mkdir(dirFor(id));}
-bool MobilePrintQueue::parseId(const String&n,uint32_t&id)const{if(!n.length())return false;char*e=nullptr;unsigned long v=strtoul(n.c_str(),&e,10);if(!e||*e||!v||v>0xFFFFFFFFUL)return false;id=(uint32_t)v;return true;}
-bool MobilePrintQueue::readMeta(uint32_t id,JobInfo&info)const{File f=LittleFS.open(metaFor(id),FILE_READ);if(!f)return false;String line;while(f.available()){line=f.readStringUntil('\n');line.trim();String v=fieldValue(line,"id");if(v.length())info.id=(uint32_t)v.toInt();else if((v=fieldValue(line,"size")).length())info.size=(size_t)v.toInt();else if((v=fieldValue(line,"format")).length())info.format=v;else if((v=fieldValue(line,"state")).length())info.state=(State)v.toInt();else if(line.startsWith("reason="))info.reason=line.substring(7);}f.close();File d=LittleFS.open(dataFor(id),FILE_READ);if(!d)return false;size_t actual=d.size();d.close();return info.id==id&&info.size==actual&&actual<=MAX_JOB_BYTES;}
-bool MobilePrintQueue::writeMeta(const JobInfo&i)const{String tmp=dirFor(i.id)+"/meta.tmp";File f=LittleFS.open(tmp,FILE_WRITE);if(!f)return false;f.printf("id=%lu\nsize=%lu\nformat=%s\nstate=%u\nreason=%s\n",(unsigned long)i.id,(unsigned long)i.size,i.format.c_str(),(unsigned)i.state,i.reason.c_str());f.flush();f.close();LittleFS.remove(metaFor(i.id));return LittleFS.rename(tmp,metaFor(i.id));}
-void MobilePrintQueue::purgeFinishedJobs(){File root=LittleFS.open(ROOT,FILE_READ);if(!root)return;File d=root.openNextFile();while(d){if(d.isDirectory()){String path=d.name();String name=path.substring(path.lastIndexOf('/')+1);uint32_t id=0;if(parseId(name,id)){JobInfo i;if(readMeta(id,i)&&(i.state==STATE_COMPLETED||i.state==STATE_ABORTED||i.state==STATE_CANCELED)){String e;removeJob(id,e);}}}d.close();d=root.openNextFile();}root.close();}
-bool MobilePrintQueue::begin(){if(!LittleFS.begin(true)){Serial.println("[Queue] LittleFS mount/format failed");return false;}if(!LittleFS.exists(ROOT)&&!LittleFS.mkdir(ROOT)){Serial.println("[Queue] Cannot create spool root");return false;}purgeFinishedJobs();Preferences p;if(p.begin(META_NS,true)){nextId_=p.getUInt("nextid",0);p.end();}File root=LittleFS.open(ROOT,FILE_READ);if(!root)return true;File d=root.openNextFile();while(d){if(d.isDirectory()){String path=d.name();String name=path.substring(path.lastIndexOf('/')+1);uint32_t id=0;if(parseId(name,id)){JobInfo i;if(readMeta(id,i)){if(i.state==STATE_PROCESSING){String e;setState(id,STATE_PENDING,"job-recovered-after-restart",e);}if(id>nextId_)nextId_=id;}else{String e;removeJob(id,e);}}}d.close();d=root.openNextFile();}root.close();return true;}
-uint8_t MobilePrintQueue::count()const{File root=LittleFS.open(ROOT,FILE_READ);if(!root)return 0;uint8_t n=0;File d=root.openNextFile();while(d){if(d.isDirectory()){String name=String(d.name());name=name.substring(name.lastIndexOf('/')+1);uint32_t id;JobInfo i;if(parseId(name,id)&&readMeta(id,i))++n;}d.close();d=root.openNextFile();}root.close();return n;}
-uint8_t MobilePrintQueue::activeCount()const{File root=LittleFS.open(ROOT,FILE_READ);if(!root)return 0;uint8_t n=0;File d=root.openNextFile();while(d){if(d.isDirectory()){String name=String(d.name());name=name.substring(name.lastIndexOf('/')+1);uint32_t id;JobInfo i;if(parseId(name,id)&&readMeta(id,i)&&(i.state==STATE_PENDING||i.state==STATE_PROCESSING))++n;}d.close();d=root.openNextFile();}root.close();return n;}
-uint8_t MobilePrintQueue::getJobAt(uint8_t index,JobInfo&info)const{File root=LittleFS.open(ROOT,FILE_READ);if(!root)return 0;uint8_t i=0;File d=root.openNextFile();while(d){if(d.isDirectory()){String name=String(d.name());name=name.substring(name.lastIndexOf('/')+1);uint32_t id;JobInfo x;if(parseId(name,id)&&readMeta(id,x)&&i++==index){info=x;d.close();root.close();return 1;}}d.close();d=root.openNextFile();}root.close();return 0;}
-bool MobilePrintQueue::getJob(uint32_t id,JobInfo&info)const{return readMeta(id,info);}
-bool MobilePrintQueue::enqueue(const uint8_t*data,size_t length,const String&format,uint32_t&jobId,String&error){if(!data||!length){error="Empty print document";return false;}if(length>MAX_JOB_BYTES){error="Print job exceeds 2 MiB queue limit";return false;}purgeFinishedJobs();if(activeCount()>=MAX_JOBS){error="Print queue is full";return false;}if(!hasSpoolSpace(length)){error="Insufficient LittleFS space for print job";Serial.printf("[Queue] Rejecting job: need=%u free=%u total=%u used=%u\n",(unsigned)length,(unsigned)(LittleFS.totalBytes()-LittleFS.usedBytes()),(unsigned)LittleFS.totalBytes(),(unsigned)LittleFS.usedBytes());return false;}uint32_t id=nextId_+1;if(!id)id=1;while(LittleFS.exists(dirFor(id))){if(++id==0)id=1;}if(!ensureJobDirectory(id)){error="Cannot create job directory";return false;}String tmp=dirFor(id)+"/document.tmp";File f=LittleFS.open(tmp,FILE_WRITE);if(!f){LittleFS.rmdir(dirFor(id));error="Cannot create spool file";return false;}size_t w=f.write(data,length);f.flush();f.close();if(w!=length||!LittleFS.rename(tmp,dataFor(id))){LittleFS.remove(tmp);LittleFS.remove(dataFor(id));LittleFS.rmdir(dirFor(id));error="Incomplete spool write";return false;}JobInfo info{id,length,format,STATE_PENDING,"job-incoming"};if(!writeMeta(info)){LittleFS.remove(dataFor(id));LittleFS.remove(metaFor(id));LittleFS.rmdir(dirFor(id));error="Cannot persist job metadata";return false;}Preferences p;if(!p.begin(META_NS,false)){String e;removeJob(id,e);error="Job ID storage unavailable";return false;}bool ok=p.putUInt("nextid",id)>0;p.end();if(!ok){String e;removeJob(id,e);error="Job ID could not be persisted";return false;}nextId_=id;jobId=id;return true;}
-bool MobilePrintQueue::enqueueSpoolFile(const String&sourcePath,size_t length,const String&format,uint32_t&jobId,String&error){if(sourcePath.isEmpty()||!LittleFS.exists(sourcePath)){error="Spool source file not found";return false;}if(!length||length>MAX_JOB_BYTES){error="Spool file exceeds 2 MiB queue limit";return false;}purgeFinishedJobs();if(activeCount()>=MAX_JOBS){error="Print queue is full";return false;}File source=LittleFS.open(sourcePath,FILE_READ);if(!source||(size_t)source.size()!=length){if(source)source.close();error="Invalid RAW spool file";return false;}source.close();uint32_t id=nextId_+1;if(!id)id=1;while(LittleFS.exists(dirFor(id))){if(++id==0)id=1;}if(!ensureJobDirectory(id)){error="Cannot create job directory";return false;}String destination=dataFor(id);if(!LittleFS.rename(sourcePath,destination)){LittleFS.rmdir(dirFor(id));error="Cannot move streamed spool file into queue";return false;}JobInfo info{id,length,format,STATE_PENDING,"job-incoming"};if(!writeMeta(info)){LittleFS.remove(destination);LittleFS.rmdir(dirFor(id));error="Cannot persist job metadata";return false;}Preferences p;if(!p.begin(META_NS,false)){String e;removeJob(id,e);error="Job ID storage unavailable";return false;}bool ok=p.putUInt("nextid",id)>0;p.end();if(!ok){String e;removeJob(id,e);error="Job ID could not be persisted";return false;}nextId_=id;jobId=id;return true;}
-bool MobilePrintQueue::setState(uint32_t id,State state,const String&reason,String&error){JobInfo i;if(!readMeta(id,i)){error="Job not found";return false;}if(i.state==STATE_CANCELED||i.state==STATE_COMPLETED||i.state==STATE_ABORTED){if(i.state!=state){error="Job is already finished";return false;}}i.state=state;i.reason=reason;if(!writeMeta(i)){error="Cannot persist job state";return false;}return true;}
-bool MobilePrintQueue::cancel(uint32_t id,String&error){JobInfo i;if(!readMeta(id,i)){error="Job not found";return false;}if(i.state==STATE_COMPLETED||i.state==STATE_CANCELED||i.state==STATE_ABORTED){error="Job is already finished";return false;}return setState(id,STATE_CANCELED,"job-canceled-by-user",error);}
-bool MobilePrintQueue::readJob(uint32_t id,Stream&out,String&error)const{JobInfo i;if(!readMeta(id,i)){error="Job not found";return false;}File f=LittleFS.open(dataFor(id),FILE_READ);if(!f){error="Cannot open spool file";return false;}uint8_t b[4096];size_t total=0;while(total<i.size){size_t n=f.read(b,sizeof(b));if(!n){f.close();error="Spool file read failed at offset "+String((unsigned long)total)+"/"+String((unsigned long)i.size);return false;}size_t written=out.write(b,n);if(written!=n){f.close();error="Spool output short write at offset "+String((unsigned long)total+written)+" (wrote "+String((unsigned)written)+"/"+String((unsigned)n)+")";return false;}total+=n;}f.close();if(total!=i.size){error="Spool size mismatch after read";return false;}return true;}
-bool MobilePrintQueue::removeJob(uint32_t id,String&error){String d=dirFor(id);if(!LittleFS.exists(d))return true;LittleFS.remove(dataFor(id));LittleFS.remove(metaFor(id));LittleFS.remove(d+"/document.tmp");LittleFS.remove(d+"/meta.tmp");if(!LittleFS.rmdir(d)){error="Cannot remove job directory";return false;}return true;}
-bool MobilePrintQueue::hasPending()const{return firstPendingId()!=0;} uint32_t MobilePrintQueue::firstPendingId()const{uint32_t best=0;uint8_t n=count();for(uint8_t i=0;i<n;++i){JobInfo j;if(getJobAt(i,j)&&j.state==STATE_PENDING&&(best==0||j.id<best))best=j.id;}return best;}
+
+bool MobilePrintQueue::enqueueSpoolFile(const String&,size_t,const String&,uint32_t&,String&error){
+  error="LittleFS spool disabled: RAW jobs are streamed directly to USB";
+  return false;
+}
+
+bool MobilePrintQueue::getJob(uint32_t,JobInfo&) const{return false;}
+
+bool MobilePrintQueue::setState(uint32_t,State,const String&,String&error){
+  error="Persistent job state disabled in pass-through mode";
+  return false;
+}
+
+bool MobilePrintQueue::cancel(uint32_t,String&error){
+  error="Job queue disabled in pass-through mode";
+  return false;
+}
+
+bool MobilePrintQueue::readJob(uint32_t,Stream&,String&error){
+  error="Job storage disabled in pass-through mode";
+  return false;
+}
+
+bool MobilePrintQueue::removeJob(uint32_t,String&error){
+  error="Job storage disabled in pass-through mode";
+  return false;
+}

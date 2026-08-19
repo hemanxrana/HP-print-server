@@ -143,7 +143,7 @@ void startRawDiscovery() {
 }
 
 String usbInterfaceLabel(const UsbPrinterInterfaceInfo &p, bool active) {
-  String s = "IF " + String(p.interfaceNumber) + " / ALT " + String(p.alternateSetting) + " / protocol 0x";
+  String s = String("IF ") + String(p.interfaceNumber) + " / ALT " + String(p.alternateSetting) + " / protocol 0x";
   if (p.protocol < 16) s += "0";
   s += String(p.protocol, HEX);
   s += " / OUT 0x";
@@ -190,7 +190,7 @@ String wifiOptionsHtml() {
   for (int i = 0; i < n; ++i) {
     String ssid = WiFi.SSID(i);
     if (ssid.isEmpty()) continue;
-    html += "<option value='" + esc(ssid) + "'></option>";
+    html += String("<option value='") + esc(ssid) + "'></option>";
   }
   WiFi.scanDelete();
   return html;
@@ -198,9 +198,13 @@ String wifiOptionsHtml() {
 
 String dashboard() {
   String wifi;
-  if (WiFi.status() == WL_CONNECTED) wifi = "Connected — " + WiFi.localIP().toString();
-  else if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) wifi = "Configuration AP — " + WiFi.softAPIP().toString();
-  else wifi = "Not connected";
+  if (WiFi.status() == WL_CONNECTED) {
+    wifi = String("Connected — ") + WiFi.localIP().toString();
+  } else if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+    wifi = String("Configuration AP — ") + WiFi.softAPIP().toString();
+  } else {
+    wifi = "Not connected";
+  }
 
   String selected = usbHost.selectedInterface()
       ? usbInterfaceLabel(*usbHost.selectedInterface(), true)
@@ -218,9 +222,9 @@ String dashboard() {
       if (!p) continue;
       const bool checked = !config.usbAuto && p->interfaceNumber == config.usbInterface && p->alternateSetting == config.usbAlt;
       const bool active = usbHost.selectedInterface() == p;
-      usbOptions += "<label><input type='radio' name='mode' value='manual:" + String(p->interfaceNumber) + ":" + String(p->alternateSetting) + "' ";
+      usbOptions += String("<label><input type='radio' name='mode' value='manual:") + String(p->interfaceNumber) + ":" + String(p->alternateSetting) + "' ";
       usbOptions += checked ? "checked" : "";
-      usbOptions += "> " + esc(usbInterfaceLabel(*p, active)) + "</label><br>";
+      usbOptions += String("> ") + esc(usbInterfaceLabel(*p, active)) + "</label><br>";
     }
     usbOptions += "<br><button type='submit'>Apply USB interface</button></form>";
   }
@@ -230,10 +234,11 @@ String dashboard() {
   html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>HP Print Server</title>";
   html += "<style>body{font-family:system-ui,Arial;max-width:820px;margin:24px auto;padding:0 16px;background:#f5f5f5;color:#222}section{background:#fff;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 8px #0001}input{box-sizing:border-box;padding:10px;margin:6px 0 14px;border:1px solid #aaa;border-radius:7px;width:100%}input[type=radio]{width:auto;margin-right:8px}button{padding:10px 14px;border:0;border-radius:7px;background:#222;color:#fff}.ssidRow{display:flex;gap:8px;align-items:center}.ssidRow input{flex:1}.status{padding:12px;background:#eee;border-radius:7px}code{word-break:break-all}.hint{font-size:.9em;color:#666}</style></head><body>";
   html += "<h1>HP Print Server</h1>";
-  html += "<section><h2>Status</h2><div class='status'>Wi-Fi: " + esc(wifi) + "<br>USB host: " + esc(usbStateText()) + "<br>Printer: " + esc(printerStateText()) + "<br>RAW JetDirect/AppSocket: TCP <b>9100</b></div></section>";
-  html += "<section><h2>Wi-Fi</h2><form method='POST' action='/save'><label>SSID</label><div class='ssidRow'><input id='ssid' name='ssid' list='wifiList' value='" + esc(config.ssid) + "' maxlength='32' autocomplete='off'><button type='button' onclick='scanWifi()'>Search</button></div><datalist id='wifiList'>" + wifiOptionsHtml() + "</datalist><div class='hint'>Type to search, or press Search to scan nearby networks.</div><label>Password</label><input type='password' name='password' placeholder='Leave blank to keep current password'><button type='submit'>Save &amp; restart</button></form></section>";
-  html += "<section><h2>USB printer interface</h2><p>Device: " + (usbHost.device().attached ? "VID 0x" + String(usbHost.device().vid, HEX) + " / PID 0x" + String(usbHost.device().pid, HEX) : "none") + "</p><p>Active: <b>" + esc(selected) + "</b></p>" + usbOptions + "</section>";
-  html += "<section><h2>RAW printing</h2><p>Connect a client directly to <code>" + String(RAW_HOSTNAME) + ":9100</code> or <code>" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("192.168.4.1")) + ":9100</code>.</p><p>The server does not add Content-Length, IPP headers, PJL, form feeds, or any other print data. The incoming byte stream is passed unchanged to USB.</p><p>Use a print stream the HP printer itself understands (for example a valid PCL/PJL stream). PDF/PNG/PWG/URF conversion is not performed.</p></section>";
+  html += String("<section><h2>Status</h2><div class='status'>Wi-Fi: ") + esc(wifi) + "<br>USB host: " + esc(usbStateText()) + "<br>Printer: " + esc(printerStateText()) + "<br>RAW JetDirect/AppSocket: TCP <b>9100</b></div></section>";
+  html += String("<section><h2>Wi-Fi</h2><form method='POST' action='/save'><label>SSID</label><div class='ssidRow'><input id='ssid' name='ssid' list='wifiList' value='") + esc(config.ssid) + "' maxlength='32' autocomplete='off'><button type='button' onclick='scanWifi()'>Search</button></div><datalist id='wifiList'>" + wifiOptionsHtml() + "</datalist><div class='hint'>Type to search, or press Search to scan nearby networks.</div><label>Password</label><input type='password' name='password' placeholder='Leave blank to keep current password'><button type='submit'>Save &amp; restart</button></form></section>";
+  html += String("<section><h2>USB printer interface</h2><p>Device: ") + (usbHost.device().attached ? String("VID 0x") + String(usbHost.device().vid, HEX) + " / PID 0x" + String(usbHost.device().pid, HEX) : String("none"));
+  html += String("</p><p>Active: <b>") + esc(selected) + "</b></p>" + usbOptions + "</section>";
+  html += String("<section><h2>RAW printing</h2><p>Connect a client directly to <code>") + String(RAW_HOSTNAME) + ":9100</code> or <code>" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("192.168.4.1")) + ":9100</code>.</p><p>The server does not add Content-Length, IPP headers, PJL, form feeds, or any other print data. The incoming byte stream is passed unchanged to USB.</p><p>Use a print stream the HP printer itself understands (for example a valid PCL/PJL stream). PDF/PNG/PWG/URF conversion is not performed.</p></section>";
   html += "<script>async function scanWifi(){const b=document.querySelector('.ssidRow button');b.disabled=true;b.textContent='Searching…';try{const r=await fetch('/scan.json');const a=await r.json();const d=document.getElementById('wifiList');d.innerHTML='';a.forEach(x=>{const o=document.createElement('option');o.value=x.ssid;d.appendChild(o)});}catch(e){alert('Wi-Fi scan failed');}finally{b.disabled=false;b.textContent='Search';}}</script></body></html>";
   return html;
 }
@@ -247,7 +252,7 @@ void sendJsonScan() {
     if (ssid.isEmpty()) continue;
     if (!first) out += ",";
     first = false;
-    out += "{\"ssid\":\"" + jsonEsc(ssid) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+    out += String("{\"ssid\":\"") + jsonEsc(ssid) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
   }
   out += "]";
   WiFi.scanDelete();

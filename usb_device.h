@@ -30,6 +30,23 @@ struct UsbPrinterInterfaceInfo {
   }
 };
 
+struct UsbInterfaceInfo {
+  bool found = false;
+  uint8_t interfaceNumber = 0;
+  uint8_t alternateSetting = 0;
+  uint8_t classCode = 0;
+  uint8_t subclass = 0;
+  uint8_t protocol = 0;
+  UsbEndpointInfo bulkOut;
+  UsbEndpointInfo bulkIn;
+  UsbEndpointInfo interruptOut;
+  UsbEndpointInfo interruptIn;
+
+  bool isScanner() const {
+    return found && classCode == 0x06 && subclass == 0x01 && protocol == 0x01;
+  }
+};
+
 struct UsbPortStatus {
   bool valid = false;
   uint8_t value = 0;
@@ -41,6 +58,7 @@ struct UsbPortStatus {
 
 struct UsbDeviceInfo {
   static constexpr uint8_t MAX_PRINTER_INTERFACES = 8;
+  static constexpr uint8_t MAX_INTERFACES = 16;
 
   bool attached = false;
   uint16_t vid = 0;
@@ -50,6 +68,9 @@ struct UsbDeviceInfo {
   String manufacturer;
   String product;
   String serial;
+
+  uint8_t interfaceCount = 0;
+  UsbInterfaceInfo interfaces[MAX_INTERFACES];
 
   uint8_t printerInterfaceCount = 0;
   UsbPrinterInterfaceInfo printerInterfaces[MAX_PRINTER_INTERFACES];

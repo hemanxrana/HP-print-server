@@ -13,38 +13,70 @@ jobs:
     if: github.actor != 'github-actions[bot]'
     steps:
       - uses: actions/checkout@v4
-      - name: Move dashboard section
+      - name: Move dashboard interface controls
         shell: python
         run: |
           from pathlib import Path
           p = Path('HP-print-server.ino')
           s = p.read_text(encoding='utf-8')
-          start = s.find('<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2>')
-          marker = '\n<div class="sectionHead" style="margin-top:18px;margin-bottom:10px"><div><h2>Printer Status</h2>'
-          if start < 0 or marker not in s[start:]: raise SystemExit('Wi-Fi section not found')
-          end = s.find(marker, start)
-          section = s[start:end].rstrip() + '\n'
-          s = s[:start] + s[end+1:]
+
+          mode_start = '<div class="mode glass" aria-label="USB interface">'
+          mode_end = '</div>\n\n<div class="sectionHead" style="margin-top:18px;margin-bottom:10px"><div><h2>Printer Status</h2>'
+          if mode_start not in s or mode_end not in s:
+              raise SystemExit('top USB interface control not found')
+          a = s.find(mode_start)
+          b = s.find(mode_end, a)
+          if b < 0:
+              raise SystemExit('Printer Status marker not found after USB interface control')
+          mode = s[a:s.find('</div>', a) + len('</div>')]
+          # The mode container has two nested button divs but only one outer closing div;
+          # locate it by the exact known block ending before Printer Status.
+          mode_block_end = s.find('\n\n', a)
+          if mode_block_end < 0 or mode_block_end > b:
+              mode_block_end = b
+          mode = s[a:mode_block_end].rstrip()
+          if mode.count('<div') != mode.count('</div>'):
+              # Fall back to the known complete two-button block.
+              marker = '<div class="sectionHead" style="margin-top:18px;margin-bottom:10px"><div><h2>Printer Status</h2>'
+              mode = s[a:b].rstrip()
+          s = s[:a] + s[b+2:]
+
+          wifi_start = '<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2>'
+          if wifi_start not in s:
+              raise SystemExit('Wi-Fi & USB section not found')
+          ws = s.find(wifi_start)
           end_marker = '\n</main><div id="toast" class="toast">'
           pos = s.find(end_marker)
-          if pos < 0: raise SystemExit('dashboard end not found')
-          s = s[:pos] + '\n' + section + s[pos:]
+          if pos < 0:
+              raise SystemExit('dashboard end not found')
+          # Insert the USB interface control at the top of the Wi-Fi/USB section.
+          insert = '\n<div class="label" style="margin-bottom:8px">USB Interface</div>\n' + mode + '\n'
+          if 'USB Interface</div>\n<div class="mode glass"' not in s[ws:pos]:
+              s = s[:ws] + s[ws:].replace('>\n<div id="scanState"', '>' + insert + '<div id="scanState"', 1)
           p.write_text(s, encoding='utf-8')
-      - name: Verify placement
+
+      - name: Verify dashboard layout
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          s=Path('HP-print-server.ino').read_text()
-          a=s.find('<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2>')
-          c=s.find('<div class="section glass"><div class="sectionHead"><div><h2>Connection</h2>')
+          s=Path('HP-print-server.ino').read_text(encoding='utf-8')
+          wifi=s.find('<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2>')
+          conn=s.find('<div class="sectionHead" style="margin-top:18px;margin-bottom:10px"><div><h2>Connection</h2>')
           end=s.find('</main><div id="toast" class="toast">')
-          assert a > c and a < end, (a,c,end)
-          print('verified: Wi-Fi & USB section is after Connection and before dashboard end')
+          assert wifi > conn and wifi < end, (wifi,conn,end)
+          inside=s[wifi:end]
+          assert 'USB Interface</div>' in inside
+          assert '<div class="mode glass" aria-label="USB interface">' in inside
+          assert s.find('<div class="mode glass" aria-label="USB interface">') == wifi + inside.find('<div class="mode glass" aria-label="USB interface">')
+          top=s[:wifi]
+          assert '<div class="mode glass" aria-label="USB interface">' not in top
+          print('verified: USB interface toggle is inside bottom Wi-Fi & USB Interface section')
           PY
+
       - name: Commit change
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add HP-print-server.ino
-          git diff --cached --quiet || git commit -m 'Move Wi-Fi and USB interface to dashboard bottom'
+          git diff --cached --quiet || git commit -m 'Move USB interface toggle into Wi-Fi settings'
           git push

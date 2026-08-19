@@ -163,9 +163,9 @@ void MobileIppServer::handleClient(WiFiClient&c){
   if(status==ST_OK){
     if(op==OP_GET_PRINTER_ATTRIBUTES){
       responseBuffer[w++]=0x04;
-      String uuid="urn:uuid:hp-smart-tank-540-"+WiFi.macAddress();
+      String uuid="urn:uuid:hp-smart-tank-5100-"+WiFi.macAddress();
       String model=MobilePrintProfile::MODEL;
-      String deviceId="MFG:HP;MDL:Smart Tank 540 series;CMD:PCL3GUI,PJL,Automatic,JPEG,PCLM,AppleRaster,PWGRaster,DW-PCL,802.11,DESKJET,DYN;CLS:PRINTER;DES:HP Smart Tank 540 series;";
+      String deviceId="MFG:HP;MDL:Smart Tank 5100 series;CMD:PCL3GUI,PJL,Automatic,JPEG,PCLM,AppleRaster,PWGRaster,DW-PCL,802.11,DESKJET,DYN;CLS:PRINTER;DES:HP Smart Tank 5100 series;";
       if(wants(requested,"printer-uri-supported"))strv(responseBuffer,RESPONSE_CAPACITY,w,0x45,"printer-uri-supported",printerUri_);
       if(wants(requested,"uri-authentication-supported"))kw(responseBuffer,RESPONSE_CAPACITY,w,"uri-authentication-supported","none");
       if(wants(requested,"uri-security-supported"))kw(responseBuffer,RESPONSE_CAPACITY,w,"uri-security-supported","none");
@@ -184,7 +184,14 @@ void MobileIppServer::handleClient(WiFiClient&c){
       if(wants(requested,"charset-supported"))charset(responseBuffer,RESPONSE_CAPACITY,w,"charset-supported","utf-8");
       if(wants(requested,"natural-language-configured"))lang(responseBuffer,RESPONSE_CAPACITY,w,"natural-language-configured","en");
       if(wants(requested,"document-format-default"))mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-default",MobilePrintProfile::FORMAT_PASSTHROUGH);
-      if(wants(requested,"document-format-supported")){mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_PCLM);mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_URF);}
+      if(wants(requested,"document-format-supported")){
+        mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_PCLM);
+        mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_URF);
+        mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_PCL);
+        mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_JPEG);
+        mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_PWG);
+        mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_OCTET);
+      }
       if(wants(requested,"compression-supported"))kw(responseBuffer,RESPONSE_CAPACITY,w,"compression-supported","none");
       if(wants(requested,"color-supported"))ippBoolean(responseBuffer,RESPONSE_CAPACITY,w,"color-supported",true);
       if(wants(requested,"print-color-mode-supported")){kw(responseBuffer,RESPONSE_CAPACITY,w,"print-color-mode-supported","color");kw(responseBuffer,RESPONSE_CAPACITY,w,"print-color-mode-supported","monochrome");}

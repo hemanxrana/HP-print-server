@@ -33,6 +33,7 @@ struct Runtime {
   TaskHandle_t hostTask = nullptr;
 } g;
 UsbHostManager *manager = nullptr;
+static void transferCallback(usb_transfer_t *t);
 
 #if defined(CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK)
 static bool enumFilter(const usb_device_desc_t *, uint8_t *) { return true; }
@@ -211,8 +212,6 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
     return false;
   }
 
-  // Prefer a distinct IEEE 1284.4/status-capable Printer Class interface.
-  // GET_PORT_STATUS is a class control request, not WinUSB/vendor REST.
   for (uint8_t i = 0; i < out.printerInterfaceCount; ++i) {
     const auto &p = out.printerInterfaces[i];
     if (p.interfaceNumber == out.printer.interfaceNumber &&
@@ -263,8 +262,8 @@ static bool readPortStatus(uint8_t interfaceNumber, uint8_t &status, String &err
   }
 
   usb_setup_packet_t setup{};
-  setup.bmRequestType = 0xA1; // device-to-host | class | interface
-  setup.bRequest = 0x01;      // USB Printer Class GET_PORT_STATUS
+  setup.bmRequestType = 0xA1;
+  setup.bRequest = 0x01;
   setup.wValue = 0;
   setup.wIndex = interfaceNumber;
   setup.wLength = 1;

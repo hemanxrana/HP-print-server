@@ -13,6 +13,7 @@ static constexpr uint8_t USB_PRINTER_CLASS_CODE = 0x07;
 static constexpr uint8_t USB_PRINTER_SUBCLASS_CODE = 0x01;
 static constexpr uint8_t USB_ENDPOINT_XFER_BULK_CODE = 0x02;
 static constexpr int MAX_ALREADY_CONNECTED_DEVICES = 8;
+static constexpr uint32_t STATUS_TIMEOUT_MS = 1000;
 
 struct TransferWait { SemaphoreHandle_t done = nullptr; };
 struct Runtime {
@@ -27,6 +28,7 @@ struct Runtime {
   volatile bool deviceGone = false;
   volatile usb_device_handle_t goneHandle = nullptr;
   volatile bool selectionPending = false;
+  volatile bool statusPending = false;
   TaskHandle_t clientTask = nullptr;
   TaskHandle_t hostTask = nullptr;
 } g;
@@ -84,6 +86,7 @@ static void resetDevice() {
   g.address = 0;
   g.deviceOpen = false;
   g.interfaceClaimed = false;
+  g.statusPending = false;
 }
 
 static void closeDevice() {
@@ -208,13 +211,122 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
     return false;
   }
 
+  // Prefer a distinct IEEE 1284.4/status-capable Printer Class interface.
+  // GET_PORT_STATUS is a class control request, not WinUSB/vendor REST.
+  for (uint8_t i = 0; i < out.printerInterfaceCount; ++i) {
+    const auto &p = out.printerInterfaces[i];
+    if (p.interfaceNumber == out.printer.interfaceNumber &&
+        p.alternateSetting == out.printer.alternateSetting) continue;
+    if (p.protocol == 0x04 || p.protocol == 0x03 || p.protocol == 0x02) {
+      out.statusInterfaceFound = true;
+      out.statusInterfaceNumber = p.interfaceNumber;
+      out.statusAlternateSetting = p.alternateSetting;
+      break;
+    }
+  }
+  if (!out.statusInterfaceFound) {
+    out.statusInterfaceFound = true;
+    out.statusInterfaceNumber = out.printer.interfaceNumber;
+    out.statusAlternateSetting = out.printer.alternateSetting;
+  }
+
   for (uint8_t i = 0; i < out.printerInterfaceCount; ++i) {
     const auto &p = out.printerInterfaces[i];
     Serial.printf("[USB] Candidate %u: IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X score=%d\n",
                   i, p.interfaceNumber, p.alternateSetting, p.protocol,
                   p.bulkOut.address, p.bulkIn.address, score(p));
   }
+  Serial.printf("[USB] STATUS interface IF=%u ALT=%u\n",
+                out.statusInterfaceNumber, out.statusAlternateSetting);
   return true;
+}
+
+static bool readPortStatus(uint8_t interfaceNumber, uint8_t &status, String &error) {
+  if (!g.deviceOpen || !g.device || !g.client) {
+    error = "USB device is not open";
+    return false;
+  }
+
+  usb_transfer_t *t = nullptr;
+  const esp_err_t alloc = usb_host_transfer_alloc(9, 0, &t);
+  if (alloc != ESP_OK || !t) {
+    error = String("status transfer alloc failed: ") + esp_err_to_name(alloc);
+    return false;
+  }
+
+  TransferWait w;
+  w.done = xSemaphoreCreateBinary();
+  if (!w.done) {
+    usb_host_transfer_free(t);
+    error = "unable to allocate status transfer semaphore";
+    return false;
+  }
+
+  usb_setup_packet_t setup{};
+  setup.bmRequestType = 0xA1; // device-to-host | class | interface
+  setup.bRequest = 0x01;      // USB Printer Class GET_PORT_STATUS
+  setup.wValue = 0;
+  setup.wIndex = interfaceNumber;
+  setup.wLength = 1;
+  memcpy(t->data_buffer, setup.val, USB_SETUP_PACKET_SIZE);
+  t->data_buffer[8] = 0;
+  t->num_bytes = 9;
+  t->device_handle = g.device;
+  t->callback = transferCallback;
+  t->context = &w;
+  t->timeout_ms = STATUS_TIMEOUT_MS;
+
+  const esp_err_t submit = usb_host_transfer_submit_control(g.client, t);
+  if (submit != ESP_OK) {
+    vSemaphoreDelete(w.done);
+    usb_host_transfer_free(t);
+    error = String("GET_PORT_STATUS submit failed: ") + esp_err_to_name(submit);
+    return false;
+  }
+
+  const TickType_t waitTicks = pdMS_TO_TICKS(STATUS_TIMEOUT_MS + 250);
+  if (xSemaphoreTake(w.done, waitTicks) != pdTRUE) {
+    error = "GET_PORT_STATUS timed out";
+    xSemaphoreTake(w.done, portMAX_DELAY);
+  }
+
+  const usb_transfer_status_t transferStatus = t->status;
+  const size_t actual = static_cast<size_t>(t->actual_num_bytes);
+  if (transferStatus == USB_TRANSFER_STATUS_COMPLETED && actual >= 9) {
+    status = t->data_buffer[8];
+    vSemaphoreDelete(w.done);
+    usb_host_transfer_free(t);
+    return true;
+  }
+
+  error = String("GET_PORT_STATUS failed status=") + String((int)transferStatus) +
+          " bytes=" + String((unsigned)actual);
+  vSemaphoreDelete(w.done);
+  usb_host_transfer_free(t);
+  return false;
+}
+
+static void refreshStatusIfPending() {
+  if (!g.statusPending || !g.deviceOpen || !manager) return;
+  g.statusPending = false;
+  UsbDeviceInfo d = manager->device();
+  if (!d.statusInterfaceFound) return;
+  uint8_t status = 0;
+  String error;
+  if (readPortStatus(d.statusInterfaceNumber, status, error)) {
+    d.portStatus = status;
+    d.portStatusValid = true;
+    manager->onEnumerated(d);
+    Serial.printf("[USB] GET_PORT_STATUS IF=%u -> 0x%02X online=%s paper=%s error=%s\n",
+                  d.statusInterfaceNumber, status,
+                  (status & 0x08) ? "yes" : "no",
+                  (status & 0x20) ? "yes" : "no",
+                  (status & 0x40) ? "yes" : "no");
+  } else {
+    d.portStatusValid = false;
+    manager->onEnumerated(d);
+    Serial.printf("[USB] GET_PORT_STATUS unavailable: %s\n", error.c_str());
+  }
 }
 
 static void publish(const UsbDeviceInfo &d) {
@@ -308,6 +420,7 @@ static void clientTask(void *) {
       if (manager) manager->onDetached();
     }
     applySelectionIfPending();
+    refreshStatusIfPending();
     if (g.newDevice && !g.deviceOpen) {
       const uint8_t address = g.newAddress;
       g.newDevice = false;
@@ -388,6 +501,10 @@ void UsbHostManager::setInterfaceSelection(bool automatic, uint8_t interfaceNumb
   g.selectionPending = true;
 }
 
+void UsbHostManager::requestStatusRefresh() {
+  if (started_ && device_.attached && device_.statusInterfaceFound) g.statusPending = true;
+}
+
 const UsbPrinterInterfaceInfo *UsbHostManager::selectedInterface() const {
   return device_.printer.found ? &device_.printer : nullptr;
 }
@@ -428,8 +545,6 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
   }
 
   memcpy(t->data_buffer, data, length);
-  // data_buffer_size is read-only in Arduino-ESP32 3.3.x / current ESP-IDF.
-  // usb_host_transfer_alloc(length, ...) already sizes the transfer buffer.
   t->num_bytes = length;
   t->device_handle = g.device;
   t->bEndpointAddress = device_.printer.bulkOut.address;

@@ -5,8 +5,6 @@
 
 namespace {
 constexpr uint16_t RAW_PORT = 9100;
-// JetDirect clients can pause while the printer/USB path applies back-pressure.
-// Do not mistake a short pause for end-of-job.
 constexpr uint32_t RAW_IDLE_TIMEOUT_MS = 30000;
 constexpr size_t RAW_RX_CHUNK = 8192;
 
@@ -16,6 +14,7 @@ bool rawServerStarted=false;
 bool rawDiscoveryAdvertised=false;
 unsigned long rawLastDataMs=0;
 uint64_t rawBytesReceived=0;
+static uint8_t rawChunk[RAW_RX_CHUNK];
 
 bool selectedInterfaceUsable(const UsbHostManager &host){
   const UsbPrinterInterfaceInfo *p=host.selectedInterface();
@@ -58,21 +57,19 @@ void handleRawServer(UsbPrinterBackend *backend){
     return;
   }
 
-  // Bounded RAM only. Nothing is written to LittleFS and the whole print job
-  // is never accumulated in memory. TCP naturally applies back-pressure while
-  // the synchronous USB bulk transfer is in progress.
-  uint8_t chunk[RAW_RX_CHUNK];
+  // Fixed-size RAM only. The complete job is never accumulated.
   size_t drained=0;
-  while(rawClient.available() && drained < sizeof(chunk)){
-    const size_t want=min((size_t)rawClient.available(),sizeof(chunk)-drained);
-    const int got=rawClient.read(chunk+drained,want);
+  while(rawClient.available() && drained < sizeof(rawChunk)){
+    const size_t available=(size_t)rawClient.available();
+    const size_t want=min(available,sizeof(rawChunk)-drained);
+    const int got=rawClient.read(rawChunk+drained,want);
     if(got<=0) break;
     drained += (size_t)got;
   }
 
   if(drained){
     String error;
-    if(!backend->sendDirect(chunk,drained,error)){
+    if(!backend->sendDirect(rawChunk,drained,error)){
       Serial.printf("[RAW] USB pass-through failed after %llu bytes: %s\n",(unsigned long long)rawBytesReceived,error.c_str());
       rawClient.stop();
       rawBytesReceived=0;

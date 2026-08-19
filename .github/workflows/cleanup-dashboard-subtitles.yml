@@ -1,0 +1,46 @@
+name: Cleanup dashboard subtitles
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  patch:
+    if: contains(github.event.issue.title, '[dashboard-cleanup]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Remove section explanation text
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('HP-print-server.ino')
+          s = p.read_text(encoding='utf-8')
+          replacements = {
+            '<p>Choose which USB interface is selected on the connected multifunction device. The scanner selection is kept separate from the printer path used for RAW 9100 printing.</p>': '',
+            '<p>USB printer state and connection details.</p>': '',
+            '<p>Network connection and RAW 9100 service information.</p>': '',
+            '<p>Connection and print-server status.</p>': '',
+          }
+          old = s
+          for a,b in replacements.items():
+            s = s.replace(a,b)
+          if s == old:
+            print('No known subtitle strings found; inspecting h2 sections is required.')
+          p.write_text(s, encoding='utf-8')
+      - name: Commit change
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add HP-print-server.ino
+          git diff --cached --quiet && exit 0
+          git commit -m 'Clean dashboard section descriptions'
+          git push
+      - name: Close trigger issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue close '${{ github.event.issue.number }}' --repo '${{ github.repository }}' --comment 'Dashboard subtitle cleanup applied.'

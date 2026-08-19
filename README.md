@@ -1,95 +1,50 @@
-# HP Print Server
+# HP Print Server — ESP32-S3 RAW 9100
 
-Arduino IDE firmware for an **ESP32-S3** wireless print server, with an emphasis on USB-connected HP printers and smartphone printing.
+Arduino IDE firmware for an **ESP32-S3** wireless print server for USB-connected printers, currently focused on transparent HP RAW/JetDirect-style printing.
 
-## Arduino IDE layout
-
-The project is intentionally **flat**: all `.ino`, `.cpp`, and `.h` files required by the firmware live in the sketch root. There is no nested `src/usb` source tree and no duplicate USB headers.
-
-Open:
+## Current architecture
 
 ```text
-HP-print-server.ino
-```
-
-in Arduino IDE. Arduino will compile the companion `.cpp` files in the same directory.
-
-## Target stack
-
-```text
-Android / Mopria / Default Print Service
+PC / Android / network print client
           |
-          | DNS-SD _ipp._tcp
-          | IPP over TCP/631
+          | TCP 9100 (JetDirect / AppSocket)
           v
-ESP32-S3 IPP server + persistent LittleFS queue
+ESP32-S3 Wi-Fi RAW server
           |
-          | USB Host
+          | byte-for-byte USB Bulk OUT
           v
-USB Printer Class interface selection
+USB Printer Class interface
           |
-          | Bulk OUT
           v
 HP printer
 ```
 
-The USB implementation enumerates the printer descriptors, discovers Printer Class interfaces and Bulk endpoints, scores the available interfaces, and allows an advanced manual interface/alternate-setting selection from the web UI.
+The network printing path is intentionally small:
 
-For normal HP printers the automatic selector prefers the standard bidirectional Printer Class protocol (`0x02`). Other Printer Class protocols are detected and exposed, but the current raw-PCL backend only sends jobs through a usable raw-print interface.
+- **TCP 9100 only**
+- no IPP server
+- no HTTP print protocol
+- no Content-Length handling for print data
+- no print queue or LittleFS spool
+- no PDF/PWG/URF/PCLm conversion
+- no print-language modification
+- USB Printer Class interface and Bulk OUT endpoint are discovered from descriptors
+- automatic interface selection prefers the standard bidirectional Printer Class protocol `0x02`
+- manual interface + alternate-setting selection is available from the configuration page
 
-## Main features
+The ESP32 forwards the received bytes unchanged to the selected USB Bulk OUT endpoint.
 
-- ESP32-S3 Arduino IDE firmware
-- Wi-Fi station mode with fallback configuration AP
-- persistent Wi-Fi/printer configuration using Preferences
-- browser-based configuration and Wi-Fi scanner
-- DNS-SD `_ipp._tcp` advertisement
-- IPP smartphone-facing server
-- persistent multi-job LittleFS spool
-- PWG Raster, PCLm, PDF, JPEG and URF ingress formats
-- USB Host enumeration and descriptor inspection
-- automatic USB Printer Class interface selection
-- manual USB interface + alternate-setting selection
-- dynamic Bulk OUT endpoint discovery
-- USB device disconnect/reconnect handling
-- production USB Bulk OUT transfer path
-- PCL test-print endpoint using the production USB backend
-- retained RAW 9100, LPR, outbound IPP, mDNS, SSDP, WSD and SNMP transport/discovery helpers
-- `/health` status endpoint
-- `/simulate` network-to-USB pipeline diagnostic
+## Important RAW limitation
 
-## USB source files
+TCP 9100 is a **transport**, not a document format. The data sent to port 9100 must already be a print stream understood by the printer, such as a valid PCL/PJL stream supported by the connected HP printer.
 
-All USB files are at the sketch root:
+The firmware deliberately does **not** append a form-feed, PJL `EOJ`, UEL, or other bytes at the end of a job. Adding such bytes would make the server non-transparent and can corrupt formats it does not understand.
 
-- `usb_device.h`
-- `usb_host_manager.h/.cpp`
-- `usb_printer_backend.h/.cpp`
-- `usb_diagnostics.h/.cpp`
+After the TCP connection ends, the firmware waits briefly for the final USB transfer to drain before returning the printer backend to Ready. This is transport cleanup only; it does not change the print data.
 
-This flat layout is deliberate. Do not recreate `src/usb` or keep a second copy of these headers; Arduino IDE can otherwise compile/include inconsistent versions.
+## Configuration
 
-## Arduino ESP32 core
-
-The project CI targets **Arduino-ESP32 3.3.10**.
-
-For the ESP32-S3 USB-host portion, use 3.3.10 first. Arduino-ESP32 3.3.11 has a known USB-host enumeration regression in configurations where the enumeration-filter feature is enabled; this firmware includes an allow-all enumeration-filter callback when that feature is present, but 3.3.10 remains the baseline for this project.
-
-## Build
-
-1. Install Arduino IDE.
-2. Install **esp32 by Espressif Systems** from Boards Manager.
-3. Use Arduino-ESP32 **3.3.10** for the baseline build.
-4. Select the ESP32-S3 board matching your hardware.
-5. Open `HP-print-server.ino`.
-6. Compile and upload.
-7. Open Serial Monitor at **115200 baud**.
-
-The repository also contains an Arduino CLI CI workflow that installs ESP32 core 3.3.10 and compiles the sketch as an ESP32-S3 target.
-
-## First boot
-
-The configuration AP is:
+On first boot, if no Wi-Fi credentials are saved, the ESP32 starts:
 
 ```text
 SSID:     HP-Print-Server
@@ -102,29 +57,70 @@ Open:
 http://192.168.4.1/
 ```
 
-Configure the Wi-Fi network and printer information. The USB interface page appears once a Printer Class device is enumerated.
+After Wi-Fi configuration, the web page is available at the ESP32's assigned IP address.
 
-## USB selection
+The configuration page provides:
 
-**Automatic** is the normal setting. The firmware discovers interface numbers, alternate settings and endpoint addresses from the USB descriptors; endpoint addresses are never hard-coded in the configuration.
+- Wi-Fi SSID/password
+- nearby Wi-Fi scan
+- USB printer/interface information
+- automatic USB interface selection
+- manual interface/alternate-setting selection
+- RAW 9100 status
 
-Manual selection is intended for diagnostics and printers that expose multiple Printer Class interfaces.
+## Printing
 
-A selected interface must have a valid Bulk OUT endpoint before it can be used for raw printing.
+Connect the client to:
 
-## Important status semantics
+```text
+<ESP32-IP>:9100
+```
 
-A network IPP job is not marked completed merely because it was accepted by the TCP/IP layer. The queue remains pending until the USB backend successfully transfers the complete document. A failed USB transfer moves the job to an aborted/error state.
+The firmware accepts a TCP stream and forwards it directly to USB.
 
-USB transfer acknowledgement means that the USB host accepted the transfer; it is not proof that the printer physically produced a page.
+For example, a Windows Standard TCP/IP printer port can target the ESP32 IP address with RAW protocol on port `9100`.
 
-## Current limitations
+## USB
 
-- The raw USB backend currently targets Printer Class protocol `0x02` (standard bidirectional raw/PCL-style printing).
-- Printer Class protocol `0x04` is detected but is not yet implemented as a full IPP-over-USB transport.
-- Document conversion/rendering is not a general-purpose PDF/PWG-to-HP-PCL engine; the phone's supplied format must be supported by the selected backend path.
-- Physical page verification requires printer-side status/feedback and is not inferred from USB transfer completion alone.
+The USB implementation:
 
-## Repository history
+- enumerates USB Printer Class interfaces
+- discovers Bulk OUT/Bulk IN endpoints dynamically
+- prefers protocol `0x02` when multiple Printer Class interfaces exist
+- supports manual interface selection for diagnostics
+- handles USB disconnect/reconnect
+- uses the production USB Bulk OUT transfer path
 
-The current Arduino-ready structure consolidates the latest USB interface-selection work rather than preserving the older nested `src/usb` layout. Earlier development branches are retained as historical references, while the Arduino-ready branch is the source of truth for the flat sketch structure.
+For the HP Smart Tank 520/540-family device tested during development, the useful interface was:
+
+```text
+Printer Class protocol: 0x02
+Bulk OUT: 0x08
+Bulk IN:  0x89
+```
+
+Endpoint numbers are **not hard-coded**; the firmware obtains them from the USB descriptors.
+
+## Arduino ESP32 core
+
+Use **Arduino-ESP32 3.3.10** as the project baseline.
+
+For the ESP32-S3 USB-host portion:
+
+1. Install Arduino IDE.
+2. Install `esp32` by Espressif Systems.
+3. Use Arduino-ESP32 3.3.10.
+4. Select the appropriate ESP32-S3 board.
+5. Open `HP-print-server.ino`.
+6. Compile and upload.
+7. Open Serial Monitor at 115200 baud.
+
+## What was removed
+
+The RAW-only firmware no longer contains the previous mobile IPP stack, IPP compatibility profiles, IPP queue/spool, outbound IPP transport, or legacy network-printer discovery helpers. This keeps the Arduino sketch focused on the one active print path: **TCP 9100 → USB Bulk OUT**.
+
+## Physical printer errors
+
+A successful USB Bulk OUT transfer only proves that the ESP32 USB host delivered the bytes to the printer. It does not prove that the printer accepted the document format or physically completed the page.
+
+If the printer reports a paper/page/format error after a RAW job, the first thing to verify is the **actual byte stream sent to TCP 9100**. The ESP32 intentionally does not convert or repair that stream.

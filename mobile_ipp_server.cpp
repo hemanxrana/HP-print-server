@@ -167,7 +167,7 @@ void MobileIppServer::handleClient(WiFiClient &c){
       if(wants(requested,"printer-info"))txt(responseBuffer,RESPONSE_CAPACITY,w,"printer-info",MobilePrintProfile::MODEL);
       if(wants(requested,"printer-make-and-model"))txt(responseBuffer,RESPONSE_CAPACITY,w,"printer-make-and-model",MobilePrintProfile::MODEL);
       if(wants(requested,"printer-uuid"))strv(responseBuffer,RESPONSE_CAPACITY,w,0x45,"printer-uuid",uuid);
-      if(wants(requested,"printer-device-id"))txt(responseBuffer,RESPONSE_CAPACITY,w,"printer-device-id","MFG:HP;MDL:Smart Tank 540 series;CMD:PCL,PCLm,JPEG,URF,PWG-Raster;CLS:PRINTER;DES:HP Smart Tank 540 series;");
+      if(wants(requested,"printer-device-id"))txt(responseBuffer,RESPONSE_CAPACITY,w,"printer-device-id","MFG:HP;MDL:Smart Tank 540 series;CMD:PCL3GUI,PJL,PCLM,URF;CLS:PRINTER;DES:HP Smart Tank 540 series;");
       if(wants(requested,"printer-state"))enm(responseBuffer,RESPONSE_CAPACITY,w,"printer-state",3);
       if(wants(requested,"printer-state-reasons"))kw(responseBuffer,RESPONSE_CAPACITY,w,"printer-state-reasons","none");
       if(wants(requested,"printer-is-accepting-jobs"))ippBoolean(responseBuffer,RESPONSE_CAPACITY,w,"printer-is-accepting-jobs",true);
@@ -178,13 +178,28 @@ void MobileIppServer::handleClient(WiFiClient &c){
       if(wants(requested,"charset-supported"))charset(responseBuffer,RESPONSE_CAPACITY,w,"charset-supported","utf-8");
       if(wants(requested,"natural-language-configured"))lang(responseBuffer,RESPONSE_CAPACITY,w,"natural-language-configured","en");
       if(wants(requested,"document-format-default"))mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-default",MobilePrintProfile::FORMAT_PASSTHROUGH);
-      if(wants(requested,"document-format-supported")){mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_PCL);mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_JPEG);mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_PASSTHROUGH);mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_URF);mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_PWG);mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_OCTET);}
+      // Only advertise PDLs that the phone can send directly to the printer
+      // without the ESP32 having to rasterize/convert the document.
+      if(wants(requested,"document-format-supported")){
+        mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_PCLM);
+        mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_URF);
+      }
       if(wants(requested,"compression-supported"))kw(responseBuffer,RESPONSE_CAPACITY,w,"compression-supported","none");
       if(wants(requested,"color-supported"))ippBoolean(responseBuffer,RESPONSE_CAPACITY,w,"color-supported",true);
-      if(wants(requested,"media-supported")){kw(responseBuffer,RESPONSE_CAPACITY,w,"media-supported","iso_a4_210x297mm");kw(responseBuffer,RESPONSE_CAPACITY,w,"media-supported","na_letter_8.5x11in");}
+      if(wants(requested,"media-supported")){
+        kw(responseBuffer,RESPONSE_CAPACITY,w,"media-supported","iso_a4_210x297mm");
+        kw(responseBuffer,RESPONSE_CAPACITY,w,"media-supported","na_letter_8.5x11in");
+        kw(responseBuffer,RESPONSE_CAPACITY,w,"media-supported","na_legal_8.5x14in");
+        kw(responseBuffer,RESPONSE_CAPACITY,w,"media-supported","na_index-4x6_4x6in");
+      }
       if(wants(requested,"sides-supported"))kw(responseBuffer,RESPONSE_CAPACITY,w,"sides-supported","one-sided");
-      if(wants(requested,"job-creation-attributes-supported")){kw(responseBuffer,RESPONSE_CAPACITY,w,"job-creation-attributes-supported","copies");kw(responseBuffer,RESPONSE_CAPACITY,w,"job-creation-attributes-supported","document-format");kw(responseBuffer,RESPONSE_CAPACITY,w,"job-creation-attributes-supported","media");kw(responseBuffer,RESPONSE_CAPACITY,w,"job-creation-attributes-supported","sides");}
-    }else if(op==OP_PRINT_JOB){responseBuffer[w++]=0x02;integer(responseBuffer,RESPONSE_CAPACITY,w,"job-id",jobId);namev(responseBuffer,RESPONSE_CAPACITY,w,"job-name",String("Job ")+String(jobId));enm(responseBuffer,RESPONSE_CAPACITY,w,"job-state",9);kw(responseBuffer,RESPONSE_CAPACITY,w,"job-state-reasons","job-completed");mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format",format);}
+      if(wants(requested,"job-creation-attributes-supported")){
+        kw(responseBuffer,RESPONSE_CAPACITY,w,"job-creation-attributes-supported","copies");
+        kw(responseBuffer,RESPONSE_CAPACITY,w,"job-creation-attributes-supported","document-format");
+        kw(responseBuffer,RESPONSE_CAPACITY,w,"job-creation-attributes-supported","media");
+        kw(responseBuffer,RESPONSE_CAPACITY,w,"job-creation-attributes-supported","sides");
+      }
+    }else if(op==OP_PRINT_JOB){responseBuffer[w++]=0x02;integer(responseBuffer,RESPONSE_CAPACITY,w,"job-id",jobId);namev(responseBuffer,RESPONSE_CAPACITY,w,"job-name",String("Job ")+String(jobId));enm(responseBuffer,RESPONSE_CAPACITY,w,"job-state",9);kw(responseBuffer,RESPONSE_CAPACITY,w,"job-state-reasons","job-completed");mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format",format.c_str());}
   }
   responseBuffer[w++]=0x03;c.print("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: ");c.print((unsigned)w);c.print("\r\nConnection: close\r\n\r\n");c.write(responseBuffer,w);c.flush();delay(1);c.stop();
 }

@@ -70,6 +70,7 @@ bool advertiseMobilePrinter(){
   MDNS.addServiceTxt("ipp","tcp","PaperMax",MobilePrintProfile::TXT_PAPER_MAX);
   MDNS.addServiceTxt("ipp","tcp","usb_MDL",MobilePrintProfile::TXT_USB_MDL);
   MDNS.addServiceTxt("ipp","tcp","usb_MFG",MobilePrintProfile::TXT_USB_MFG);
+  MDNS.addServiceTxt("ipp","tcp","usb_CMD",MobilePrintProfile::TXT_USB_CMD);
   MDNS.addServiceTxt("ipp","tcp","Color",MobilePrintProfile::TXT_COLOR);
   MDNS.addServiceTxt("ipp","tcp","Duplex",MobilePrintProfile::TXT_DUPLEX);
   MDNS.addServiceTxt("ipp","tcp","Fax",MobilePrintProfile::TXT_FAX);

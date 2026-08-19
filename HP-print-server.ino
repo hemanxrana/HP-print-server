@@ -14,6 +14,8 @@
 static constexpr const char *RAW_HOSTNAME = "printer";
 static constexpr uint8_t RAW_PRINT_INTERFACE = 1;
 static constexpr uint8_t RAW_PRINT_ALT = 0;
+static constexpr uint8_t USB_SCAN_INTERFACE = 0;
+static constexpr uint8_t USB_SCAN_ALT = 0;
 static constexpr const char *AP_SSID = "HP-Print-Server";
 static constexpr const char *AP_PASSWORD = "configureme";
 static constexpr const char *CONFIG_NS = "hp-print";
@@ -29,6 +31,7 @@ struct Config {
 };
 Config config;
 static unsigned long lastStatus = 0;
+static bool scannerInterfaceSelected = false;
 
 String esc(String s) {
   s.replace("&", "&amp;");
@@ -203,15 +206,32 @@ void sendJsonStatus() {
   const bool rawActive = usbPrinterBackend.rawClientConnected();
   const bool printerAttached = usbHost.device().attached;
   String out;
-  out.reserve(760);
+  out.reserve(820);
   out += "{\"printer\":\"" + jsonEsc(printerStateText());
   out += "\",\"usb\":\"" + jsonEsc(usbStateText());
   out += "\",\"usbStatus\":\"" + jsonEsc(usbStatusText());
   out += "\",\"wifi\":\"" + jsonEsc(wifiStatusText());
   out += "\",\"rawConnected\":" + String(rawActive ? "true" : "false");
   out += ",\"usbAttached\":" + String(printerAttached ? "true" : "false");
+  out += ",\"interfaceMode\":\"" + String(scannerInterfaceSelected ? "scanner" : "printer") + "\"";
   out += ",\"ip\":\"" + (connected ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + "\"}";
   configServer.send(200, "application/json", out);
+}
+
+void handleInterfaceMode() {
+  const String mode = configServer.hasArg("mode") ? configServer.arg("mode") : "printer";
+  if (mode == "scanner") {
+    scannerInterfaceSelected = true;
+    usbHost.setInterfaceSelection(false, USB_SCAN_INTERFACE, USB_SCAN_ALT);
+    Serial.printf("[USB] Interface mode changed: scanner IF=%u ALT=%u\n", USB_SCAN_INTERFACE, USB_SCAN_ALT);
+    configServer.send(200, "application/json", "{\"mode\":\"scanner\",\"interface\":0,\"alternate\":0}");
+    return;
+  }
+
+  scannerInterfaceSelected = false;
+  usbHost.setInterfaceSelection(false, RAW_PRINT_INTERFACE, RAW_PRINT_ALT);
+  Serial.printf("[USB] Interface mode changed: printer IF=%u ALT=%u\n", RAW_PRINT_INTERFACE, RAW_PRINT_ALT);
+  configServer.send(200, "application/json", "{\"mode\":\"printer\",\"interface\":1,\"alternate\":0}");
 }
 
 String dashboard() {
@@ -232,23 +252,20 @@ String dashboard() {
 :root{color-scheme:light;--bg:#eef2f7;--glass:rgba(255,255,255,.62);--glass-strong:rgba(255,255,255,.78);--line:rgba(255,255,255,.78);--text:#101114;--muted:#69707d;--blue:#007aff;--green:#34c759;--red:#ff3b30;--shadow:0 18px 50px rgba(30,45,70,.12)}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;min-height:100vh;color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;background:radial-gradient(circle at 15% 5%,rgba(255,255,255,.95),transparent 35%),radial-gradient(circle at 90% 10%,rgba(190,215,255,.65),transparent 32%),linear-gradient(145deg,#eef2f7,#e7edf5 55%,#f4f6f9);background-attachment:fixed}
 body:before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(120deg,rgba(255,255,255,.24),transparent 35%,rgba(255,255,255,.18));mix-blend-mode:screen}.app{max-width:1050px;margin:auto;padding:24px 18px 52px;position:relative}.top{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:18px}.brand{display:flex;align-items:center;gap:13px}.logo{width:48px;height:48px;border-radius:16px;background:linear-gradient(145deg,rgba(255,255,255,.86),rgba(215,224,238,.7));border:1px solid rgba(255,255,255,.9);display:grid;place-items:center;font-weight:800;font-size:18px;box-shadow:inset 0 1px 0 #fff,0 10px 28px rgba(30,50,80,.12);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}.eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:700}.title{font-size:28px;font-weight:800;letter-spacing:-.035em}.subtitle{font-size:13px;color:var(--muted);margin-top:2px}.glass{background:var(--glass);border:1px solid var(--line);box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.9);backdrop-filter:blur(24px) saturate(145%);-webkit-backdrop-filter:blur(24px) saturate(145%)}.btn{border:1px solid rgba(255,255,255,.35);border-radius:999px;padding:11px 17px;background:var(--blue);color:#fff;font:inherit;font-weight:700;cursor:pointer;box-shadow:0 7px 20px rgba(0,122,255,.2);transition:transform .16s,opacity .16s}.btn:hover{transform:translateY(-1px)}.btn:active{transform:scale(.98)}.btn.secondary{background:rgba(255,255,255,.58);color:var(--text);border-color:rgba(255,255,255,.8);box-shadow:none}.btn:disabled{opacity:.55;cursor:wait;transform:none}
-.mode{display:flex;padding:4px;border-radius:16px;margin-bottom:15px;background:rgba(255,255,255,.48);border:1px solid rgba(255,255,255,.78);box-shadow:inset 0 1px 2px rgba(30,50,80,.08)}.mode button{flex:1;border:0;border-radius:12px;padding:10px 15px;background:transparent;color:var(--muted);font:inherit;font-weight:700;cursor:pointer;transition:.18s}.mode button.active{background:var(--glass-strong);color:var(--text);box-shadow:0 4px 14px rgba(30,50,80,.11),inset 0 1px 0 #fff}.modeIcon{margin-right:6px}.panel{display:none}.panel.active{display:block}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.card{border-radius:22px;padding:17px;min-height:112px}.label{font-size:11px;color:var(--muted);font-weight:750;text-transform:uppercase;letter-spacing:.06em}.value{font-size:19px;font-weight:800;margin-top:7px;line-height:1.25;letter-spacing:-.02em}.small{font-size:12px;color:var(--muted);margin-top:5px}.pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;margin-top:9px}.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px rgba(52,199,89,.12)}.dot.off{background:var(--red);box-shadow:0 0 0 3px rgba(255,59,48,.12)}.section{margin-top:14px;border-radius:24px;padding:20px}.sectionHead{display:flex;justify-content:space-between;align-items:flex-start;gap:15px;margin-bottom:15px}.section h2{font-size:19px;letter-spacing:-.02em;margin:0}.section p{margin:7px 0;color:var(--muted);font-size:13px;line-height:1.5}.infoGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.info{background:rgba(255,255,255,.38);border:1px solid rgba(255,255,255,.58);border-radius:17px;padding:14px}.info b{display:block;margin-top:5px}.selectWrap{position:relative}.selectWrap:after{content:"⌄";position:absolute;right:15px;top:50%;transform:translateY(-55%);color:var(--muted);pointer-events:none;font-size:18px}.selectWrap select{appearance:none;-webkit-appearance:none;width:100%;padding:14px 42px 14px 14px;border:1px solid rgba(255,255,255,.85);border-radius:15px;background:rgba(255,255,255,.62);color:var(--text);font:inherit;font-weight:650;outline:none;box-shadow:inset 0 1px 0 #fff}.selectWrap select:focus,.field input:focus{border-color:rgba(0,122,255,.55);box-shadow:0 0 0 4px rgba(0,122,255,.1)}.wifiForm{margin-top:16px;border-top:1px solid rgba(255,255,255,.7);padding-top:16px}.field{margin-bottom:12px}.field label{display:block;font-size:12px;font-weight:700;margin-bottom:6px}.field input{width:100%;padding:13px;border:1px solid rgba(255,255,255,.85);border-radius:14px;font:inherit;background:rgba(255,255,255,.58);outline:none}.hint{font-size:12px;color:var(--muted)}.actions{display:flex;gap:9px;flex-wrap:wrap;align-items:center}.printerHero{display:flex;align-items:center;gap:14px}.printerIcon{width:48px;height:48px;border-radius:15px;background:rgba(255,255,255,.55);display:grid;place-items:center;font-size:22px;border:1px solid rgba(255,255,255,.72)}.statusLine{font-size:13px;color:var(--muted);margin-top:4px}.code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:rgba(255,255,255,.5);padding:3px 6px;border-radius:7px}.toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,20px);background:rgba(25,27,32,.9);color:#fff;padding:12px 16px;border-radius:999px;opacity:0;pointer-events:none;transition:.2s;box-shadow:0 8px 25px rgba(0,0,0,.2);font-size:13px;backdrop-filter:blur(15px);-webkit-backdrop-filter:blur(15px)}.toast.show{opacity:1;transform:translate(-50%,0)}
+.mode{display:flex;padding:4px;border-radius:16px;margin-bottom:15px;background:rgba(255,255,255,.48);border:1px solid rgba(255,255,255,.78);box-shadow:inset 0 1px 2px rgba(30,50,80,.08)}.mode button{flex:1;border:0;border-radius:12px;padding:10px 15px;background:transparent;color:var(--muted);font:inherit;font-weight:700;cursor:pointer;transition:.18s}.mode button.active{background:var(--glass-strong);color:var(--text);box-shadow:0 4px 14px rgba(30,50,80,.11),inset 0 1px 0 #fff}.modeIcon{margin-right:6px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.card{border-radius:22px;padding:17px;min-height:112px}.label{font-size:11px;color:var(--muted);font-weight:750;text-transform:uppercase;letter-spacing:.06em}.value{font-size:19px;font-weight:800;margin-top:7px;line-height:1.25;letter-spacing:-.02em}.small{font-size:12px;color:var(--muted);margin-top:5px}.pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;margin-top:9px}.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px rgba(52,199,89,.12)}.dot.off{background:var(--red);box-shadow:0 0 0 3px rgba(255,59,48,.12)}.section{margin-top:14px;border-radius:24px;padding:20px}.sectionHead{display:flex;justify-content:space-between;align-items:flex-start;gap:15px;margin-bottom:15px}.section h2{font-size:19px;letter-spacing:-.02em;margin:0}.section p{margin:7px 0;color:var(--muted);font-size:13px;line-height:1.5}.infoGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.info{background:rgba(255,255,255,.38);border:1px solid rgba(255,255,255,.58);border-radius:17px;padding:14px}.info b{display:block;margin-top:5px}.selectWrap{position:relative}.selectWrap:after{content:"⌄";position:absolute;right:15px;top:50%;transform:translateY(-55%);color:var(--muted);pointer-events:none;font-size:18px}.selectWrap select{appearance:none;-webkit-appearance:none;width:100%;padding:14px 42px 14px 14px;border:1px solid rgba(255,255,255,.85);border-radius:15px;background:rgba(255,255,255,.62);color:var(--text);font:inherit;font-weight:650;outline:none;box-shadow:inset 0 1px 0 #fff}.selectWrap select:focus,.field input:focus{border-color:rgba(0,122,255,.55);box-shadow:0 0 0 4px rgba(0,122,255,.1)}.wifiForm{margin-top:16px;border-top:1px solid rgba(255,255,255,.7);padding-top:16px}.field{margin-bottom:12px}.field label{display:block;font-size:12px;font-weight:700;margin-bottom:6px}.field input{width:100%;padding:13px;border:1px solid rgba(255,255,255,.85);border-radius:14px;font:inherit;background:rgba(255,255,255,.58);outline:none}.hint{font-size:12px;color:var(--muted)}.actions{display:flex;gap:9px;flex-wrap:wrap;align-items:center}.printerHero{display:flex;align-items:center;gap:14px}.printerIcon{width:48px;height:48px;border-radius:15px;background:rgba(255,255,255,.55);display:grid;place-items:center;font-size:22px;border:1px solid rgba(255,255,255,.72)}.statusLine{font-size:13px;color:var(--muted);margin-top:4px}.code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:rgba(255,255,255,.5);padding:3px 6px;border-radius:7px}.toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,20px);background:rgba(25,27,32,.9);color:#fff;padding:12px 16px;border-radius:999px;opacity:0;pointer-events:none;transition:.2s;box-shadow:0 8px 25px rgba(0,0,0,.2);font-size:13px;backdrop-filter:blur(15px);-webkit-backdrop-filter:blur(15px)}.toast.show{opacity:1;transform:translate(-50%,0)}
 @media(max-width:760px){.grid{grid-template-columns:1fr 1fr}.infoGrid{grid-template-columns:1fr 1fr}}@media(max-width:560px){.app{padding:16px 12px 40px}.top{align-items:flex-start}.title{font-size:23px}.top>.btn{padding:9px 13px}.grid{grid-template-columns:1fr 1fr}.infoGrid{grid-template-columns:1fr}.section{padding:16px;border-radius:20px}.mode button{padding:9px 10px}.logo{width:44px;height:44px}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
 </style></head><body><main class="app">
 <div class="top"><div class="brand"><div class="logo">HP</div><div><div class="eyebrow">ESP32-S3 print server</div><div class="title">HP Print Server</div><div class="subtitle">JetDirect / AppSocket · TCP 9100</div></div></div><button class="btn secondary" id="refreshBtn" onclick="refreshStatus()">Refresh</button></div>
-<div class="mode glass"><button id="scanMode" class="active" onclick="setMode('scan')"><span class="modeIcon">⌕</span>Scan</button><button id="printMode" onclick="setMode('print')"><span class="modeIcon">▣</span>Print</button></div>
+<div class="mode glass" aria-label="USB interface"><button id="scanMode" onclick="setInterfaceMode('scanner')"><span class="modeIcon">⌕</span>Scanner interface</button><button id="printMode" class="active" onclick="setInterfaceMode('printer')"><span class="modeIcon">▣</span>Printer interface</button></div>
 
-<section id="scanPanel" class="panel active">
-<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi network</h2><p>Scan once, then choose a nearby network from the dropdown.</p></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan networks</button></div>
-<div id="scanState" class="hint">Press Scan networks to find nearby Wi-Fi.</div><div class="selectWrap" style="margin-top:11px"><select id="ssidSelect"><option value="">Select a network…</option></select></div>
-<form class="wifiForm" method="POST" action="/save"><div class="field"><label for="ssid">Selected SSID</label><input id="ssid" name="ssid" value=")HTML";
+<div class="section glass"><div class="sectionHead"><div><p>Choose which USB interface is selected on the connected multifunction device. Scanner uses IF 0 / ALT 0; printer uses IF 1 / ALT 0.</p></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan Wi-Fi</button></div>
+<div id="scanState" class="hint">Select a USB interface above. Wi-Fi scanning is independent of the USB interface.</div><div class="selectWrap" style="margin-top:11px"><select id="ssidSelect"><option value="">Select a Wi-Fi network…</option></select></div>
+<form class="wifiForm" method="POST" action="/save"><div class="field"><label for="ssid">Wi-Fi network</label><input id="ssid" name="ssid" value=")HTML";
   html += esc(config.ssid);
   html += R"HTML(" maxlength="32" autocomplete="off" placeholder="Select a network or enter a hidden SSID"></div><div class="field"><label for="password">Password</label><input id="password" type="password" name="password" placeholder="Leave blank to keep the saved password"></div><div class="actions"><button class="btn" type="submit">Save Wi-Fi &amp; restart</button><span class="hint">Hidden networks can be entered manually.</span></div></form></div>
-</section>
 
-<section id="printPanel" class="panel">
-<div class="grid">
+<div class="grid" style="margin-top:14px">
 <div class="card glass"><div class="printerHero"><div class="printerIcon">▣</div><div><div class="label">Printer</div><div id="printer" class="value">)HTML";
   html += esc(printerStateText());
   html += R"HTML(</div><div id="printerPill" class="pill"><span class="dot"></span><span>)HTML";
@@ -260,29 +277,30 @@ body:before{content:"";position:fixed;inset:0;pointer-events:none;background:lin
 <div class="card glass"><div class="label">RAW 9100</div><div id="raw" class="value">Listening</div><div class="small">Transparent print stream</div></div>
 </div>
 
-<section class="section glass"><div class="sectionHead"><div><h2>Printer status</h2><p>USB connection and printer status are shown together. The verified print interface remains fixed at interface 1, alternate setting 0.</p></div></div>
-<div class="infoGrid"><div class="info"><span class="label">Device</span><b id="device">)HTML";
+<div class="section glass"><div class="infoGrid"><div class="info"><span class="label">Device</span><b id="device">)HTML";
   html += esc(deviceName);
   html += R"HTML(</b></div><div class="info"><span class="label">USB / printer</span><b id="usbStatus">)HTML";
   html += esc(usbStatusText());
   html += R"HTML(</b></div><div class="info"><span class="label">Connection</span><b id="connection">)HTML";
   html += printerAttached ? "USB attached" : "Waiting for USB printer";
-  html += R"HTML(</b></div></div></section>
-
-<section class="section glass"><div class="sectionHead"><div><h2>Connection</h2><p>Use the local hostname when mDNS is available.</p></div></div><div class="infoGrid"><div class="info"><span class="label">Web UI</span><b>printer.local</b></div><div class="info"><span class="label">RAW endpoint</span><b><span class="code">printer.local:9100</span></b></div><div class="info"><span class="label">IP address</span><b id="ip">)HTML";
+  html += R"HTML(</b></div><div class="info"><span class="label">Web UI</span><b>printer.local</b></div><div class="info"><span class="label">RAW endpoint</span><b><span class="code">printer.local:9100</span></b></div><div class="info"><span class="label">IP address</span><b id="ip">)HTML";
   html += esc(ip);
-  html += R"HTML(</b></div></div></section>
-</section>
+  html += R"HTML(</b></div></div></div>
 
 </main><div id="toast" class="toast"></div>
 <script>
 const $=id=>document.getElementById(id);
+let interfaceMode=')HTML";
+  html += scannerInterfaceSelected ? "scanner" : "printer";
+  html += R"HTML(';
 function safe(s){return String(s).replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[m]));}
-function setMode(mode){const scan=mode==='scan';$('scanPanel').classList.toggle('active',scan);$('printPanel').classList.toggle('active',!scan);$('scanMode').classList.toggle('active',scan);$('printMode').classList.toggle('active',!scan);}
+function setInterfaceButtons(){const scanner=interfaceMode==='scanner';$('scanMode').classList.toggle('active',scanner);$('printMode').classList.toggle('active',!scanner);}
+async function setInterfaceMode(mode){if(mode===interfaceMode)return;const old=interfaceMode;interfaceMode=mode;setInterfaceButtons();try{const r=await fetch('/interface.json?mode='+encodeURIComponent(mode)+'&ts='+Date.now());if(!r.ok)throw new Error();const s=await r.json();interfaceMode=s.mode;setInterfaceButtons();showToast(interfaceMode==='scanner'?'Scanner interface selected (IF 0)':'Printer interface selected (IF 1)');refreshStatus();}catch(e){interfaceMode=old;setInterfaceButtons();showToast('USB interface change failed');}}
 $('ssidSelect').addEventListener('change',()=>{$('ssid').value=$('ssidSelect').value;});
-async function scanWifi(){const b=$('scanBtn'),select=$('ssidSelect'),state=$('scanState');b.disabled=true;b.textContent='Scanning…';state.textContent='Scanning nearby networks…';select.innerHTML='<option value="">Scanning…</option>';try{const r=await fetch('/scan.json?ts='+Date.now());if(!r.ok)throw new Error();const a=await r.json();a.sort((x,y)=>y.rssi-x.rssi);select.innerHTML='<option value="">Select a network…</option>';a.forEach(x=>{const o=document.createElement('option');o.value=x.ssid;o.textContent=x.ssid+'  ·  '+x.rssi+' dBm  ·  Ch '+x.channel;select.appendChild(o);});if(!a.length){select.innerHTML='<option value="">No visible networks found</option>';state.textContent='No visible networks found.';}else{state.textContent=a.length+' nearby network'+(a.length===1?'':'s')+' found.';const current=$('ssid').value;if(current&&a.some(x=>x.ssid===current))select.value=current;}}catch(e){select.innerHTML='<option value="">Scan failed</option>';state.textContent='Scan failed. You can still enter a hidden SSID manually.';}finally{b.disabled=false;b.textContent='Scan networks';}}
-async function refreshStatus(){const b=$('refreshBtn');b.disabled=true;b.textContent='Refreshing…';try{const r=await fetch('/status.json?ts='+Date.now());if(!r.ok)throw new Error();const s=await r.json();$('printer').textContent=s.printer;$('wifi').textContent=s.wifi;$('usbStatus').textContent=s.usbStatus;$('raw').textContent=s.rawConnected?'Job active':'Listening';$('ip').textContent=s.ip;$('connection').textContent=s.usbAttached?'USB attached':'Waiting for USB printer';$('printerPill').innerHTML='<span class="dot '+(s.usbAttached?'':'off')+'"></span><span>'+(s.usbAttached?'USB connected':'USB not detected')+'</span>';}catch(e){showToast('Status refresh failed');}finally{b.disabled=false;b.textContent='Refresh';}}
+async function scanWifi(){const b=$('scanBtn'),select=$('ssidSelect'),state=$('scanState');b.disabled=true;b.textContent='Scanning…';state.textContent='Scanning nearby Wi-Fi networks…';select.innerHTML='<option value="">Scanning…</option>';try{const r=await fetch('/scan.json?ts='+Date.now());if(!r.ok)throw new Error();const a=await r.json();a.sort((x,y)=>y.rssi-x.rssi);select.innerHTML='<option value="">Select a Wi-Fi network…</option>';a.forEach(x=>{const o=document.createElement('option');o.value=x.ssid;o.textContent=x.ssid+'  ·  '+x.rssi+' dBm  ·  Ch '+x.channel;select.appendChild(o);});if(!a.length){select.innerHTML='<option value="">No visible networks found</option>';state.textContent='No visible Wi-Fi networks found.';}else{state.textContent=a.length+' nearby Wi-Fi network'+(a.length===1?'':'s')+' found.';const current=$('ssid').value;if(current&&a.some(x=>x.ssid===current))select.value=current;}}catch(e){select.innerHTML='<option value="">Scan failed</option>';state.textContent='Scan failed. You can still enter a hidden SSID manually.';}finally{b.disabled=false;b.textContent='Scan Wi-Fi';}}
+async function refreshStatus(){const b=$('refreshBtn');b.disabled=true;b.textContent='Refreshing…';try{const r=await fetch('/status.json?ts='+Date.now());if(!r.ok)throw new Error();const s=await r.json();$('printer').textContent=s.printer;$('wifi').textContent=s.wifi;$('usbStatus').textContent=s.usbStatus;$('raw').textContent=s.rawConnected?'Job active':'Listening';$('ip').textContent=s.ip;$('connection').textContent=s.usbAttached?'USB attached':'Waiting for USB printer';interfaceMode=s.interfaceMode||interfaceMode;setInterfaceButtons();$('printerPill').innerHTML='<span class="dot '+(s.usbAttached?'':'off')+'"></span><span>'+(s.usbAttached?'USB connected':'USB not detected')+'</span>';}catch(e){showToast('Status refresh failed');}finally{b.disabled=false;b.textContent='Refresh';}}
 function showToast(t){const x=$('toast');x.textContent=t;x.classList.add('show');clearTimeout(window._toast);window._toast=setTimeout(()=>x.classList.remove('show'),2800);}
+setInterfaceButtons();
 setInterval(refreshStatus,5000);
 </script></body></html>)HTML";
   return html;
@@ -304,10 +322,8 @@ void handleSave() {
 }
 
 void handleUsbScan() {
-  // Keep the currently verified printer path. This endpoint is deliberately
-  // non-destructive and provides the future hook for USB-port discovery.
   usbHost.setInterfaceSelection(false, RAW_PRINT_INTERFACE, RAW_PRINT_ALT);
-  String out = "{\"message\":\"USB scan hook ready. RAW printing remains on interface 1 / alternate 0.\"}";
+  String out = "{\"message\":\"USB printer interface selected: IF 1 / alternate 0.\"}";
   configServer.send(200, "application/json", out);
 }
 
@@ -324,12 +340,14 @@ void setup() {
 
   startRawDiscovery();
 
+  scannerInterfaceSelected = false;
   usbHost.setInterfaceSelection(false, RAW_PRINT_INTERFACE, RAW_PRINT_ALT);
   usbPrinterBackend.begin();
 
   configServer.on("/", HTTP_GET, handleRoot);
   configServer.on("/scan.json", HTTP_GET, sendJsonScan);
   configServer.on("/status.json", HTTP_GET, sendJsonStatus);
+  configServer.on("/interface.json", HTTP_GET, handleInterfaceMode);
   configServer.on("/save", HTTP_POST, handleSave);
   configServer.on("/usb-scan", HTTP_GET, handleUsbScan);
   configServer.begin();

@@ -29,11 +29,13 @@ public:
 
   // Sends a Print-Job to a network IPP printer and checks the HTTP + IPP response.
   bool send(const PrintTarget& target, const String& printerUri,
-            const String& user, const uint8_t* document, size_t documentLength,
+            const String& user, const String& documentFormat,
+            const uint8_t* document, size_t documentLength,
             uint32_t timeoutMs = 15000, uint16_t* ippStatus = nullptr);
 
   // Streaming variant for LittleFS/queue-backed jobs; avoids a 2 MiB RAM buffer.
   bool sendStream(const PrintTarget& target, const String& printerUri,
-                  const String& user, Stream& source, size_t documentLength,
+                  const String& user, const String& documentFormat,
+                  Stream& source, size_t documentLength,
                   uint32_t timeoutMs = 15000, uint16_t* ippStatus = nullptr);
 };

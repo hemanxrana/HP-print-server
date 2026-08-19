@@ -32,7 +32,11 @@ bool statusSaysReady(const UsbPrinterBackend &backend) {
          !backend.usbStatusError();
 }
 
-const char *statusReason(const UsbPrinterBackend &backend) {
+// This helper used to be named statusReason(), which collided with the
+// UsbPrinterBackend::statusReason() member accessor. Inside member functions,
+// the member name hid the namespace helper and caused statusReason(*this) to
+// be interpreted as a one-argument member call. Keep the helper distinct.
+const char *statusReasonText(const UsbPrinterBackend &backend) {
   if (!backend.usbStatusValid()) return "status-not-yet-available";
   if (backend.usbStatusError()) return "usb-printer-reports-error";
   if (backend.usbPaperEmpty()) return "usb-printer-reports-paper-empty";
@@ -139,6 +143,10 @@ void startRawServerIfNeeded() {
 }
 } // namespace
 
+bool UsbPrinterBackend::rawClientConnected() const {
+  return (bool)rawClient;
+}
+
 bool UsbPrinterBackend::begin() {
   StatusLed::begin();
   StatusLed::set(StatusLed::BOOT);
@@ -189,7 +197,7 @@ void UsbPrinterBackend::poll() {
         reason_ = "selected-interface-has-no-bulk-output";
       } else if (!statusSaysReady(*this)) {
         state_ = usbStatusError() ? ERROR : OFFLINE;
-        reason_ = statusReason(*this);
+        reason_ = statusReasonText(*this);
       } else {
         state_ = IDLE;
         reason_ = usbStatusValid() ? "usb-printer-ready" : "printer-interface-ready";
@@ -264,7 +272,7 @@ void UsbPrinterBackend::finishRawJob() {
     StatusLed::set(StatusLed::ERROR);
   } else if (usbStatusValid() && (usbPaperEmpty() || !usbStatusSelected())) {
     state_ = OFFLINE;
-    reason_ = statusReason(*this);
+    reason_ = statusReasonText(*this);
     StatusLed::set(StatusLed::WAITING_FOR_PRINTER);
   } else {
     state_ = IDLE;

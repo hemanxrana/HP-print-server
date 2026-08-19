@@ -6,6 +6,11 @@
 #include "usb_host_manager.h"
 #include "mobile_print_queue.h"
 
+// These objects are owned by the main Arduino sketch.
+extern WebServer configServer;
+extern UsbHostManager usbHost;
+extern MobilePrintQueue printQueue;
+
 #ifndef PIN_LED_RGB
 #define PIN_LED_RGB 48
 #endif

@@ -1,0 +1,98 @@
+name: Patch status logging
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch repeated status logging
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('HP-print-server.ino')
+          s = p.read_text()
+          old = '''  if (millis() - lastStatus > 5000) {
+    lastStatus = millis();
+    Serial.printf("[STATUS] WiFi=%d IP=%s USB=%d printer=%s raw=%s usbport=0x%02X\\n",
+                  (int)WiFi.status(),
+                  WiFi.localIP().toString().c_str(),
+                  (int)usbHost.state(),
+                  printerStateText().c_str(),
+                  usbPrinterBackend.rawClientConnected() ? "connected" : "idle",
+                  usbHost.portStatusValid() ? usbHost.portStatusValue() : 0);
+  }'''
+          new = '''  if (millis() - lastStatus > 1000) {
+    lastStatus = millis();
+
+    const int wifiState = (int)WiFi.status();
+    const String ip = WiFi.localIP().toString();
+    const int usbState = (int)usbHost.state();
+    const String printerState = printerStateText();
+    const bool rawConnected = usbPrinterBackend.rawClientConnected();
+    const uint8_t usbPort =
+        usbHost.portStatusValid() ? usbHost.portStatusValue() : 0;
+
+    static bool initialized = false;
+    static int lastWifiState = -1;
+    static String lastIp;
+    static int lastUsbState = -1;
+    static String lastPrinterState;
+    static bool lastRawConnected = false;
+    static uint8_t lastUsbPort = 0;
+
+    const bool changed =
+        !initialized ||
+        wifiState != lastWifiState ||
+        ip != lastIp ||
+        usbState != lastUsbState ||
+        printerState != lastPrinterState ||
+        rawConnected != lastRawConnected ||
+        usbPort != lastUsbPort;
+
+    if (changed) {
+      Serial.printf("[STATUS] WiFi=%d IP=%s USB=%d printer=%s raw=%s usbport=0x%02X\\n",
+                    wifiState,
+                    ip.c_str(),
+                    usbState,
+                    printerState.c_str(),
+                    rawConnected ? "connected" : "idle",
+                    usbPort);
+
+      lastWifiState = wifiState;
+      lastIp = ip;
+      lastUsbState = usbState;
+      lastPrinterState = printerState;
+      lastRawConnected = rawConnected;
+      lastUsbPort = usbPort;
+      initialized = true;
+    }
+  }'''
+          if old not in s:
+              if 'const bool changed =' in s and 'lastPrinterState' in s:
+                  print('Patch already applied')
+              else:
+                  raise SystemExit('Original status block not found; refusing to modify file')
+          else:
+              p.write_text(s.replace(old, new, 1))
+              print('Patched')
+          PY
+      - name: Commit patch and remove workflow
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/workflows/patch-status-logging.yml
+          if git diff --quiet; then
+            echo 'No source changes needed'
+            exit 0
+          fi
+          git add HP-print-server.ino .github/workflows/patch-status-logging.yml
+          git commit -m 'fix: only log serial status when state changes'
+          git push

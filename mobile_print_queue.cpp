@@ -1,8 +1,7 @@
 #include "mobile_print_queue.h"
 
 bool MobilePrintQueue::begin(){
-  // No flash spool is used. This prevents LittleFS wear and eliminates
-  // filesystem-full failures from transparent print jobs.
+  // Transparent pass-through mode: no flash spool and no persistent queue.
   return true;
 }
 
@@ -12,7 +11,7 @@ bool MobilePrintQueue::enqueue(const uint8_t*,size_t,const String&,uint32_t&,Str
 }
 
 bool MobilePrintQueue::enqueueSpoolFile(const String&,size_t,const String&,uint32_t&,String&error){
-  error="LittleFS spool disabled: RAW jobs are streamed directly to USB";
+  error="LittleFS spool disabled: jobs are streamed directly to USB";
   return false;
 }
 
@@ -28,7 +27,7 @@ bool MobilePrintQueue::cancel(uint32_t,String&error){
   return false;
 }
 
-bool MobilePrintQueue::readJob(uint32_t,Stream&,String&error){
+bool MobilePrintQueue::readJob(uint32_t,Stream&,String&error) const{
   error="Job storage disabled in pass-through mode";
   return false;
 }

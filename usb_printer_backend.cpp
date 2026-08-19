@@ -5,7 +5,8 @@
 namespace {
 constexpr uint16_t RAW_PORT = 9100;
 constexpr uint32_t RAW_IDLE_TIMEOUT_MS = 30000;
-constexpr uint32_t RAW_JOB_DRAIN_MS = 250;
+constexpr uint32_t RAW_JOB_DRAIN_MS = 1500;
+constexpr uint32_t RAW_CLOSE_GUARD_MS = 250;
 constexpr size_t RAW_RX_CHUNK = 8192;
 
 WiFiServer rawServer(RAW_PORT);
@@ -31,9 +32,11 @@ bool sendUsbChunk(UsbHostManager &host, const uint8_t *data, size_t length, Stri
 }
 
 void finishRawConnection(UsbPrinterBackend *backend, const char *reason) {
-  // Do not inject FF/PJL/other bytes. TCP/9100 remains a transparent
-  // transport and must not change the application's print language.
+  // TCP FIN is not a USB printer completion indication. Give the printer time
+  // to drain the final USB transfer before releasing the network connection.
+  // No FF/PJL/UEL/form-feed is injected: RAW remains byte-for-byte transparent.
   if (backend) backend->finishRawJob();
+  delay(RAW_CLOSE_GUARD_MS);
   if (rawClient) rawClient.stop();
   Serial.printf("[RAW] TCP 9100 job ended (%s, %llu bytes)\n",
                 reason, (unsigned long long)rawBytesReceived);
@@ -193,16 +196,14 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
     return false;
   }
 
-  // Keep the backend in PRINTING until the TCP/9100 connection ends. This
-  // prevents the raw job from being treated as complete between 8 KiB chunks.
+  // Never complete a RAW job per 8 KiB chunk. Keep it PRINTING until the TCP
+  // stream ends and the final USB pipeline drain has completed.
   reason_ = "raw-job-in-progress";
   return true;
 }
 
 void UsbPrinterBackend::finishRawJob() {
   if (state_ == PRINTING) {
-    // Allow the final USB transfer to drain through the printer's USB pipeline.
-    // No print-language bytes are added or modified.
     delay(RAW_JOB_DRAIN_MS);
     state_ = IDLE;
     reason_ = "printer-interface-ready";

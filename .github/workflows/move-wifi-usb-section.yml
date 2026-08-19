@@ -1,7 +1,7 @@
 name: Move Wi-Fi USB section to bottom
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, synchronize, reopened]
 
 permissions:

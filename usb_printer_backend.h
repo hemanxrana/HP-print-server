@@ -1,6 +1,5 @@
 #pragma once
 #include <Arduino.h>
-#include "mobile_print_queue.h"
 #include "usb_host_manager.h"
 
 class UsbPrinterBackend {
@@ -13,10 +12,14 @@ public:
   bool online() const { return state_ == IDLE || state_ == PRINTING; }
   const String &statusReason() const { return reason_; }
   const UsbDeviceInfo &device() const { return host_.device(); }
+
+  // Send an already-rendered raw print stream byte-for-byte to USB Bulk OUT.
   bool sendDirect(const uint8_t *data, size_t length, String &error);
-  // Stream directly into USB using a bounded 8 KiB RAM buffer.
-  bool sendStream(Stream &source, size_t length, String &error);
-  bool processNext(MobilePrintQueue &queue, String &error);
+
+  // Called when a TCP/9100 job has ended. This deliberately does not alter the
+  // document or append a form-feed/PJL command; RAW mode must remain byte exact.
+  void finishRawJob();
+
 private:
   UsbHostManager &host_;
   PrinterState state_ = OFFLINE;

@@ -1,0 +1,50 @@
+name: Move Wi-Fi USB section to bottom
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  move-section:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Move dashboard section
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('HP-print-server.ino')
+          s = p.read_text(encoding='utf-8')
+          start = s.find('<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2>')
+          marker = '\n<div class="sectionHead" style="margin-top:18px;margin-bottom:10px"><div><h2>Printer Status</h2>'
+          if start < 0 or marker not in s[start:]: raise SystemExit('Wi-Fi section not found')
+          end = s.find(marker, start)
+          section = s[start:end].rstrip() + '\n'
+          s = s[:start] + s[end+1:]
+          end_marker = '\n</main><div id="toast" class="toast">'
+          pos = s.find(end_marker)
+          if pos < 0: raise SystemExit('dashboard end not found')
+          s = s[:pos] + '\n' + section + s[pos:]
+          p.write_text(s, encoding='utf-8')
+      - name: Verify placement
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path('HP-print-server.ino').read_text()
+          a=s.find('<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2>')
+          c=s.find('<div class="section glass"><div class="sectionHead"><div><h2>Connection</h2>')
+          end=s.find('</main><div id="toast" class="toast">')
+          assert a > c and a < end, (a,c,end)
+          print('verified: Wi-Fi & USB section is after Connection and before dashboard end')
+          PY
+      - name: Commit change
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add HP-print-server.ino
+          git diff --cached --quiet || git commit -m 'Move Wi-Fi and USB interface to dashboard bottom'
+          git push

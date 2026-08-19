@@ -8,8 +8,7 @@
 // ESP32-S3 USB-to-Wi-Fi RAW print server.
 // Network side: JetDirect/AppSocket on TCP 9100 only.
 // Print data is forwarded byte-for-byte to the selected USB Printer Class
-// Bulk OUT endpoint. No IPP, document conversion, spool or print-language
-// emulation is performed here.
+// Bulk OUT endpoint. IPP and document conversion are intentionally absent.
 
 static constexpr const char *RAW_HOSTNAME = "hp-print-server";
 static constexpr const char *AP_SSID = "HP-Print-Server";
@@ -32,19 +31,14 @@ Config config;
 static unsigned long lastStatus = 0;
 
 String esc(String s) {
-  s.replace("&", "&amp;");
-  s.replace("<", "&lt;");
-  s.replace(">", "&gt;");
-  s.replace("\"", "&quot;");
-  s.replace("'", "&#39;");
+  s.replace("&", "&amp;"); s.replace("<", "&lt;"); s.replace(">", "&gt;");
+  s.replace("\"", "&quot;"); s.replace("'", "&#39;");
   return s;
 }
 
 String jsonEsc(String s) {
-  s.replace("\\", "\\\\");
-  s.replace("\"", "\\\"");
-  s.replace("\r", "\\r");
-  s.replace("\n", "\\n");
+  s.replace("\\", "\\\\"); s.replace("\"", "\\\"");
+  s.replace("\r", "\\r"); s.replace("\n", "\\n");
   return s;
 }
 
@@ -87,30 +81,20 @@ bool connectWiFi() {
     Serial.println("[WiFi] No saved SSID");
     return false;
   }
-
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(RAW_HOSTNAME);
   WiFi.begin(config.ssid.c_str(), config.password.c_str());
-  Serial.print("[WiFi] Connecting to ");
-  Serial.println(config.ssid);
-
+  Serial.print("[WiFi] Connecting to "); Serial.println(config.ssid);
   const unsigned long deadline = millis() + 20000UL;
-  while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
-    delay(250);
-    Serial.print('.');
-  }
+  while (WiFi.status() != WL_CONNECTED && millis() < deadline) { delay(250); Serial.print('.'); }
   Serial.println();
-
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("[WiFi] Connection failed, status=%d\n", (int)WiFi.status());
     WiFi.disconnect(false, false);
     return false;
   }
-
-  Serial.print("[WiFi] Connected: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("[WiFi] Hostname: ");
-  Serial.println(RAW_HOSTNAME);
+  Serial.print("[WiFi] Connected: "); Serial.println(WiFi.localIP());
+  Serial.print("[WiFi] Hostname: "); Serial.println(RAW_HOSTNAME);
   return true;
 }
 
@@ -121,10 +105,8 @@ bool startConfigAP() {
     Serial.println("[AP] Failed to start configuration AP");
     return false;
   }
-  Serial.print("[AP] SSID: ");
-  Serial.println(AP_SSID);
-  Serial.print("[AP] Configure at http://");
-  Serial.println(WiFi.softAPIP());
+  Serial.print("[AP] SSID: "); Serial.println(AP_SSID);
+  Serial.print("[AP] Configure at http://"); Serial.println(WiFi.softAPIP());
   return true;
 }
 
@@ -142,22 +124,27 @@ void startRawDiscovery() {
   }
 }
 
-String usbInterfaceLabel(const UsbPrinterInterfaceInfo &p, bool active) {
-  String s = "IF " + String(p.interfaceNumber) + " / ALT " + String(p.alternateSetting) + " / protocol 0x";
-  if (p.protocol < 16) s += "0";
-  s += String(p.protocol, HEX);
-  s += " / OUT 0x";
-  if (p.bulkOut.address < 16) s += "0";
-  s += String(p.bulkOut.address, HEX);
-  s += " / IN ";
-  if (p.bulkIn.valid()) {
-    s += "0x";
-    if (p.bulkIn.address < 16) s += "0";
-    s += String(p.bulkIn.address, HEX);
-  } else {
-    s += "none";
+String usbProtocolName(const UsbPrinterInterfaceInfo &p) {
+  switch (p.protocol) {
+    case 0x01: return "Unidirectional printer";
+    case 0x02: return "Bidirectional printer (RAW candidate)";
+    case 0x03: return "IEEE 1284.4 printer";
+    case 0x04: return "IEEE 1284.4 / status-capable";
+    case 0xFF: return "Vendor-specific printer";
+    default: return "Printer protocol";
   }
-  if (active) s += " [ACTIVE]";
+}
+
+String usbInterfaceLabel(const UsbPrinterInterfaceInfo &p, bool active) {
+  String s = usbProtocolName(p) + " — interface " + String(p.interfaceNumber);
+  if (p.alternateSetting) s += ", alternate " + String(p.alternateSetting);
+  if (active) s += " · ACTIVE FOR PRINTING";
+  return s;
+}
+
+String usbDetails(const UsbPrinterInterfaceInfo &p) {
+  String s = "OUT 0x" + String(p.bulkOut.address, HEX);
+  if (p.bulkIn.valid()) s += " · IN 0x" + String(p.bulkIn.address, HEX);
   return s;
 }
 
@@ -183,59 +170,22 @@ String printerStateText() {
   return "Unknown";
 }
 
-String wifiOptionsHtml() {
-  String html;
-  html.reserve(2500);
-  const int n = WiFi.scanNetworks(false, true);
-  for (int i = 0; i < n; ++i) {
-    String ssid = WiFi.SSID(i);
-    if (ssid.isEmpty()) continue;
-    html += "<option value='" + esc(ssid) + "'></option>";
-  }
-  WiFi.scanDelete();
-  return html;
+String wifiText() {
+  if (WiFi.status() == WL_CONNECTED) return "Connected · " + WiFi.localIP().toString();
+  if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) return "Configuration AP · " + WiFi.softAPIP().toString();
+  return "Not connected";
 }
 
-String dashboard() {
-  String wifi;
-  if (WiFi.status() == WL_CONNECTED) wifi = "Connected — " + WiFi.localIP().toString();
-  else if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) wifi = "Configuration AP — " + WiFi.softAPIP().toString();
-  else wifi = "Not connected";
-
-  String selected = usbHost.selectedInterface()
-      ? usbInterfaceLabel(*usbHost.selectedInterface(), true)
-      : "none";
-
-  String usbOptions;
-  if (!usbHost.device().attached || usbHost.interfaceCount() == 0) {
-    usbOptions = "<p>No USB printer interfaces detected.</p>";
-  } else {
-    usbOptions = "<form method='POST' action='/usb'><label><input type='radio' name='mode' value='auto' ";
-    usbOptions += config.usbAuto ? "checked" : "";
-    usbOptions += "> Automatic</label><br>";
-    for (uint8_t i = 0; i < usbHost.interfaceCount(); ++i) {
-      const UsbPrinterInterfaceInfo *p = usbHost.interfaceAt(i);
-      if (!p) continue;
-      const bool checked = !config.usbAuto && p->interfaceNumber == config.usbInterface && p->alternateSetting == config.usbAlt;
-      const bool active = usbHost.selectedInterface() == p;
-      usbOptions += "<label><input type='radio' name='mode' value='manual:" + String(p->interfaceNumber) + ":" + String(p->alternateSetting) + "' ";
-      usbOptions += checked ? "checked" : "";
-      usbOptions += "> " + esc(usbInterfaceLabel(*p, active)) + "</label><br>";
-    }
-    usbOptions += "<br><button type='submit'>Apply USB interface</button></form>";
-  }
-
-  String html;
-  html.reserve(8500);
-  html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>HP Print Server</title>";
-  html += "<style>body{font-family:system-ui,Arial;max-width:820px;margin:24px auto;padding:0 16px;background:#f5f5f5;color:#222}section{background:#fff;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 8px #0001}input{box-sizing:border-box;padding:10px;margin:6px 0 14px;border:1px solid #aaa;border-radius:7px;width:100%}input[type=radio]{width:auto;margin-right:8px}button{padding:10px 14px;border:0;border-radius:7px;background:#222;color:#fff}.ssidRow{display:flex;gap:8px;align-items:center}.ssidRow input{flex:1}.status{padding:12px;background:#eee;border-radius:7px}code{word-break:break-all}.hint{font-size:.9em;color:#666}</style></head><body>";
-  html += "<h1>HP Print Server</h1>";
-  html += "<section><h2>Status</h2><div class='status'>Wi-Fi: " + esc(wifi) + "<br>USB host: " + esc(usbStateText()) + "<br>Printer: " + esc(printerStateText()) + "<br>RAW JetDirect/AppSocket: TCP <b>9100</b></div></section>";
-  html += "<section><h2>Wi-Fi</h2><form method='POST' action='/save'><label>SSID</label><div class='ssidRow'><input id='ssid' name='ssid' list='wifiList' value='" + esc(config.ssid) + "' maxlength='32' autocomplete='off'><button type='button' onclick='scanWifi()'>Search</button></div><datalist id='wifiList'>" + wifiOptionsHtml() + "</datalist><div class='hint'>Type to search, or press Search to scan nearby networks.</div><label>Password</label><input type='password' name='password' placeholder='Leave blank to keep current password'><button type='submit'>Save &amp; restart</button></form></section>";
-  html += "<section><h2>USB printer interface</h2><p>Device: " + (usbHost.device().attached ? "VID 0x" + String(usbHost.device().vid, HEX) + " / PID 0x" + String(usbHost.device().pid, HEX) : "none") + "</p><p>Active: <b>" + esc(selected) + "</b></p>" + usbOptions + "</section>";
-  html += "<section><h2>RAW printing</h2><p>Connect a client directly to <code>" + String(RAW_HOSTNAME) + ":9100</code> or <code>" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("192.168.4.1")) + ":9100</code>.</p><p>The server does not add Content-Length, IPP headers, PJL, form feeds, or any other print data. The incoming byte stream is passed unchanged to USB.</p><p>Use a print stream the HP printer itself understands (for example a valid PCL/PJL stream). PDF/PNG/PWG/URF conversion is not performed.</p></section>";
-  html += "<script>async function scanWifi(){const b=document.querySelector('.ssidRow button');b.disabled=true;b.textContent='Searching…';try{const r=await fetch('/scan.json');const a=await r.json();const d=document.getElementById('wifiList');d.innerHTML='';a.forEach(x=>{const o=document.createElement('option');o.value=x.ssid;d.appendChild(o)});}catch(e){alert('Wi-Fi scan failed');}finally{b.disabled=false;b.textContent='Search';}}</script></body></html>";
-  return html;
+String portStatusText() {
+  if (!usbPrinterBackend.usbStatusValid()) return "Waiting for USB printer status";
+  const uint8_t s = usbPrinterBackend.usbPortStatus();
+  String out;
+  out += (s & 0x08) ? "No USB error" : "USB printer reports error";
+  out += " · ";
+  out += (s & 0x10) ? "Selected" : "Not selected";
+  out += " · ";
+  out += (s & 0x20) ? "Paper empty" : "Paper available";
+  return out;
 }
 
 void sendJsonScan() {
@@ -243,20 +193,78 @@ void sendJsonScan() {
   String out = "[";
   bool first = true;
   for (int i = 0; i < n; ++i) {
-    String ssid = WiFi.SSID(i);
+    const String ssid = WiFi.SSID(i);
     if (ssid.isEmpty()) continue;
     if (!first) out += ",";
     first = false;
-    out += "{\"ssid\":\"" + jsonEsc(ssid) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+    out += "{\"ssid\":\"" + jsonEsc(ssid) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + ",\"channel\":" + String(WiFi.channel(i)) + "}";
   }
   out += "]";
   WiFi.scanDelete();
   configServer.send(200, "application/json", out);
 }
 
-void handleRoot() {
-  configServer.send(200, "text/html; charset=utf-8", dashboard());
+String statusJson() {
+  const UsbDeviceInfo &d = usbHost.device();
+  String out = "{";
+  out += "\"wifi\":\"" + jsonEsc(wifiText()) + "\",";
+  out += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  out += "\"ip\":\"" + jsonEsc(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + "\",";
+  out += "\"usb\":\"" + jsonEsc(usbStateText()) + "\",";
+  out += "\"printer\":\"" + jsonEsc(printerStateText()) + "\",";
+  out += "\"usbStatus\":\"" + jsonEsc(portStatusText()) + "\",";
+  out += "\"rawConnected\":" + String(usbPrinterBackend.rawClientConnected() ? "true" : "false") + ",";
+  out += "\"rawBytes\":" + String((unsigned long long)usbPrinterBackend.rawBytesReceived()) + ",";
+  out += "\"device\":\"" + jsonEsc(d.attached ? (d.manufacturer + " " + d.product) : String("No printer")) + "\"";
+  out += "}";
+  return out;
 }
+
+String dashboard() {
+  const UsbDeviceInfo &d = usbHost.device();
+  String selected = usbHost.selectedInterface() ? usbInterfaceLabel(*usbHost.selectedInterface(), true) : "No printing interface selected";
+
+  String usbCards;
+  if (!d.attached || usbHost.interfaceCount() == 0) {
+    usbCards = "<div class='empty'>No USB Printer Class interfaces detected yet.</div>";
+  } else {
+    for (uint8_t i = 0; i < usbHost.interfaceCount(); ++i) {
+      const UsbPrinterInterfaceInfo *p = usbHost.interfaceAt(i);
+      if (!p) continue;
+      const bool checked = !config.usbAuto && p->interfaceNumber == config.usbInterface && p->alternateSetting == config.usbAlt;
+      const bool active = usbHost.selectedInterface() == p;
+      usbCards += "<label class='usbCard"><input type='radio' name='mode' value='manual:" + String(p->interfaceNumber) + ":" + String(p->alternateSetting) + "' " + (checked ? "checked" : "") + ">";
+      usbCards += "<span><b>" + esc(usbProtocolName(*p)) + "</b><small>Interface " + String(p->interfaceNumber) + (p->alternateSetting ? " · Alt " + String(p->alternateSetting) : "") + "</small><small>" + esc(usbDetails(*p)) + "</small>";
+      if (active) usbCards += "<em>Active</em>";
+      usbCards += "</span></label>";
+    }
+  }
+
+  String html;
+  html.reserve(15000);
+  html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>HP Print Server</title>";
+  html += "<style>body{margin:0;background:#f4f7fb;color:#172033;font-family:system-ui,-apple-system,Segoe UI,sans-serif}.wrap{max-width:1000px;margin:auto;padding:28px 18px 50px}.top{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:22px}h1{font-size:28px;margin:0}h2{font-size:18px;margin:0 0 14px}.muted,small{color:#68758a}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.card,section{background:white;border:1px solid #e3e8f0;border-radius:16px;box-shadow:0 4px 18px #1720330b}.card{padding:16px}.value{font-weight:700;margin-top:7px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#20a464;margin-right:7px}.bad{background:#d83a3a}.section{margin-top:16px;padding:20px}button{border:0;border-radius:10px;padding:10px 14px;background:#172033;color:white;cursor:pointer}button.secondary{background:#e9eef6;color:#172033}input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:12px;border:1px solid #ccd5e2;border-radius:10px;margin:7px 0 12px;font-size:15px}.ssidList{display:grid;gap:8px;max-height:310px;overflow:auto;margin:12px 0}.ssid{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px;border:1px solid #dfe5ee;border-radius:12px;cursor:pointer;background:#fff}.ssid:hover{border-color:#8da2c1;background:#f8faff}.ssid b{display:block}.ssid span{white-space:nowrap;color:#65738a;font-size:13px}.signal{font-variant-numeric:tabular-nums}.usbCards{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:10px}.usbCard{display:flex;gap:10px;padding:14px;border:1px solid #dfe5ee;border-radius:12px;cursor:pointer}.usbCard input{margin-top:3px}.usbCard span{display:flex;flex-direction:column;gap:4px}.usbCard em{font-style:normal;color:#087f4f;font-size:12px;font-weight:700}.empty{padding:16px;background:#f7f9fc;border-radius:10px;color:#66748a}.row{display:flex;gap:10px;align-items:center}.row>*{flex:1}.actions{display:flex;gap:10px;flex-wrap:wrap}.code{font-family:ui-monospace,monospace;background:#f3f5f8;padding:3px 6px;border-radius:6px}.hint{font-size:13px;color:#68758a;line-height:1.45}@media(max-width:600px){.top{align-items:flex-start;flex-direction:column}.row{flex-direction:column;align-items:stretch}}</style></head><body><main class='wrap'>";
+  html += "<div class='top'><div><h1>HP Print Server</h1><div class='muted'>ESP32-S3 · RAW JetDirect/AppSocket</div></div><button class='secondary' onclick='refreshStatus()'>Refresh status</button></div>";
+  html += "<div class='grid' id='statusGrid'>";
+  html += "<div class='card'><small>Printer</small><div class='value'><span class='dot'></span>" + esc(printerStateText()) + "</div></div>";
+  html += "<div class='card'><small>Wi-Fi</small><div class='value'>" + esc(wifiText()) + "</div></div>";
+  html += "<div class='card'><small>USB</small><div class='value'>" + esc(usbStateText()) + "</div></div>";
+  html += "<div class='card'><small>RAW 9100</small><div class='value'>" + String(usbPrinterBackend.rawClientConnected() ? "Job active" : "Listening") + "</div></div></div>";
+
+  html += "<section class='section'><h2>Printer & USB status</h2><div class='muted'>" + esc(d.attached ? (d.manufacturer + " · " + d.product) : String("No USB printer attached")) + "</div><p>USB printer status: <b id='usbStatus'>" + esc(portStatusText()) + "</b></p><p class='hint'>Status is read from the USB Printer Class GET_PORT_STATUS request. The printing path remains the selected Bulk OUT interface.</p></section>";
+
+  html += "<section class='section'><h2>Wi-Fi network</h2><div class='actions'><button type='button' onclick='scanWifi()'>Rescan nearby Wi-Fi</button><span class='hint' id='scanState'>Select a network below.</span></div><div id='ssidList' class='ssidList'><div class='empty'>Press Rescan to list nearby SSIDs.</div></div>";
+  html += "<form method='POST' action='/save'><label>Selected SSID or hidden network</label><input id='ssid' name='ssid' value='" + esc(config.ssid) + "' maxlength='32' autocomplete='off'><label>Password</label><input type='password' name='password' placeholder='Leave blank to keep the saved password'><div class='actions'><button type='submit'>Save Wi-Fi &amp; restart</button></div></form><p class='hint'>Hidden networks can still be entered manually. Existing Wi-Fi settings remain stored in Preferences.</p></section>";
+
+  html += "<section class='section'><h2>USB printing interface</h2><p class='hint'>Choose Automatic for the best Bulk OUT interface, or select a specific interface. Endpoint numbers are shown only as technical details.</p><form method='POST' action='/usb'><label class='usbCard'><input type='radio' name='mode' value='auto' " + String(config.usbAuto ? "checked" : "") + "><span><b>Automatic selection</b><small>Prefer the bidirectional Bulk OUT printer interface.</small></span></label><div class='usbCards' style='margin-top:10px'>" + usbCards + "</div><div class='actions' style='margin-top:12px'><button type='submit'>Apply USB interface</button></div></form><p class='hint'>Active: <b>" + esc(selected) + "</b></p></section>";
+
+  html += "<section class='section'><h2>Connection</h2><div class='grid'><div class='card'><small>Wi-Fi IP</small><div class='value'>" + esc(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + "</div></div><div class='card'><small>Hostname</small><div class='value'>" + String(RAW_HOSTNAME) + "</div></div><div class='card'><small>RAW endpoint</small><div class='value'><span class='code'>:9100</span></div></div><div class='card'><small>USB device</small><div class='value">" + (d.attached ? "VID 0x" + String(d.vid, HEX) + " · PID 0x" + String(d.pid, HEX) : String("None")) + "</div></div></div></section>";
+  html += "<section class='section'><h2>RAW printing</h2><p class='hint'>TCP 9100 is transparent: no IPP, Content-Length, PJL, form feed, or document conversion is added. The sender must provide a print stream understood by the printer.</p></section>";
+  html += "</main><script>\nasync function scanWifi(){const list=document.getElementById('ssidList'),state=document.getElementById('scanState');state.textContent='Scanning…';list.innerHTML='<div class=empty>Scanning nearby networks…</div>';try{const r=await fetch('/scan.json?ts='+Date.now());const a=await r.json();if(!a.length){list.innerHTML='<div class=empty>No visible networks found.</div>';return;}list.innerHTML='';a.sort((x,y)=>y.rssi-x.rssi).forEach(x=>{const b=document.createElement('button');b.type='button';b.className='ssid';const left=document.createElement('span');left.innerHTML='<b>'+safe(x.ssid)+'</b><span>Channel '+x.channel+'</span>';const right=document.createElement('span');right.className='signal';right.textContent=x.rssi+' dBm';b.append(left,right);b.onclick=()=>{document.getElementById('ssid').value=x.ssid;document.querySelectorAll('.ssid').forEach(z=>z.style.borderColor='');b.style.borderColor='#5d7fb7';};list.appendChild(b);});state.textContent=a.length+' nearby network(s) found.';}catch(e){list.innerHTML='<div class=empty>Wi-Fi scan failed.</div>';state.textContent='Scan failed.';}}\nfunction safe(s){return String(s).replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[m]));}\nasync function refreshStatus(){try{const r=await fetch('/status.json?ts='+Date.now());const s=await r.json();document.getElementById('usbStatus').textContent=s.usbStatus;}catch(e){}}\nsetInterval(refreshStatus,3000);\n</script></body></html>";
+  return html;
+}
+
+void handleRoot() { configServer.send(200, "text/html; charset=utf-8", dashboard()); }
 
 void handleSave() {
   if (configServer.hasArg("ssid")) config.ssid = configServer.arg("ssid");
@@ -270,9 +278,8 @@ void handleSave() {
 void handleUsb() {
   if (configServer.hasArg("mode")) {
     const String m = configServer.arg("mode");
-    if (m == "auto") {
-      config.usbAuto = true;
-    } else if (m.startsWith("manual:")) {
+    if (m == "auto") config.usbAuto = true;
+    else if (m.startsWith("manual:")) {
       const int a = m.indexOf(':', 7);
       if (a > 7) {
         config.usbAuto = false;
@@ -296,15 +303,14 @@ void setup() {
 
   loadConfig();
   if (!connectWiFi()) startConfigAP();
-
   startRawDiscovery();
 
-  // Apply the saved interface choice before enumeration starts.
   usbHost.setInterfaceSelection(config.usbAuto, config.usbInterface, config.usbAlt);
   usbPrinterBackend.begin();
 
   configServer.on("/", HTTP_GET, handleRoot);
   configServer.on("/scan.json", HTTP_GET, sendJsonScan);
+  configServer.on("/status.json", HTTP_GET, [](){ configServer.send(200, "application/json", statusJson()); });
   configServer.on("/save", HTTP_POST, handleSave);
   configServer.on("/usb", HTTP_POST, handleUsb);
   configServer.begin();
@@ -322,10 +328,10 @@ void loop() {
 
   if (millis() - lastStatus > 5000) {
     lastStatus = millis();
-    Serial.printf("[STATUS] WiFi=%d IP=%s USB=%d printer=%s\n",
-                  (int)WiFi.status(),
-                  WiFi.localIP().toString().c_str(),
-                  (int)usbHost.state(),
-                  printerStateText().c_str());
+    Serial.printf("[STATUS] WiFi=%d IP=%s USB=%d printer=%s raw=%s usbport=0x%02X\n",
+                  (int)WiFi.status(), WiFi.localIP().toString().c_str(),
+                  (int)usbHost.state(), printerStateText().c_str(),
+                  usbPrinterBackend.rawClientConnected() ? "connected" : "idle",
+                  usbPrinterBackend.usbStatusValid() ? usbPrinterBackend.usbPortStatus() : 0);
   }
 }

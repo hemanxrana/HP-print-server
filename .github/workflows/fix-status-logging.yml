@@ -1,15 +1,13 @@
 name: Apply status logging fix
 
-on:
-  push:
-    paths:
-      - '.github/workflows/fix-status-logging.yml'
+on: push
 
 permissions:
   contents: write
 
 jobs:
   fix:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,17 +15,16 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
-
           p = Path('HP-print-server.ino')
           s = p.read_text(encoding='utf-8')
           start = s.find('  if (millis() - lastStatus > 5000) {')
           if start < 0:
-              raise SystemExit('Old status block was not found')
+              print('Status block already updated; nothing to do')
+              raise SystemExit(0)
           end = s.find('\n  }', start)
           if end < 0:
               raise SystemExit('End of old status block was not found')
           end += len('\n  }')
-
           replacement = '''  if (millis() - lastStatus > 1000) {
     lastStatus = millis();
 
@@ -75,12 +72,10 @@ jobs:
       initialized = true;
     }
   }'''
-
           p.write_text(s[:start] + replacement + s[end:], encoding='utf-8')
           PY
-          git diff --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add HP-print-server.ino
-          git commit -m 'Reduce repetitive serial status logging'
+          git commit -m 'Reduce repetitive serial status logging' || true
           git push

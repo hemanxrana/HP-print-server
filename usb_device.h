@@ -24,6 +24,19 @@ struct UsbPrinterInterfaceInfo {
   bool usableForRawPrint() const {
     return found && bulkOut.valid() && bulkOut.isBulk() && !bulkOut.isIn();
   }
+
+  bool usableForStatus() const {
+    return found && subclass == 0x01;
+  }
+};
+
+struct UsbPortStatus {
+  bool valid = false;
+  uint8_t value = 0;
+  bool error = false;
+  bool selected = false;
+  bool paperEmpty = false;
+  unsigned long updatedAt = 0;
 };
 
 struct UsbDeviceInfo {
@@ -41,5 +54,12 @@ struct UsbDeviceInfo {
   uint8_t printerInterfaceCount = 0;
   UsbPrinterInterfaceInfo printerInterfaces[MAX_PRINTER_INTERFACES];
 
+  // Interface used for RAW Bulk OUT printing.
   UsbPrinterInterfaceInfo printer;
+
+  // Independent Printer Class interface used for GET_PORT_STATUS when the
+  // descriptor exposes a second suitable interface.
+  UsbPrinterInterfaceInfo statusInterface;
+  bool statusInterfaceSeparate = false;
+  UsbPortStatus portStatus;
 };

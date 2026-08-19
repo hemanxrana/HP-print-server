@@ -253,12 +253,6 @@ String dashboard() {
         + " · IN 0x" + String(pi.bulkIn.address, HEX);
   }
 
-  // Scanner interface information is kept separate from the printer card.
-  // The current USB configuration exposes the scanner as IF 0 / ALT 0.
-  const String scannerInterfaceDetails = String("Interface ") + String(USB_SCAN_INTERFACE)
-      + " · Alternate " + String(USB_SCAN_ALT)
-      + " · Scanner interface";
-
   String html;
   html.reserve(18000);
 
@@ -287,19 +281,12 @@ body:before{content:"";position:fixed;inset:0;pointer-events:none;background:lin
 <div class="card glass"><div class="label">RAW 9100</div><div id="raw" class="value">Listening</div><div class="small">Transparent print stream</div></div>
 </div>
 
-<div class="section glass"><div class="sectionHead"><div><h2>Connection</h2><p>Choose the USB interface used by the server. Wi-Fi is configured separately below.</p></div></div>
-<div class="interfaceList">
-<button type="button" id="printMode" class="interfaceCard"><div class="interfaceTop"><span class="interfaceName">Printer</span><span class="interfaceBadge">Available</span></div><div class="interfaceDescription">)HTML";
-  html += esc(deviceName);
-  html += R"HTML( · USB Printer Class / RAW printing</div><div class="interfaceDetails">)HTML";
-  html += esc(printerInterfaceDetails);
-  html += R"HTML(</div></button>
-<button type="button" id="scanMode" class="interfaceCard"><div class="interfaceTop"><span class="interfaceName">Scanner</span><span class="interfaceBadge">Available</span></div><div class="interfaceDescription">USB scanner interface</div><div class="interfaceDetails">)HTML";
-  html += esc(scannerInterfaceDetails);
-  html += R"HTML(</div></button>
-</div></div>
+<div class="section glass"><div class="sectionHead"><div><h2>USB Interface</h2><p>Select the USB interface to use. The selected interface is highlighted and its available descriptor information is shown below.</p></div></div>
+<div class="selectWrap"><select id="usbInterfaceSelect" aria-label="USB interface"><option value="printer">Printer</option><option value="scanner">Scanner</option></select></div>
+<div id="usbInterfaceDetails" class="interfaceDetails" style="margin-top:14px;padding:15px;border-radius:16px;background:rgba(255,255,255,.42);border:1px solid rgba(255,255,255,.72)"></div>
+</div>
 
-<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi</h2><p>Configure the network connection independently from the USB printer/scanner interface.</p></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan Wi-Fi</button></div>
+<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi</h2><p>Configure the network connection independently from the USB interface.</p></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan Wi-Fi</button></div>
 <div class="selectWrap"><select id="ssidSelect"><option value="">Select a Wi-Fi network…</option></select></div>
 <div id="scanState" class="statusLine" style="display:none"></div>
 <form class="wifiForm" method="POST" action="/save"><div class="field"><label for="ssid">Wi-Fi network</label><input id="ssid" name="ssid" value=")HTML";
@@ -312,14 +299,18 @@ const $=id=>document.getElementById(id);
 let interfaceMode=')HTML";
   html += scannerInterfaceSelected ? "scanner" : "printer";
   html += R"HTML(';
-function setInterfaceButtons(){const scanner=interfaceMode==='scanner';$('scanMode').classList.toggle('active',scanner);$('printMode').classList.toggle('active',!scanner);$('scanMode').querySelector('.interfaceBadge').textContent=scanner?'Selected':'Available';$('printMode').querySelector('.interfaceBadge').textContent=scanner?'Available':'Selected';}
-async function setInterfaceMode(mode){if(mode===interfaceMode)return;const old=interfaceMode;interfaceMode=mode;setInterfaceButtons();try{const r=await fetch('/interface.json?mode='+encodeURIComponent(mode)+'&ts='+Date.now());if(!r.ok)throw new Error();const s=await r.json();interfaceMode=s.mode;setInterfaceButtons();showToast(interfaceMode==='scanner'?'Scanner interface selected · IF 0 / ALT 0':'Printer interface selected · IF 1 / ALT 0');refreshStatus();}catch(e){interfaceMode=old;setInterfaceButtons();showToast('USB interface change failed');}}
-$('printMode').addEventListener('click',()=>setInterfaceMode('printer'));$('scanMode').addEventListener('click',()=>setInterfaceMode('scanner'));
+const printerDetails=')HTML";
+  html += jsonEsc(String("Name: ") + deviceName + " · VID: 0x" + String(usbHost.device().vid,HEX) + " · PID: 0x" + String(usbHost.device().pid,HEX) + " · " + printerInterfaceDetails);
+  html += R"HTML(';
+const scannerDetails='Not detected — no scanner interface information is exposed by the current USB descriptor model.';
+function updateUsbInterface(){const scanner=interfaceMode==='scanner';const select=$('usbInterfaceSelect');select.value=interfaceMode;$('usbInterfaceDetails').innerHTML=scanner?'<strong>Scanner</strong><br>'+scannerDetails:'<strong>Printer</strong><br>'+printerDetails;select.style.borderColor=scanner?'rgba(0,122,255,.55)':'rgba(0,122,255,.55)';}
+async function setInterfaceMode(mode){if(mode===interfaceMode){updateUsbInterface();return;}const old=interfaceMode;interfaceMode=mode;updateUsbInterface();try{const r=await fetch('/interface.json?mode='+encodeURIComponent(mode)+'&ts='+Date.now());if(!r.ok)throw new Error();const s=await r.json();interfaceMode=s.mode;updateUsbInterface();showToast(interfaceMode==='scanner'?'Scanner interface selected':'Printer interface selected');refreshStatus();}catch(e){interfaceMode=old;updateUsbInterface();showToast('USB interface change failed');}}
+$('usbInterfaceSelect').addEventListener('change',e=>setInterfaceMode(e.target.value));
 $('ssidSelect').addEventListener('change',()=>{$('ssid').value=$('ssidSelect').value;});
 async function scanWifi(){const b=$('scanBtn'),select=$('ssidSelect');b.disabled=true;b.textContent='Scanning…';select.innerHTML='<option value="">Scanning…</option>';try{const r=await fetch('/scan.json?ts='+Date.now());if(!r.ok)throw new Error();const a=await r.json();a.sort((x,y)=>y.rssi-x.rssi);select.innerHTML='<option value="">Select a Wi-Fi network…</option>';a.forEach(x=>{const o=document.createElement('option');o.value=x.ssid;o.textContent=x.ssid+' · '+x.rssi+' dBm · Ch '+x.channel;select.appendChild(o);});if(!a.length){select.innerHTML='<option value="">No visible networks found</option>';$('scanState').style.display='block';$('scanState').textContent='No visible Wi-Fi networks found.';}else{$('scanState').textContent=a.length+' nearby Wi-Fi network'+(a.length===1?'':'s')+' found.';$('scanState').style.display='block';const current=$('ssid').value;if(current&&a.some(x=>x.ssid===current))select.value=current;}}catch(e){select.innerHTML='<option value="">Scan failed</option>';$('scanState').style.display='block';$('scanState').textContent='Wi-Fi scan failed.';}finally{b.disabled=false;b.textContent='Scan Wi-Fi';}}
-async function refreshStatus(){const b=$('refreshBtn');b.disabled=true;b.textContent='Refreshing…';try{const r=await fetch('/status.json?ts='+Date.now());if(!r.ok)throw new Error();const s=await r.json();$('printer').textContent=s.printer;$('wifi').textContent=s.wifi;$('raw').textContent=s.rawConnected?'Job active':'Listening';interfaceMode=s.interfaceMode||interfaceMode;setInterfaceButtons();$('printerPill').innerHTML='<span class="dot '+(s.usbAttached?'':'off')+'"></span><span>'+(s.usbAttached?'USB connected':'USB not detected')+'</span>';}catch(e){showToast('Status refresh failed');}finally{b.disabled=false;b.textContent='Refresh';}}
+async function refreshStatus(){const b=$('refreshBtn');b.disabled=true;b.textContent='Refreshing…';try{const r=await fetch('/status.json?ts='+Date.now());if(!r.ok)throw new Error();const s=await r.json();$('printer').textContent=s.printer;$('wifi').textContent=s.wifi;$('raw').textContent=s.rawConnected?'Job active':'Listening';interfaceMode=s.interfaceMode||interfaceMode;updateUsbInterface();$('printerPill').innerHTML='<span class="dot '+(s.usbAttached?'':'off')+'"></span><span>'+(s.usbAttached?'USB connected':'USB not detected')+'</span>';}catch(e){showToast('Status refresh failed');}finally{b.disabled=false;b.textContent='Refresh';}}
 function showToast(t){const x=$('toast');x.textContent=t;x.classList.add('show');clearTimeout(window._toast);window._toast=setTimeout(()=>x.classList.remove('show'),2800);}
-setInterfaceButtons();
+updateUsbInterface();
 setInterval(refreshStatus,5000);
 </script></body></html>)HTML";
   return html;

@@ -676,9 +676,12 @@ void UsbHostManager::onPortStatusTransfer(bool valid, uint8_t value, const Strin
   UsbPortStatus &s = device_.portStatus;
   s.valid = true;
   s.value = value;
-  s.error = (value & 0x20) == 0;
+  // USB Printer Class GET_PORT_STATUS uses bit 5=paper empty,
+  // bit 4=selected, and bit 3=NOT error (1 means no error).
+  // The HP Smart Tank returns 0x18 when ready: selected + no error.
+  s.error = (value & 0x08) == 0;
   s.selected = (value & 0x10) != 0;
-  s.paperEmpty = (value & 0x08) != 0;
+  s.paperEmpty = (value & 0x20) != 0;
   s.updatedAt = millis();
   error_.clear();
 

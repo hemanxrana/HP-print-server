@@ -124,3 +124,4 @@ The RAW-only firmware no longer contains the previous mobile IPP stack, IPP comp
 A successful USB Bulk OUT transfer only proves that the ESP32 USB host delivered the bytes to the printer. It does not prove that the printer accepted the document format or physically completed the page.
 
 If the printer reports a paper/page/format error after a RAW job, the first thing to verify is the **actual byte stream sent to TCP 9100**. The ESP32 intentionally does not convert or repair that stream.
+

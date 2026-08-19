@@ -1,30 +1,28 @@
 #pragma once
 
-// Android/Mopria-facing IPP profile for a byte-for-byte USB pass-through queue.
-// Discovery advertises common mobile PDLs so Android can choose a printable
-// representation. The server never parses, validates, converts, or rejects
-// the document because of its PDL; the USB printer receives the bytes and
-// decides whether it can interpret them.
+// Android/Mopria-facing IPP profile for a byte-for-byte USB pass-through
+// printer. The ESP32 does NOT render PDF/JPEG/Office documents. The mobile
+// print service is responsible for producing one of the printer-oriented PDLs
+// below; the ESP32 forwards the resulting document unchanged to USB.
 namespace MobilePrintProfile {
 static constexpr const char *SERVICE_TYPE = "_ipp._tcp";
-// IPP Everywhere discovery subtype. The Arduino mDNS layer currently
-// advertises the generic _ipp._tcp service; this constant is kept for the
-// service profile and for a future native-subtype registration path.
 static constexpr const char *SERVICE_SUBTYPE = "_print._sub._ipp._tcp";
 static constexpr uint16_t IPP_PORT = 631;
 static constexpr const char *IPP_PATH = "/ipp/print";
 
-// Used for the server's generic default. The actual IPP document-format sent
-// by Android is preserved and passed through unchanged.
-static constexpr const char *FORMAT_PASSTHROUGH = "application/octet-stream";
+// PCLm is the preferred mobile-print representation for this HP family.
+// PWG Raster is retained as a standards-based alternative used by Android/Mopria.
+// This default is used when an IPP client omits document-format.
+static constexpr const char *FORMAT_PASSTHROUGH = "application/PCLm";
 
 static constexpr const char *TXT_VERS = "1.1";
 static constexpr const char *TXT_PRODUCT = "(ESP32-S3 USB Print Server)";
 static constexpr const char *TXT_NOTE = "USB printer pass-through";
 
-// DNS-SD/Mopria discovery uses this list to decide which documents it can
-// submit. This is capability advertisement only; there is no format check in
-// the IPP request path.
+// Keep discovery conservative: advertise formats the phone-side print
+// subsystem can render for mobile printing and that are suitable for direct
+// forwarding to the printer. Do not advertise Office/PDF/image formats as if
+// the ESP32 itself could interpret them.
 static constexpr const char *TXT_PDL =
-    "application/pdf,application/PCLm,application/vnd.hp-pcl,application/vnd.hp-pclxl,image/pwg-raster,image/urf,image/jpeg,image/png,application/octet-stream";
+    "application/PCLm,image/pwg-raster";
 } // namespace MobilePrintProfile

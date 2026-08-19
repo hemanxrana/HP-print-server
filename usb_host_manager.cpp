@@ -11,7 +11,11 @@
 namespace {
 static constexpr uint8_t USB_PRINTER_CLASS_CODE = 0x07;
 static constexpr uint8_t USB_PRINTER_SUBCLASS_CODE = 0x01;
+static constexpr uint8_t USB_IMAGE_CLASS_CODE = 0x06;
+static constexpr uint8_t USB_IMAGE_SUBCLASS_CODE = 0x01;
+static constexpr uint8_t USB_IMAGE_PROTOCOL_CODE = 0x01;
 static constexpr uint8_t USB_ENDPOINT_XFER_BULK_CODE = 0x02;
+static constexpr uint8_t USB_ENDPOINT_XFER_INT_CODE = 0x03;
 static constexpr uint8_t USB_PRINTER_GET_PORT_STATUS = 0x01;
 static constexpr uint8_t USB_PRINTER_STATUS_REQUEST_TYPE = 0xA1; // IN | CLASS | INTERFACE
 static constexpr int MAX_ALREADY_CONNECTED_DEVICES = 8;
@@ -64,6 +68,18 @@ static String usbString(const usb_str_desc_t *d) {
 
 static bool bulk(const usb_ep_desc_t *e) {
   return e && ((e->bmAttributes & 0x03) == USB_ENDPOINT_XFER_BULK_CODE);
+}
+
+static bool interruptEndpoint(const usb_ep_desc_t *e) {
+  return e && ((e->bmAttributes & 0x03) == USB_ENDPOINT_XFER_INT_CODE);
+}
+
+static void storeEndpoint(UsbEndpointInfo &slot, const usb_ep_desc_t *ept) {
+  if (!ept || slot.valid()) return;
+  slot.address = ept->bEndpointAddress;
+  slot.attributes = ept->bmAttributes;
+  slot.maxPacketSize = ept->wMaxPacketSize;
+  slot.interval = ept->bInterval;
 }
 
 static int printScore(const UsbPrinterInterfaceInfo &p) {
@@ -120,8 +136,6 @@ static int selectedStatusIndex(const UsbDeviceInfo &d, int printIndex) {
   for (uint8_t i = 0; i < d.printerInterfaceCount; ++i) {
     const auto &p = d.printerInterfaces[i];
     if ((int)i == printIndex) continue;
-    // Two interfaces with the same interface number are alternate settings,
-    // not two simultaneous interfaces. Prefer a genuinely separate interface.
     bool sameInterfaceAsPrint = false;
     if (printIndex >= 0) {
       sameInterfaceAsPrint = p.interfaceNumber == d.printerInterfaces[printIndex].interfaceNumber;
@@ -191,12 +205,6 @@ static bool claimInterfaces(UsbDeviceInfo &d, String &error) {
   g.printInterfaceClaimed = true;
   d.printer = print;
 
-  // Select a second, descriptor-derived Printer Class interface for status.
-  // GET_PORT_STATUS is an EP0 class request, so the status interface itself
-  // does not need a bulk endpoint; the descriptor only needs to identify a
-  // genuine Printer Class interface. A bulk IN endpoint is preferred because
-  // it is a strong signal that this interface is the printer's bidirectional
-  // status/control personality.
   const int statusIndex = selectedStatusIndex(d, printIndex);
   d.statusInterfaceSeparate = false;
   d.statusInterface = UsbPrinterInterfaceInfo{};
@@ -282,36 +290,51 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
   const uint16_t total = cd->wTotalLength;
   const usb_standard_desc_t *d = usb_parse_next_descriptor(
       (const usb_standard_desc_t *)cd, total, &offset);
-  UsbPrinterInterfaceInfo *current = nullptr;
+  UsbPrinterInterfaceInfo *printerCurrent = nullptr;
+  UsbInterfaceInfo *genericCurrent = nullptr;
 
   while (d) {
     if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
       const usb_intf_desc_t *i = (const usb_intf_desc_t *)d;
-      current = nullptr;
+      printerCurrent = nullptr;
+      genericCurrent = nullptr;
+
+      if (out.interfaceCount < UsbDeviceInfo::MAX_INTERFACES) {
+        genericCurrent = &out.interfaces[out.interfaceCount++];
+        genericCurrent->found = true;
+        genericCurrent->interfaceNumber = i->bInterfaceNumber;
+        genericCurrent->alternateSetting = i->bAlternateSetting;
+        genericCurrent->classCode = i->bInterfaceClass;
+        genericCurrent->subclass = i->bInterfaceSubClass;
+        genericCurrent->protocol = i->bInterfaceProtocol;
+      }
+
       if (i->bInterfaceClass == USB_PRINTER_CLASS_CODE &&
           i->bInterfaceSubClass == USB_PRINTER_SUBCLASS_CODE &&
           ((i->bInterfaceProtocol >= 1 && i->bInterfaceProtocol <= 4) ||
            i->bInterfaceProtocol == 0xFF) &&
           out.printerInterfaceCount < UsbDeviceInfo::MAX_PRINTER_INTERFACES) {
-        current = &out.printerInterfaces[out.printerInterfaceCount++];
-        current->found = true;
-        current->interfaceNumber = i->bInterfaceNumber;
-        current->alternateSetting = i->bAlternateSetting;
-        current->subclass = i->bInterfaceSubClass;
-        current->protocol = i->bInterfaceProtocol;
+        printerCurrent = &out.printerInterfaces[out.printerInterfaceCount++];
+        printerCurrent->found = true;
+        printerCurrent->interfaceNumber = i->bInterfaceNumber;
+        printerCurrent->alternateSetting = i->bAlternateSetting;
+        printerCurrent->subclass = i->bInterfaceSubClass;
+        printerCurrent->protocol = i->bInterfaceProtocol;
       }
-    } else if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT &&
-               current && bulk((const usb_ep_desc_t *)d)) {
+    } else if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
       const usb_ep_desc_t *ept = (const usb_ep_desc_t *)d;
-      UsbEndpointInfo ep;
-      ep.address = ept->bEndpointAddress;
-      ep.attributes = ept->bmAttributes;
-      ep.maxPacketSize = ept->wMaxPacketSize;
-      ep.interval = ept->bInterval;
-      if (ep.isIn()) {
-        if (!current->bulkIn.valid()) current->bulkIn = ep;
-      } else if (!current->bulkOut.valid()) {
-        current->bulkOut = ep;
+      if (genericCurrent) {
+        if (bulk(ept)) {
+          if ((ept->bEndpointAddress & 0x80) != 0) storeEndpoint(genericCurrent->bulkIn, ept);
+          else storeEndpoint(genericCurrent->bulkOut, ept);
+        } else if (interruptEndpoint(ept)) {
+          if ((ept->bEndpointAddress & 0x80) != 0) storeEndpoint(genericCurrent->interruptIn, ept);
+          else storeEndpoint(genericCurrent->interruptOut, ept);
+        }
+      }
+      if (printerCurrent && bulk(ept)) {
+        if ((ept->bEndpointAddress & 0x80) != 0) storeEndpoint(printerCurrent->bulkIn, ept);
+        else storeEndpoint(printerCurrent->bulkOut, ept);
       }
     }
     d = usb_parse_next_descriptor((const usb_standard_desc_t *)d, total, &offset);
@@ -321,6 +344,14 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
     error = "USB device has no USB Printer Class interface";
     closeDevice();
     return false;
+  }
+
+  for (uint8_t i = 0; i < out.interfaceCount; ++i) {
+    const auto &u = out.interfaces[i];
+    Serial.printf("[USB] Interface %u: IF=%u ALT=%u class=0x%02X subclass=0x%02X protocol=0x%02X%s\n",
+                  i, u.interfaceNumber, u.alternateSetting,
+                  u.classCode, u.subclass, u.protocol,
+                  u.isScanner() ? " [SCANNER]" : "");
   }
 
   for (uint8_t i = 0; i < out.printerInterfaceCount; ++i) {
@@ -425,7 +456,7 @@ static void submitPortStatusIfPending() {
   setup->wIndex = manager->statusInterface()->interfaceNumber;
   setup->wLength = 1;
 
-  t->num_bytes = 9; // 8-byte setup packet + one-byte Printer Class status.
+  t->num_bytes = 9;
   t->device_handle = g.device;
   t->callback = statusTransferCallback;
   t->context = nullptr;
@@ -459,8 +490,6 @@ static void applySelectionIfPending() {
     return;
   }
 
-  // Interface selection changes are made by the same client task that owns
-  // the USB device, so there is no concurrent claim/release race.
   if (g.statusTransfer) {
     usb_host_transfer_free((usb_transfer_t *)g.statusTransfer);
     g.statusTransfer = nullptr;
@@ -676,9 +705,6 @@ void UsbHostManager::onPortStatusTransfer(bool valid, uint8_t value, const Strin
   UsbPortStatus &s = device_.portStatus;
   s.valid = true;
   s.value = value;
-  // USB Printer Class GET_PORT_STATUS uses bit 5=paper empty,
-  // bit 4=selected, and bit 3=NOT error (1 means no error).
-  // The HP Smart Tank returns 0x18 when ready: selected + no error.
   s.error = (value & 0x08) == 0;
   s.selected = (value & 0x10) != 0;
   s.paperEmpty = (value & 0x20) != 0;

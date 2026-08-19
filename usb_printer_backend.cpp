@@ -5,15 +5,14 @@
 namespace {
 constexpr uint16_t RAW_PORT = 9100;
 constexpr uint32_t RAW_IDLE_TIMEOUT_MS = 30000;
-constexpr uint32_t RAW_JOB_DRAIN_MS = 1500;
-constexpr uint32_t RAW_CLOSE_GUARD_MS = 250;
+constexpr uint32_t RAW_JOB_DRAIN_MS = 2500;
+constexpr uint32_t RAW_CLOSE_GUARD_MS = 500;
 constexpr size_t RAW_RX_CHUNK = 8192;
 
 WiFiServer rawServer(RAW_PORT);
 WiFiClient rawClient;
 bool rawServerStarted = false;
 unsigned long rawLastDataMs = 0;
-uint64_t rawBytesReceived = 0;
 static uint8_t rawChunk[RAW_RX_CHUNK];
 
 bool selectedInterfaceUsable(const UsbHostManager &host) {
@@ -32,15 +31,18 @@ bool sendUsbChunk(UsbHostManager &host, const uint8_t *data, size_t length, Stri
 }
 
 void finishRawConnection(UsbPrinterBackend *backend, const char *reason) {
-  // TCP FIN is not a USB printer completion indication. Give the printer time
-  // to drain the final USB transfer before releasing the network connection.
-  // No FF/PJL/UEL/form-feed is injected: RAW remains byte-for-byte transparent.
-  if (backend) backend->finishRawJob();
+  if (!backend) return;
+
+  // TCP close only tells us the network sender is finished. The printer can
+  // still be consuming USB data. Keep the backend in PRINTING while the USB
+  // pipeline drains, then take a real Printer Class status sample.
+  backend->finishRawJob();
   delay(RAW_CLOSE_GUARD_MS);
   if (rawClient) rawClient.stop();
+  backend->setRawClientConnected(false);
   Serial.printf("[RAW] TCP 9100 job ended (%s, %llu bytes)\n",
-                reason, (unsigned long long)rawBytesReceived);
-  rawBytesReceived = 0;
+                reason, (unsigned long long)backend->rawBytesReceived());
+  backend->clearRawBytes();
 }
 
 void handleRawServer(UsbPrinterBackend *backend) {
@@ -58,7 +60,8 @@ void handleRawServer(UsbPrinterBackend *backend) {
       rawClient.setNoDelay(true);
       rawClient.setTimeout(30000);
       rawLastDataMs = millis();
-      rawBytesReceived = 0;
+      backend->clearRawBytes();
+      backend->setRawClientConnected(true);
       Serial.println("[RAW] TCP 9100 client connected; transparent USB pass-through");
     }
     return;
@@ -77,12 +80,13 @@ void handleRawServer(UsbPrinterBackend *backend) {
     String error;
     if (!backend->sendDirect(rawChunk, drained, error)) {
       Serial.printf("[RAW] USB pass-through failed after %llu bytes: %s\n",
-                    (unsigned long long)rawBytesReceived, error.c_str());
+                    (unsigned long long)backend->rawBytesReceived(), error.c_str());
       rawClient.stop();
-      rawBytesReceived = 0;
+      backend->setRawClientConnected(false);
+      backend->clearRawBytes();
       return;
     }
-    rawBytesReceived += drained;
+    backend->addRawBytes(drained);
     rawLastDataMs = millis();
   }
 
@@ -127,6 +131,14 @@ void UsbPrinterBackend::poll() {
   startRawServerIfNeeded();
   handleRawServer(this);
 
+  // Keep the cached USB Printer Class status fresh. The request itself is
+  // executed by the USB host client task, not by the Arduino loop thread.
+  static unsigned long lastUsbStatus = 0;
+  if (millis() - lastUsbStatus >= 1000) {
+    lastUsbStatus = millis();
+    host_.requestStatusRefresh();
+  }
+
   if (!configured_) {
     if (host_.state() == UsbHostManager::PRINTER_READY) {
       configured_ = true;
@@ -144,6 +156,26 @@ void UsbPrinterBackend::poll() {
     StatusLed::set(StatusLed::PRINTING);
     StatusLed::update();
     return;
+  }
+
+  // A valid USB Printer Class status is authoritative for the physical
+  // printer: bit 5 = paper empty, bit 4 = selected, bit 3 = no error.
+  if (host_.statusValid()) {
+    const uint8_t s = host_.portStatus();
+    if (!(s & 0x08)) {
+      state_ = ERROR;
+      reason_ = (s & 0x20) ? "printer-reports-paper-empty-and-error" : "printer-reports-usb-error";
+      StatusLed::set(StatusLed::ERROR);
+      StatusLed::update();
+      return;
+    }
+    if (!(s & 0x10)) {
+      state_ = OFFLINE;
+      reason_ = "printer-not-selected";
+      StatusLed::set(StatusLed::WAITING_FOR_PRINTER);
+      StatusLed::update();
+      return;
+    }
   }
 
   switch (host_.state()) {
@@ -196,17 +228,33 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
     return false;
   }
 
-  // Never complete a RAW job per 8 KiB chunk. Keep it PRINTING until the TCP
-  // stream ends and the final USB pipeline drain has completed.
   reason_ = "raw-job-in-progress";
   return true;
 }
 
 void UsbPrinterBackend::finishRawJob() {
-  if (state_ == PRINTING) {
-    delay(RAW_JOB_DRAIN_MS);
-    state_ = IDLE;
-    reason_ = "printer-interface-ready";
-    StatusLed::set(StatusLed::PRINTER_READY);
+  if (state_ != PRINTING) return;
+
+  // Do not declare completion merely because the TCP sender disconnected.
+  // Wait for the USB pipeline to drain and sample the printer status several
+  // times. No bytes are added to the print stream and no USB soft-reset is
+  // issued, because either would risk truncating the final page.
+  delay(RAW_JOB_DRAIN_MS);
+  for (uint8_t i = 0; i < 3; ++i) {
+    host_.requestStatusRefresh();
+    delay(200);
   }
+
+  if (host_.statusValid() && !(host_.portStatus() & 0x08)) {
+    state_ = ERROR;
+    reason_ = (host_.portStatus() & 0x20)
+                ? "printer-reports-paper-empty-and-error"
+                : "printer-reports-usb-error-after-job";
+    StatusLed::set(StatusLed::ERROR);
+    return;
+  }
+
+  state_ = IDLE;
+  reason_ = "printer-interface-ready";
+  StatusLed::set(StatusLed::PRINTER_READY);
 }

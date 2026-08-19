@@ -4,8 +4,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-// The sketch owns this backend. The legacy begin() overload is retained for
-// source compatibility, but pass-through printing is always streamed.
 extern UsbPrinterBackend usbPrinterBackend;
 
 namespace {
@@ -31,7 +29,7 @@ bool strv(uint8_t *o,size_t c,size_t &p,uint8_t t,const char *n,const String &v)
 bool txt(uint8_t *o,size_t c,size_t &p,const char *n,const String &v){return strv(o,c,p,0x41,n,v);}
 bool namev(uint8_t *o,size_t c,size_t &p,const char *n,const String &v){return strv(o,c,p,0x42,n,v);}
 bool kw(uint8_t *o,size_t c,size_t &p,const char *n,const char *v){return attr(o,c,p,0x44,n,(const uint8_t*)v,strlen(v));}
-bool mime(uint8_t *o,size_t c,size_t &p,const char *n,const String &v){return attr(o,c,p,0x49,n,(const uint8_t*)v.c_str(),v.length());}
+bool mime(uint8_t *o,size_t c,size_t &p,const char *n,const char *v){return attr(o,c,p,0x49,n,(const uint8_t*)v,strlen(v));}
 bool charset(uint8_t *o,size_t c,size_t &p,const char *n,const char *v){return attr(o,c,p,0x47,n,(const uint8_t*)v,strlen(v));}
 bool lang(uint8_t *o,size_t c,size_t &p,const char *n,const char *v){return attr(o,c,p,0x48,n,(const uint8_t*)v,strlen(v));}
 bool integer(uint8_t *o,size_t c,size_t &p,const char *n,uint32_t v){uint8_t b[4];p32(b,v);return attr(o,c,p,0x21,n,b,4);}
@@ -101,8 +99,6 @@ void MobileIppServer::begin(const String &name,const String &uri,JobHandler hand
 }
 
 void MobileIppServer::begin(const String &name,const String &uri,LegacyJobHandler legacyHandler,MobilePrintQueue *queue){
-  // Existing sketch code uses this overload. Use the USB stream backend directly
-  // so the legacy callback cannot accidentally reintroduce whole-job buffering.
   printerName_=name;printerUri_=uri;handler_=backendStreamHandler;legacyHandler_=legacyHandler;queue_=queue;
   int scheme=uri.indexOf("://");int slash=scheme>=0?uri.indexOf('/',scheme+3):-1;
   printerPath_=slash>=0?uri.substring(slash):MobilePrintProfile::IPP_PATH;
@@ -112,19 +108,15 @@ void MobileIppServer::begin(const String &name,const String &uri,LegacyJobHandle
 }
 
 void MobileIppServer::handleClient(WiFiClient &c){
-  c.setTimeout(2);
-  String lineText;
+  c.setTimeout(2);String lineText;
   if(!line(c,lineText,10000)){c.stop();return;}
   if(!lineText.startsWith("POST ")){c.print("HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n");c.stop();return;}
   int sp=lineText.indexOf(' ',5);if(sp<0){c.stop();return;}
   String target=lineText.substring(5,sp);int q=target.indexOf('?');if(q>=0)target=target.substring(0,q);
-  if(!(target==printerPath_||target==printerPath_+"/"||target=="/ipp/print"||target=="/ipp/print/"||target=="/ipp/printer"||target=="/ipp/printer/")){
-    c.print("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");c.stop();return;
-  }
+  if(!(target==printerPath_||target==printerPath_+"/"||target=="/ipp/print"||target=="/ipp/print/"||target=="/ipp/printer"||target=="/ipp/printer/")){c.print("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");c.stop();return;}
   size_t total=0;bool haveLength=false,chunked=false,isIpp=false,expect=false;
   while(line(c,lineText,10000)){
-    if(lineText.isEmpty())break;
-    String h=lineText;h.toLowerCase();
+    if(lineText.isEmpty())break;String h=lineText;h.toLowerCase();
     if(h.startsWith("content-length:")){String v=h.substring(15);v.trim();char *e=nullptr;unsigned long n=strtoul(v.c_str(),&e,10);if(e==v.c_str()||*e!='\0'){c.stop();return;}total=(size_t)n;haveLength=true;}
     else if(h.startsWith("content-type:")){String v=h.substring(13);v.trim();int z=v.indexOf(';');if(z>=0)v=v.substring(0,z);v.trim();isIpp=(v=="application/ipp");}
     else if(h.startsWith("transfer-encoding:"))chunked=h.indexOf("chunked")>=0;
@@ -141,57 +133,41 @@ void MobileIppServer::handleClient(WiFiClient &c){
 
   size_t used=8;bool endAttributes=false;String format=MobilePrintProfile::FORMAT_PASSTHROUGH,requested,last;
   while(used<total){
-    uint8_t tag;if(!byteRead(c,tag,30000))break;used++;
-    if(tag==0x03){endAttributes=true;break;}
-    if(tag==0x01){last="";continue;} // operation-attributes group
-    if(tag==0x02||tag==0x04||tag==0x05){last="";continue;}
-    uint8_t b[2];if(!exact(c,b,2,30000))break;used+=2;uint16_t nameLen=g16(b);
-    if(nameLen>255||used+nameLen+2>total)break;
-    char nameBuf[256];if(!exact(c,(uint8_t*)nameBuf,nameLen,30000))break;used+=nameLen;nameBuf[nameLen]=0;
-    String name=nameLen?String(nameBuf):last;if(nameLen)last=name;
-    if(!exact(c,b,2,30000))break;used+=2;uint16_t valueLen=g16(b);if(used+valueLen>total)break;
-    String value;value.reserve(valueLen);
-    for(uint16_t i=0;i<valueLen;++i){uint8_t x;if(!byteRead(c,x,30000)){c.stop();return;}value+=(char)x;}
-    used+=valueLen;
-    if(name=="document-format")format=value;
-    else if(name=="requested-attributes"){if(!requested.isEmpty())requested+=',';requested+=value;}
+    uint8_t tag;if(!byteRead(c,tag,30000))break;used++;if(tag==0x03){endAttributes=true;break;}if(tag==0x01||tag==0x02||tag==0x04||tag==0x05){last="";continue;}
+    uint8_t b[2];if(!exact(c,b,2,30000))break;used+=2;uint16_t nameLen=g16(b);if(nameLen>255||used+nameLen+2>total)break;
+    char nameBuf[256];if(!exact(c,(uint8_t*)nameBuf,nameLen,30000))break;used+=nameLen;nameBuf[nameLen]=0;String name=nameLen?String(nameBuf):last;if(nameLen)last=name;
+    if(!exact(c,b,2,30000))break;used+=2;uint16_t valueLen=g16(b);if(used+valueLen>total)break;String value;value.reserve(valueLen);
+    for(uint16_t i=0;i<valueLen;++i){uint8_t x;if(!byteRead(c,x,30000)){c.stop();return;}value+=(char)x;}used+=valueLen;
+    if(name=="document-format")format=value;else if(name=="requested-attributes"){if(!requested.isEmpty())requested+=',';requested+=value;}
   }
   if(!endAttributes){c.print("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nMalformed IPP attributes\n");c.stop();return;}
 
   size_t documentLength=total-used;
   Serial.printf("[IPP] op=0x%04X id=%lu format=%s document=%u bytes freePSRAM=%u freeHeap=%u\n",op,(unsigned long)req,format.c_str(),(unsigned)documentLength,(unsigned)ESP.getFreePsram(),(unsigned)ESP.getFreeHeap());
-
   uint16_t status=ST_OK;String error;uint32_t jobId=0;
   if(op==OP_PRINT_JOB){
     if(!documentLength){status=ST_BAD_REQUEST;error="Print-Job requires document data";}
     else if(!handler_){status=ST_UNAVAILABLE;error="Print backend unavailable";}
-    else{
-      DocStream document(c,documentLength);
-      if(!handler_(document,documentLength,format,jobId,error)){status=ST_NOT_POSSIBLE;if(error.isEmpty())error="Print job rejected";}
-      if(document.remaining()){status=ST_BAD_REQUEST;error="Print backend did not consume complete document";}
-    }
-  }else if(op==OP_VALIDATE_JOB){
-    if(documentLength){DocStream d(c,documentLength);while(d.available())d.read();}
-  }else if(op==OP_GET_PRINTER_ATTRIBUTES||op==OP_GET_JOBS){
-    // handled below
-  }else if(op==OP_CANCEL_JOB||op==OP_GET_JOB_ATTRIBUTES){status=ST_NOT_FOUND;error="Job not found";}
+    else{DocStream document(c,documentLength);if(!handler_(document,documentLength,format,jobId,error)){status=ST_NOT_POSSIBLE;if(error.isEmpty())error="Print job rejected";}if(document.remaining()){status=ST_BAD_REQUEST;error="Print backend did not consume complete document";}}
+  }else if(op==OP_VALIDATE_JOB){if(documentLength){DocStream d(c,documentLength);while(d.available())d.read();}}
+  else if(op==OP_GET_PRINTER_ATTRIBUTES||op==OP_GET_JOBS){}
+  else if(op==OP_CANCEL_JOB||op==OP_GET_JOB_ATTRIBUTES){status=ST_NOT_FOUND;error="Job not found";}
   else{status=ST_UNSUPPORTED;error="IPP operation not supported";}
 
-  size_t w=0;p16(responseBuffer+w,version);w+=2;p16(responseBuffer+w,status);w+=2;p32(responseBuffer+w,req);w+=4;
-  responseBuffer[w++]=0x01; // operation-attributes-tag
-  charset(responseBuffer,RESPONSE_CAPACITY,w,"attributes-charset","utf-8");
-  lang(responseBuffer,RESPONSE_CAPACITY,w,"attributes-natural-language","en");
+  size_t w=0;p16(responseBuffer+w,version);w+=2;p16(responseBuffer+w,status);w+=2;p32(responseBuffer+w,req);w+=4;responseBuffer[w++]=0x01;
+  charset(responseBuffer,RESPONSE_CAPACITY,w,"attributes-charset","utf-8");lang(responseBuffer,RESPONSE_CAPACITY,w,"attributes-natural-language","en");
   if(!error.isEmpty())txt(responseBuffer,RESPONSE_CAPACITY,w,"status-message",error);
 
   if(status==ST_OK){
     if(op==OP_GET_PRINTER_ATTRIBUTES){
       responseBuffer[w++]=0x04;
-      String uuid="urn:uuid:esp32-"+WiFi.macAddress();
+      String uuid="urn:uuid:hp-smart-tank-540-"+WiFi.macAddress();
       if(wants(requested,"printer-uri-supported"))strv(responseBuffer,RESPONSE_CAPACITY,w,0x45,"printer-uri-supported",printerUri_);
-      if(wants(requested,"printer-name"))namev(responseBuffer,RESPONSE_CAPACITY,w,"printer-name",printerName_);
-      if(wants(requested,"printer-info"))txt(responseBuffer,RESPONSE_CAPACITY,w,"printer-info","ESP32-S3 USB printer pass-through");
-      if(wants(requested,"printer-make-and-model"))txt(responseBuffer,RESPONSE_CAPACITY,w,"printer-make-and-model",printerName_);
+      if(wants(requested,"printer-name"))namev(responseBuffer,RESPONSE_CAPACITY,w,"printer-name",MobilePrintProfile::MODEL);
+      if(wants(requested,"printer-info"))txt(responseBuffer,RESPONSE_CAPACITY,w,"printer-info",MobilePrintProfile::MODEL);
+      if(wants(requested,"printer-make-and-model"))txt(responseBuffer,RESPONSE_CAPACITY,w,"printer-make-and-model",MobilePrintProfile::MODEL);
       if(wants(requested,"printer-uuid"))strv(responseBuffer,RESPONSE_CAPACITY,w,0x45,"printer-uuid",uuid);
+      if(wants(requested,"printer-device-id"))txt(responseBuffer,RESPONSE_CAPACITY,w,"printer-device-id","MFG:HP;MDL:Smart Tank 540 series;CMD:PCL,PCLm,JPEG,URF,PWG-Raster;CLS:PRINTER;DES:HP Smart Tank 540 series;");
       if(wants(requested,"printer-state"))enm(responseBuffer,RESPONSE_CAPACITY,w,"printer-state",3);
       if(wants(requested,"printer-state-reasons"))kw(responseBuffer,RESPONSE_CAPACITY,w,"printer-state-reasons","none");
       if(wants(requested,"printer-is-accepting-jobs"))ippBoolean(responseBuffer,RESPONSE_CAPACITY,w,"printer-is-accepting-jobs",true);
@@ -201,19 +177,16 @@ void MobileIppServer::handleClient(WiFiClient &c){
       if(wants(requested,"charset-configured"))charset(responseBuffer,RESPONSE_CAPACITY,w,"charset-configured","utf-8");
       if(wants(requested,"charset-supported"))charset(responseBuffer,RESPONSE_CAPACITY,w,"charset-supported","utf-8");
       if(wants(requested,"natural-language-configured"))lang(responseBuffer,RESPONSE_CAPACITY,w,"natural-language-configured","en");
-      if(wants(requested,"document-format-default"))mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-default",String("application/PCLm"));
-      if(wants(requested,"document-format-supported")){mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",String("application/PCLm"));mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",String("image/pwg-raster"));}
+      if(wants(requested,"document-format-default"))mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-default",MobilePrintProfile::FORMAT_PASSTHROUGH);
+      if(wants(requested,"document-format-supported")){mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_PCL);mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_JPEG);mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_PASSTHROUGH);mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_URF);mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_PWG);mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format-supported",MobilePrintProfile::FORMAT_OCTET);}
       if(wants(requested,"compression-supported"))kw(responseBuffer,RESPONSE_CAPACITY,w,"compression-supported","none");
       if(wants(requested,"color-supported"))ippBoolean(responseBuffer,RESPONSE_CAPACITY,w,"color-supported",true);
       if(wants(requested,"media-supported")){kw(responseBuffer,RESPONSE_CAPACITY,w,"media-supported","iso_a4_210x297mm");kw(responseBuffer,RESPONSE_CAPACITY,w,"media-supported","na_letter_8.5x11in");}
       if(wants(requested,"sides-supported"))kw(responseBuffer,RESPONSE_CAPACITY,w,"sides-supported","one-sided");
       if(wants(requested,"job-creation-attributes-supported")){kw(responseBuffer,RESPONSE_CAPACITY,w,"job-creation-attributes-supported","copies");kw(responseBuffer,RESPONSE_CAPACITY,w,"job-creation-attributes-supported","document-format");kw(responseBuffer,RESPONSE_CAPACITY,w,"job-creation-attributes-supported","media");kw(responseBuffer,RESPONSE_CAPACITY,w,"job-creation-attributes-supported","sides");}
-    }else if(op==OP_PRINT_JOB){
-      responseBuffer[w++]=0x02;integer(responseBuffer,RESPONSE_CAPACITY,w,"job-id",jobId);namev(responseBuffer,RESPONSE_CAPACITY,w,"job-name",String("Job ")+String(jobId));enm(responseBuffer,RESPONSE_CAPACITY,w,"job-state",9);kw(responseBuffer,RESPONSE_CAPACITY,w,"job-state-reasons","job-completed");mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format",format);
-    }
+    }else if(op==OP_PRINT_JOB){responseBuffer[w++]=0x02;integer(responseBuffer,RESPONSE_CAPACITY,w,"job-id",jobId);namev(responseBuffer,RESPONSE_CAPACITY,w,"job-name",String("Job ")+String(jobId));enm(responseBuffer,RESPONSE_CAPACITY,w,"job-state",9);kw(responseBuffer,RESPONSE_CAPACITY,w,"job-state-reasons","job-completed");mime(responseBuffer,RESPONSE_CAPACITY,w,"document-format",format);}
   }
-  responseBuffer[w++]=0x03;
-  c.print("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: ");c.print((unsigned)w);c.print("\r\nConnection: close\r\n\r\n");c.write(responseBuffer,w);c.flush();delay(1);c.stop();
+  responseBuffer[w++]=0x03;c.print("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: ");c.print((unsigned)w);c.print("\r\nConnection: close\r\n\r\n");c.write(responseBuffer,w);c.flush();delay(1);c.stop();
 }
 
 void MobileIppServer::poll(){if(!running_)return;WiFiClient c=server_.available();if(!c)return;Serial.printf("[IPP] Client %s connected\n",c.remoteIP().toString().c_str());handleClient(c);}

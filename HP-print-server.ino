@@ -259,12 +259,6 @@ body:before{content:"";position:fixed;inset:0;pointer-events:none;background:lin
 <div class="top"><div class="brand"><div class="logo">HP</div><div><div class="eyebrow">ESP32-S3 print server</div><div class="title">HP Print Server</div><div class="subtitle">JetDirect / AppSocket · TCP 9100</div></div></div><button class="btn secondary" id="refreshBtn" onclick="refreshStatus()">Refresh</button></div>
 <div class="mode glass" aria-label="USB interface"><button id="scanMode" onclick="setInterfaceMode('scanner')"><span class="modeIcon">⌕</span>Scanner interface</button><button id="printMode" class="active" onclick="setInterfaceMode('printer')"><span class="modeIcon">▣</span>Printer interface</button></div>
 
-<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan Wi-Fi</button></div>
-<div id="scanState" class="hint" style="display:none"></div><div class="selectWrap" style="margin-top:11px"><select id="ssidSelect"><option value="">Select a Wi-Fi network…</option></select></div>
-<form class="wifiForm" method="POST" action="/save"><div class="field"><label for="ssid">Wi-Fi network</label><input id="ssid" name="ssid" value=")HTML";
-  html += esc(config.ssid);
-  html += R"HTML(" maxlength="32" autocomplete="off" placeholder="Select a network or enter a hidden SSID"></div><div class="field"><label for="password">Password</label><input id="password" type="password" name="password" placeholder="Leave blank to keep the saved password"></div><div class="actions"><button class="btn" type="submit">Save Wi-Fi &amp; restart</button><span class="hint">Hidden networks can be entered manually.</span></div></form></div>
-
 <div class="sectionHead" style="margin-top:18px;margin-bottom:10px"><div><h2>Printer Status</h2></div></div>
 <div class="grid">
 <div class="card glass"><div class="printerHero"><div class="printerIcon">▣</div><div><div class="label">Printer</div><div id="printer" class="value">)HTML";
@@ -287,6 +281,12 @@ body:before{content:"";position:fixed;inset:0;pointer-events:none;background:lin
   html += R"HTML(</b></div><div class="info"><span class="label">Web UI</span><b>printer.local</b></div><div class="info"><span class="label">RAW endpoint</span><b><span class="code">printer.local:9100</span></b></div><div class="info"><span class="label">IP address</span><b id="ip">)HTML";
   html += esc(ip);
   html += R"HTML(</b></div></div></div>
+
+<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi &amp; USB Interface</h2></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan Wi-Fi</button></div>
+<div id="scanState" class="hint" style="display:none"></div><div class="selectWrap" style="margin-top:11px"><select id="ssidSelect"><option value="">Select a Wi-Fi network…</option></select></div>
+<form class="wifiForm" method="POST" action="/save"><div class="field"><label for="ssid">Wi-Fi network</label><input id="ssid" name="ssid" value=")HTML";
+  html += esc(config.ssid);
+  html += R"HTML(" maxlength="32" autocomplete="off" placeholder="Select a network or enter a hidden SSID"></div><div class="field"><label for="password">Password</label><input id="password" type="password" name="password" placeholder="Leave blank to keep the saved password"></div><div class="actions"><button class="btn" type="submit">Save Wi-Fi &amp; restart</button><span class="hint">Hidden networks can be entered manually.</span></div></form></div>
 
 </main><div id="toast" class="toast"></div>
 <script>

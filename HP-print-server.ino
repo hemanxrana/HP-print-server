@@ -11,8 +11,6 @@
 // printing interface. No IPP, document conversion, spool or print-language
 // emulation is performed here.
 
-// The HP printer's known working RAW printing interface is IF=1 ALT=0.
-// Interface selection is intentionally not exposed in the normal UI.
 static constexpr const char *RAW_HOSTNAME = "printer";
 static constexpr uint8_t RAW_PRINT_INTERFACE = 1;
 static constexpr uint8_t RAW_PRINT_ALT = 0;
@@ -203,13 +201,15 @@ void sendJsonScan() {
 void sendJsonStatus() {
   const bool connected = WiFi.status() == WL_CONNECTED;
   const bool rawActive = usbPrinterBackend.rawClientConnected();
+  const bool printerAttached = usbHost.device().attached;
   String out;
-  out.reserve(700);
+  out.reserve(760);
   out += "{\"printer\":\"" + jsonEsc(printerStateText());
   out += "\",\"usb\":\"" + jsonEsc(usbStateText());
   out += "\",\"usbStatus\":\"" + jsonEsc(usbStatusText());
   out += "\",\"wifi\":\"" + jsonEsc(wifiStatusText());
   out += "\",\"rawConnected\":" + String(rawActive ? "true" : "false");
+  out += ",\"usbAttached\":" + String(printerAttached ? "true" : "false");
   out += ",\"ip\":\"" + (connected ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + "\"}";
   configServer.send(200, "application/json", out);
 }
@@ -223,67 +223,65 @@ String dashboard() {
       : "HP USB printer";
 
   String html;
-  html.reserve(15000);
+  html.reserve(17000);
 
   html += R"HTML(<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#6750A4"><title>HP Print Server</title>
+<meta name="theme-color" content="#eef2f7"><title>HP Print Server</title>
 <style>
-:root{color-scheme:light;--primary:#6750a4;--primary2:#7f67be;--bg:#f7f5fb;--surface:#fff;--surface2:#f1edf7;--text:#1c1b1f;--muted:#6f6b76;--outline:#ded8e5;--ok:#2e7d32;--warn:#a15c00;--bad:#ba1a1a}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-.app{max-width:1050px;margin:auto;padding:24px 18px 52px}.top{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:22px}.brand{display:flex;align-items:center;gap:14px}.logo{width:46px;height:46px;border-radius:15px;background:var(--primary);color:white;display:grid;place-items:center;font-weight:800;font-size:20px;box-shadow:0 6px 18px #6750a430}.eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:700}.title{font-size:28px;font-weight:800;letter-spacing:-.02em}.subtitle{font-size:14px;color:var(--muted);margin-top:2px}.btn{border:0;border-radius:999px;padding:11px 17px;background:var(--primary);color:#fff;font-weight:700;cursor:pointer}.btn.secondary{background:var(--surface2);color:var(--text)}.btn:disabled{opacity:.55;cursor:wait}
-.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.card{background:var(--surface);border:1px solid var(--outline);border-radius:20px;padding:17px;box-shadow:0 4px 20px #1c1b1f08}.label{font-size:12px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.05em}.value{font-size:18px;font-weight:800;margin-top:7px;line-height:1.25}.small{font-size:13px;color:var(--muted);margin-top:5px}.pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;margin-top:9px}.dot{width:9px;height:9px;border-radius:50%;background:var(--ok)}.dot.off{background:var(--bad)}.dot.warn{background:var(--warn)}
-.section{margin-top:15px;background:var(--surface);border:1px solid var(--outline);border-radius:22px;padding:20px;box-shadow:0 4px 20px #1c1b1f08}.sectionHead{display:flex;justify-content:space-between;align-items:flex-start;gap:15px;margin-bottom:15px}.section h2{font-size:19px;margin:0}.section p{margin:7px 0;color:var(--muted);font-size:14px;line-height:1.5}.infoGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.info{background:var(--surface2);border-radius:15px;padding:14px}.info b{display:block;margin-top:4px}.ssidList{display:grid;grid-template-columns:repeat(2,1fr);gap:9px;max-height:360px;overflow:auto;padding:2px}.ssid{border:1px solid var(--outline);background:#fff;border-radius:16px;padding:13px;display:flex;justify-content:space-between;align-items:center;gap:12px;cursor:pointer;text-align:left}.ssid:hover,.ssid.selected{border-color:var(--primary);background:#f8f5ff}.ssidName{font-weight:750;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ssidMeta{font-size:12px;color:var(--muted);margin-top:3px}.signal{font-size:12px;font-weight:750;color:var(--muted);white-space:nowrap}.wifiForm{margin-top:16px;border-top:1px solid var(--outline);padding-top:16px}.field{margin-bottom:12px}.field label{display:block;font-size:13px;font-weight:700;margin-bottom:6px}.field input{width:100%;padding:12px 13px;border:1px solid #c9c3d0;border-radius:13px;font:inherit;background:#fff}.hint{font-size:12px;color:var(--muted)}.actions{display:flex;gap:9px;flex-wrap:wrap;align-items:center}.usbBox{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:15px;background:var(--surface2);border-radius:17px}.usbTitle{font-weight:800}.usbDetails{font-size:13px;color:var(--muted);margin-top:4px}.code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:#e9e3f0;padding:3px 6px;border-radius:7px}.toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,20px);background:#2b2930;color:#fff;padding:12px 16px;border-radius:999px;opacity:0;pointer-events:none;transition:.2s;box-shadow:0 8px 25px #0003;font-size:13px}.toast.show{opacity:1;transform:translate(-50%,0)}
-@media(max-width:850px){.grid{grid-template-columns:repeat(2,1fr)}.infoGrid{grid-template-columns:1fr 1fr}.ssidList{grid-template-columns:1fr}}@media(max-width:560px){.app{padding:17px 12px 40px}.top{align-items:flex-start}.title{font-size:23px}.top>.btn{padding:9px 12px}.grid{grid-template-columns:1fr 1fr}.infoGrid{grid-template-columns:1fr}.card{padding:14px}.section{padding:16px;border-radius:18px}.ssidList{max-height:310px}}
+:root{color-scheme:light;--bg:#eef2f7;--glass:rgba(255,255,255,.62);--glass-strong:rgba(255,255,255,.78);--line:rgba(255,255,255,.78);--text:#101114;--muted:#69707d;--blue:#007aff;--green:#34c759;--red:#ff3b30;--shadow:0 18px 50px rgba(30,45,70,.12)}
+*{box-sizing:border-box}html{background:var(--bg)}body{margin:0;min-height:100vh;color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;background:radial-gradient(circle at 15% 5%,rgba(255,255,255,.95),transparent 35%),radial-gradient(circle at 90% 10%,rgba(190,215,255,.65),transparent 32%),linear-gradient(145deg,#eef2f7,#e7edf5 55%,#f4f6f9);background-attachment:fixed}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(120deg,rgba(255,255,255,.24),transparent 35%,rgba(255,255,255,.18));mix-blend-mode:screen}.app{max-width:1050px;margin:auto;padding:24px 18px 52px;position:relative}.top{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:18px}.brand{display:flex;align-items:center;gap:13px}.logo{width:48px;height:48px;border-radius:16px;background:linear-gradient(145deg,rgba(255,255,255,.86),rgba(215,224,238,.7));border:1px solid rgba(255,255,255,.9);display:grid;place-items:center;font-weight:800;font-size:18px;box-shadow:inset 0 1px 0 #fff,0 10px 28px rgba(30,50,80,.12);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}.eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:700}.title{font-size:28px;font-weight:800;letter-spacing:-.035em}.subtitle{font-size:13px;color:var(--muted);margin-top:2px}.glass{background:var(--glass);border:1px solid var(--line);box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.9);backdrop-filter:blur(24px) saturate(145%);-webkit-backdrop-filter:blur(24px) saturate(145%)}.btn{border:1px solid rgba(255,255,255,.35);border-radius:999px;padding:11px 17px;background:var(--blue);color:#fff;font:inherit;font-weight:700;cursor:pointer;box-shadow:0 7px 20px rgba(0,122,255,.2);transition:transform .16s,opacity .16s}.btn:hover{transform:translateY(-1px)}.btn:active{transform:scale(.98)}.btn.secondary{background:rgba(255,255,255,.58);color:var(--text);border-color:rgba(255,255,255,.8);box-shadow:none}.btn:disabled{opacity:.55;cursor:wait;transform:none}
+.mode{display:flex;padding:4px;border-radius:16px;margin-bottom:15px;background:rgba(255,255,255,.48);border:1px solid rgba(255,255,255,.78);box-shadow:inset 0 1px 2px rgba(30,50,80,.08)}.mode button{flex:1;border:0;border-radius:12px;padding:10px 15px;background:transparent;color:var(--muted);font:inherit;font-weight:700;cursor:pointer;transition:.18s}.mode button.active{background:var(--glass-strong);color:var(--text);box-shadow:0 4px 14px rgba(30,50,80,.11),inset 0 1px 0 #fff}.modeIcon{margin-right:6px}.panel{display:none}.panel.active{display:block}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.card{border-radius:22px;padding:17px;min-height:112px}.label{font-size:11px;color:var(--muted);font-weight:750;text-transform:uppercase;letter-spacing:.06em}.value{font-size:19px;font-weight:800;margin-top:7px;line-height:1.25;letter-spacing:-.02em}.small{font-size:12px;color:var(--muted);margin-top:5px}.pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;margin-top:9px}.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px rgba(52,199,89,.12)}.dot.off{background:var(--red);box-shadow:0 0 0 3px rgba(255,59,48,.12)}.section{margin-top:14px;border-radius:24px;padding:20px}.sectionHead{display:flex;justify-content:space-between;align-items:flex-start;gap:15px;margin-bottom:15px}.section h2{font-size:19px;letter-spacing:-.02em;margin:0}.section p{margin:7px 0;color:var(--muted);font-size:13px;line-height:1.5}.infoGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.info{background:rgba(255,255,255,.38);border:1px solid rgba(255,255,255,.58);border-radius:17px;padding:14px}.info b{display:block;margin-top:5px}.selectWrap{position:relative}.selectWrap:after{content:"⌄";position:absolute;right:15px;top:50%;transform:translateY(-55%);color:var(--muted);pointer-events:none;font-size:18px}.selectWrap select{appearance:none;-webkit-appearance:none;width:100%;padding:14px 42px 14px 14px;border:1px solid rgba(255,255,255,.85);border-radius:15px;background:rgba(255,255,255,.62);color:var(--text);font:inherit;font-weight:650;outline:none;box-shadow:inset 0 1px 0 #fff}.selectWrap select:focus,.field input:focus{border-color:rgba(0,122,255,.55);box-shadow:0 0 0 4px rgba(0,122,255,.1)}.wifiForm{margin-top:16px;border-top:1px solid rgba(255,255,255,.7);padding-top:16px}.field{margin-bottom:12px}.field label{display:block;font-size:12px;font-weight:700;margin-bottom:6px}.field input{width:100%;padding:13px;border:1px solid rgba(255,255,255,.85);border-radius:14px;font:inherit;background:rgba(255,255,255,.58);outline:none}.hint{font-size:12px;color:var(--muted)}.actions{display:flex;gap:9px;flex-wrap:wrap;align-items:center}.printerHero{display:flex;align-items:center;gap:14px}.printerIcon{width:48px;height:48px;border-radius:15px;background:rgba(255,255,255,.55);display:grid;place-items:center;font-size:22px;border:1px solid rgba(255,255,255,.72)}.statusLine{font-size:13px;color:var(--muted);margin-top:4px}.code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:rgba(255,255,255,.5);padding:3px 6px;border-radius:7px}.toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,20px);background:rgba(25,27,32,.9);color:#fff;padding:12px 16px;border-radius:999px;opacity:0;pointer-events:none;transition:.2s;box-shadow:0 8px 25px rgba(0,0,0,.2);font-size:13px;backdrop-filter:blur(15px);-webkit-backdrop-filter:blur(15px)}.toast.show{opacity:1;transform:translate(-50%,0)}
+@media(max-width:760px){.grid{grid-template-columns:1fr 1fr}.infoGrid{grid-template-columns:1fr 1fr}}@media(max-width:560px){.app{padding:16px 12px 40px}.top{align-items:flex-start}.title{font-size:23px}.top>.btn{padding:9px 13px}.grid{grid-template-columns:1fr 1fr}.infoGrid{grid-template-columns:1fr}.section{padding:16px;border-radius:20px}.mode button{padding:9px 10px}.logo{width:44px;height:44px}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
 </style></head><body><main class="app">
-<div class="top"><div class="brand"><div class="logo">HP</div><div><div class="eyebrow">ESP32-S3 print server</div><div class="title">HP Print Server</div><div class="subtitle">RAW JetDirect / AppSocket · no IPP</div></div></div><button class="btn secondary" id="refreshBtn" onclick="refreshStatus()">Refresh</button></div>
+<div class="top"><div class="brand"><div class="logo">HP</div><div><div class="eyebrow">ESP32-S3 print server</div><div class="title">HP Print Server</div><div class="subtitle">JetDirect / AppSocket · TCP 9100</div></div></div><button class="btn secondary" id="refreshBtn" onclick="refreshStatus()">Refresh</button></div>
+<div class="mode glass"><button id="scanMode" class="active" onclick="setMode('scan')"><span class="modeIcon">⌕</span>Scan</button><button id="printMode" onclick="setMode('print')"><span class="modeIcon">▣</span>Print</button></div>
+
+<section id="scanPanel" class="panel active">
+<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi network</h2><p>Scan once, then choose a nearby network from the dropdown.</p></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan networks</button></div>
+<div id="scanState" class="hint">Press Scan networks to find nearby Wi-Fi.</div><div class="selectWrap" style="margin-top:11px"><select id="ssidSelect"><option value="">Select a network…</option></select></div>
+<form class="wifiForm" method="POST" action="/save"><div class="field"><label for="ssid">Selected SSID</label><input id="ssid" name="ssid" value=")HTML";
+  html += esc(config.ssid);
+  html += R"HTML(" maxlength="32" autocomplete="off" placeholder="Select a network or enter a hidden SSID"></div><div class="field"><label for="password">Password</label><input id="password" type="password" name="password" placeholder="Leave blank to keep the saved password"></div><div class="actions"><button class="btn" type="submit">Save Wi-Fi &amp; restart</button><span class="hint">Hidden networks can be entered manually.</span></div></form></div>
+</section>
+
+<section id="printPanel" class="panel">
 <div class="grid">
-<div class="card"><div class="label">Printer</div><div id="printer" class="value">)HTML";
+<div class="card glass"><div class="printerHero"><div class="printerIcon">▣</div><div><div class="label">Printer</div><div id="printer" class="value">)HTML";
   html += esc(printerStateText());
   html += R"HTML(</div><div id="printerPill" class="pill"><span class="dot"></span><span>)HTML";
   html += printerAttached ? "USB connected" : "USB not detected";
-  html += R"HTML(</span></div></div>
-<div class="card"><div class="label">Wi-Fi</div><div id="wifi" class="value">)HTML";
+  html += R"HTML(</span></div></div></div></div>
+<div class="card glass"><div class="label">Wi-Fi</div><div id="wifi" class="value">)HTML";
   html += esc(wifiStatusText());
   html += R"HTML(</div><div class="small">Network connection</div></div>
-<div class="card"><div class="label">USB</div><div id="usb" class="value">)HTML";
-  html += esc(usbStateText());
-  html += R"HTML(</div><div class="small">Fixed print interface 1</div></div>
-<div class="card"><div class="label">RAW 9100</div><div id="raw" class="value">Listening</div><div class="small">TCP 9100 · transparent stream</div></div>
+<div class="card glass"><div class="label">RAW 9100</div><div id="raw" class="value">Listening</div><div class="small">Transparent print stream</div></div>
 </div>
 
-<section class="section"><div class="sectionHead"><div><h2>Printer status</h2><p>Live status comes from the USB printer status path. The printing interface remains fixed and is not exposed as a user setting.</p></div></div>
-<div class="infoGrid"><div class="info"><span class="label">Device</span><b>)HTML";
+<section class="section glass"><div class="sectionHead"><div><h2>Printer status</h2><p>USB connection and printer status are shown together. The verified print interface remains fixed at interface 1, alternate setting 0.</p></div></div>
+<div class="infoGrid"><div class="info"><span class="label">Device</span><b id="device">)HTML";
   html += esc(deviceName);
-  html += R"HTML(</b></div><div class="info"><span class="label">USB status</span><b id="usbStatus">)HTML";
+  html += R"HTML(</b></div><div class="info"><span class="label">USB / printer</span><b id="usbStatus">)HTML";
   html += esc(usbStatusText());
   html += R"HTML(</b></div><div class="info"><span class="label">Connection</span><b id="connection">)HTML";
   html += printerAttached ? "USB attached" : "Waiting for USB printer";
   html += R"HTML(</b></div></div></section>
 
-<section class="section"><div class="sectionHead"><div><h2>Wi-Fi network</h2><p>Select a nearby network. Signal strength is shown for each visible SSID.</p></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan networks</button></div>
-<div id="scanState" class="hint">Press Scan networks to find nearby Wi-Fi.</div><div id="ssidList" class="ssidList" style="margin-top:10px"><div class="info">No scan performed yet.</div></div>
-<form class="wifiForm" method="POST" action="/save"><div class="field"><label for="ssid">Selected SSID</label><input id="ssid" name="ssid" value=")HTML";
-  html += esc(config.ssid);
-  html += R"HTML(" maxlength="32" autocomplete="off" placeholder="Choose a network above or enter a hidden SSID"></div><div class="field"><label for="password">Password</label><input id="password" type="password" name="password" placeholder="Leave blank to keep the saved password"></div><div class="actions"><button class="btn" type="submit">Save Wi-Fi &amp; restart</button><span class="hint">Hidden networks can be entered manually.</span></div></form></section>
-
-<section class="section"><div class="sectionHead"><div><h2>USB connection</h2><p>The known working printer interface is locked to interface 1, alternate setting 0. Endpoint details are intentionally hidden from the normal dashboard.</p></div></div>
-<div class="usbBox"><div><div class="usbTitle">RAW printing interface · IF 1 / ALT 0</div><div class="usbDetails">The device is automatically enumerated and the printer status interface is handled by the USB host.</div></div><button class="btn secondary" onclick="scanUsb()">Change / scan USB port</button></div>
-<p class="hint" style="margin-top:12px">The scan action is reserved for future USB-port selection. It does not change the active printing interface today.</p></section>
-
-<section class="section"><div class="sectionHead"><div><h2>Connection</h2><p>Use the local hostname when mDNS is available.</p></div></div><div class="infoGrid"><div class="info"><span class="label">Web UI</span><b>printer.local</b></div><div class="info"><span class="label">RAW endpoint</span><b><span class="code">printer.local:9100</span></b></div><div class="info"><span class="label">IP address</span><b id="ip">)HTML";
+<section class="section glass"><div class="sectionHead"><div><h2>Connection</h2><p>Use the local hostname when mDNS is available.</p></div></div><div class="infoGrid"><div class="info"><span class="label">Web UI</span><b>printer.local</b></div><div class="info"><span class="label">RAW endpoint</span><b><span class="code">printer.local:9100</span></b></div><div class="info"><span class="label">IP address</span><b id="ip">)HTML";
   html += esc(ip);
   html += R"HTML(</b></div></div></section>
+</section>
 
-<section class="section"><h2>RAW printing</h2><p>TCP 9100 is transparent: no IPP, Content-Length, PJL, form-feed, document conversion, or other print data is added. The incoming stream is forwarded unchanged to USB.</p><p>Use a print stream understood by the HP printer itself.</p></section>
 </main><div id="toast" class="toast"></div>
 <script>
 const $=id=>document.getElementById(id);
 function safe(s){return String(s).replace(/[&<>\"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[m]));}
-function signalText(r){if(r>=-55)return 'Excellent';if(r>=-67)return 'Good';if(r>=-75)return 'Fair';return 'Weak';}
-async function scanWifi(){const b=$('scanBtn'),list=$('ssidList'),state=$('scanState');b.disabled=true;b.textContent='Scanning…';state.textContent='Scanning nearby networks…';list.innerHTML='<div class="info">Looking for visible networks…</div>';try{const r=await fetch('/scan.json?ts='+Date.now());if(!r.ok)throw new Error();const a=await r.json();a.sort((x,y)=>y.rssi-x.rssi);if(!a.length){list.innerHTML='<div class="info">No visible networks found.</div>';state.textContent='No visible networks found.';return;}list.innerHTML='';a.forEach(x=>{const el=document.createElement('button');el.type='button';el.className='ssid';el.innerHTML='<div style="min-width:0"><div class="ssidName">'+safe(x.ssid)+'</div><div class="ssidMeta">Channel '+x.channel+' · '+signalText(x.rssi)+'</div></div><div class="signal">'+x.rssi+' dBm</div>';el.onclick=()=>{ $('ssid').value=x.ssid;document.querySelectorAll('.ssid').forEach(z=>z.classList.remove('selected'));el.classList.add('selected');};list.appendChild(el);});state.textContent=a.length+' nearby network'+(a.length===1?'':'s')+' found.';}catch(e){list.innerHTML='<div class="info">Wi-Fi scan failed. You can still enter a hidden SSID manually.</div>';state.textContent='Scan failed.';}finally{b.disabled=false;b.textContent='Scan networks';}}
-async function refreshStatus(){const b=$('refreshBtn');b.disabled=true;b.textContent='Refreshing…';try{const r=await fetch('/status.json?ts='+Date.now());const s=await r.json();$('printer').textContent=s.printer;$('wifi').textContent=s.wifi;$('usb').textContent=s.usb;$('usbStatus').textContent=s.usbStatus;$('raw').textContent=s.rawConnected?'Job active':'Listening';$('ip').textContent=s.ip;$('connection').textContent=s.usbAttached?'USB attached':'Waiting for USB printer';}catch(e){showToast('Status refresh failed');}finally{b.disabled=false;b.textContent='Refresh';}}
-async function scanUsb(){try{const r=await fetch('/usb-scan?ts='+Date.now());const s=await r.json();showToast(s.message);}catch(e){showToast('USB scan request failed');}}
+function setMode(mode){const scan=mode==='scan';$('scanPanel').classList.toggle('active',scan);$('printPanel').classList.toggle('active',!scan);$('scanMode').classList.toggle('active',scan);$('printMode').classList.toggle('active',!scan);}
+$('ssidSelect').addEventListener('change',()=>{$('ssid').value=$('ssidSelect').value;});
+async function scanWifi(){const b=$('scanBtn'),select=$('ssidSelect'),state=$('scanState');b.disabled=true;b.textContent='Scanning…';state.textContent='Scanning nearby networks…';select.innerHTML='<option value="">Scanning…</option>';try{const r=await fetch('/scan.json?ts='+Date.now());if(!r.ok)throw new Error();const a=await r.json();a.sort((x,y)=>y.rssi-x.rssi);select.innerHTML='<option value="">Select a network…</option>';a.forEach(x=>{const o=document.createElement('option');o.value=x.ssid;o.textContent=x.ssid+'  ·  '+x.rssi+' dBm  ·  Ch '+x.channel;select.appendChild(o);});if(!a.length){select.innerHTML='<option value="">No visible networks found</option>';state.textContent='No visible networks found.';}else{state.textContent=a.length+' nearby network'+(a.length===1?'':'s')+' found.';const current=$('ssid').value;if(current&&a.some(x=>x.ssid===current))select.value=current;}}catch(e){select.innerHTML='<option value="">Scan failed</option>';state.textContent='Scan failed. You can still enter a hidden SSID manually.';}finally{b.disabled=false;b.textContent='Scan networks';}}
+async function refreshStatus(){const b=$('refreshBtn');b.disabled=true;b.textContent='Refreshing…';try{const r=await fetch('/status.json?ts='+Date.now());if(!r.ok)throw new Error();const s=await r.json();$('printer').textContent=s.printer;$('wifi').textContent=s.wifi;$('usbStatus').textContent=s.usbStatus;$('raw').textContent=s.rawConnected?'Job active':'Listening';$('ip').textContent=s.ip;$('connection').textContent=s.usbAttached?'USB attached':'Waiting for USB printer';$('printerPill').innerHTML='<span class="dot '+(s.usbAttached?'':'off')+'"></span><span>'+(s.usbAttached?'USB connected':'USB not detected')+'</span>';}catch(e){showToast('Status refresh failed');}finally{b.disabled=false;b.textContent='Refresh';}}
 function showToast(t){const x=$('toast');x.textContent=t;x.classList.add('show');clearTimeout(window._toast);window._toast=setTimeout(()=>x.classList.remove('show'),2800);}
 setInterval(refreshStatus,5000);
 </script></body></html>)HTML";
@@ -326,8 +324,6 @@ void setup() {
 
   startRawDiscovery();
 
-  // The printer's known-good RAW printing interface is fixed here.
-  // USB status selection remains descriptor-derived inside UsbHostManager.
   usbHost.setInterfaceSelection(false, RAW_PRINT_INTERFACE, RAW_PRINT_ALT);
   usbPrinterBackend.begin();
 

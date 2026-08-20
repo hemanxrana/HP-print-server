@@ -11,9 +11,6 @@
 namespace {
 static constexpr uint8_t USB_PRINTER_CLASS_CODE = 0x07;
 static constexpr uint8_t USB_PRINTER_SUBCLASS_CODE = 0x01;
-static constexpr uint8_t USB_IMAGE_CLASS_CODE = 0x06;
-static constexpr uint8_t USB_IMAGE_SUBCLASS_CODE = 0x01;
-static constexpr uint8_t USB_IMAGE_PROTOCOL_CODE = 0x01;
 static constexpr uint8_t USB_ENDPOINT_XFER_BULK_CODE = 0x02;
 static constexpr uint8_t USB_ENDPOINT_XFER_INT_CODE = 0x03;
 static constexpr uint8_t USB_PRINTER_GET_PORT_STATUS = 0x01;
@@ -696,12 +693,22 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
 }
 
 void UsbHostManager::onPortStatusTransfer(bool valid, uint8_t value, const String &error) {
+  static String lastStatusError;
+
   if (!valid) {
     device_.portStatus.valid = false;
-    if (error.length()) error_ = error;
+    if (error.length()) {
+      if (error != lastStatusError) {
+        Serial.printf("[USB] GET_PORT_STATUS error: %s\n", error.c_str());
+        lastStatusError = error;
+      }
+      error_ = error;
+    }
     return;
   }
 
+  const bool wasValid = device_.portStatus.valid;
+  const uint8_t previousValue = device_.portStatus.value;
   UsbPortStatus &s = device_.portStatus;
   s.valid = true;
   s.value = value;
@@ -710,10 +717,13 @@ void UsbHostManager::onPortStatusTransfer(bool valid, uint8_t value, const Strin
   s.paperEmpty = (value & 0x20) != 0;
   s.updatedAt = millis();
   error_.clear();
+  lastStatusError.clear();
 
-  Serial.printf("[USB] GET_PORT_STATUS IF=%u value=0x%02X error=%d selected=%d paper-empty=%d\n",
-                device_.statusInterface.interfaceNumber, value,
-                (int)s.error, (int)s.selected, (int)s.paperEmpty);
+  if (!wasValid || previousValue != value) {
+    Serial.printf("[USB] GET_PORT_STATUS IF=%u value=0x%02X error=%d selected=%d paper-empty=%d\n",
+                  device_.statusInterface.interfaceNumber, value,
+                  (int)s.error, (int)s.selected, (int)s.paperEmpty);
+  }
 }
 
 void UsbHostManager::onEnumerated(const UsbDeviceInfo &info) {
@@ -723,6 +733,7 @@ void UsbHostManager::onEnumerated(const UsbDeviceInfo &info) {
 }
 
 void UsbHostManager::onDetached() {
+  if (device_.attached) Serial.println("[USB] Device disconnected");
   device_ = UsbDeviceInfo{};
   error_.clear();
   state_ = started_ ? RUNNING : STOPPED;

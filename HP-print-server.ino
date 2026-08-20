@@ -14,8 +14,6 @@
 static constexpr const char *RAW_HOSTNAME = "printer";
 static constexpr uint8_t RAW_PRINT_INTERFACE = 1;
 static constexpr uint8_t RAW_PRINT_ALT = 0;
-static constexpr uint8_t USB_SCAN_INTERFACE = 0;
-static constexpr uint8_t USB_SCAN_ALT = 0;
 static constexpr const char *AP_SSID = "HP-Print-Server";
 static constexpr const char *AP_PASSWORD = "configureme";
 static constexpr const char *CONFIG_NS = "hp-print";
@@ -31,7 +29,6 @@ struct Config {
 };
 Config config;
 static unsigned long lastStatus = 0;
-static bool scannerInterfaceSelected = false;
 
 String esc(String s) {
   s.replace("&", "&amp;");
@@ -135,18 +132,6 @@ void startRawDiscovery() {
   }
 }
 
-String usbStateText() {
-  switch (usbHost.state()) {
-    case UsbHostManager::STOPPED: return "Stopped";
-    case UsbHostManager::RUNNING: return "Running";
-    case UsbHostManager::ENUMERATING: return "Enumerating";
-    case UsbHostManager::DEVICE_ATTACHED: return "Device attached";
-    case UsbHostManager::PRINTER_READY: return "Printer ready";
-    case UsbHostManager::ERROR: return String("Error: ") + usbHost.lastError();
-  }
-  return "Unknown";
-}
-
 String printerStateText() {
   switch (usbPrinterBackend.state()) {
     case UsbPrinterBackend::OFFLINE: return "Offline";
@@ -158,17 +143,13 @@ String printerStateText() {
 }
 
 String usbStatusText() {
-  if (!usbHost.device().attached) return "No printer attached";
-  if (!usbHost.portStatusValid()) return "Status pending";
+  if (!usbHost.device().attached) return "No USB printer detected";
+  if (!usbHost.portStatusValid()) return "Printer connected; status is being checked";
 
-  const uint8_t s = usbHost.portStatusValue();
-  String result;
-  if (usbHost.portStatusError()) result = "Printer reports an error";
-  else if (usbHost.portStatusPaperEmpty()) result = "Paper empty / unavailable";
-  else if (usbHost.portStatusSelected()) result = "Printer selected / ready";
-  else result = "Printer online";
-  result += String(" (0x") + String(s, HEX) + ")";
-  return result;
+  if (usbHost.portStatusError()) return "Printer reports an error";
+  if (usbHost.portStatusPaperEmpty()) return "Paper is empty or unavailable";
+  if (usbHost.portStatusSelected()) return "Printer is selected and ready";
+  return "Printer is online";
 }
 
 String wifiStatusText() {
@@ -176,7 +157,7 @@ String wifiStatusText() {
     return String("Connected · ") + WiFi.localIP().toString();
   }
   if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
-    return String("Setup AP · ") + WiFi.softAPIP().toString();
+    return String("Setup access point · ") + WiFi.softAPIP().toString();
   }
   return "Not connected";
 }
@@ -205,55 +186,24 @@ void sendJsonStatus() {
   const bool connected = WiFi.status() == WL_CONNECTED;
   const bool rawActive = usbPrinterBackend.rawClientConnected();
   const bool printerAttached = usbHost.device().attached;
+  const String ip = connected ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  const String networkName = connected ? WiFi.SSID() : String(AP_SSID);
+  const String printerName = printerAttached && usbHost.device().product.length()
+      ? usbHost.device().product
+      : "USB printer";
+
   String out;
-  out.reserve(820);
+  out.reserve(1000);
   out += "{\"printer\":\"" + jsonEsc(printerStateText());
-  out += "\",\"usb\":\"" + jsonEsc(usbStateText());
+  out += "\",\"printerName\":\"" + jsonEsc(printerName);
   out += "\",\"usbStatus\":\"" + jsonEsc(usbStatusText());
   out += "\",\"wifi\":\"" + jsonEsc(wifiStatusText());
+  out += "\",\"ssid\":\"" + jsonEsc(networkName);
   out += "\",\"rawConnected\":" + String(rawActive ? "true" : "false");
   out += ",\"usbAttached\":" + String(printerAttached ? "true" : "false");
-  out += ",\"interfaceMode\":\"" + String(scannerInterfaceSelected ? "scanner" : "printer") + "\"";
-  out += ",\"ip\":\"" + (connected ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + "\"}";
+  out += ",\"ip\":\"" + jsonEsc(ip);
+  out += "\",\"hostname\":\"printer.local\"}";
   configServer.send(200, "application/json", out);
-}
-
-void handleInterfaceMode() {
-  const String mode = configServer.hasArg("mode") ? configServer.arg("mode") : "printer";
-  if (mode == "scanner") {
-    bool scannerDetected = false;
-    for (uint8_t i = 0; i < usbHost.device().interfaceCount; ++i) {
-      if (usbHost.device().interfaces[i].isScanner()) {
-        scannerDetected = true;
-        break;
-      }
-    }
-    if (!scannerDetected) {
-      scannerInterfaceSelected = false;
-      configServer.send(404, "application/json", "{\"error\":\"Scanner interface not detected\"}");
-      return;
-    }
-    scannerInterfaceSelected = true;
-    // Keep the existing /interface.json selection API. Scanner selection is
-    // descriptor/UI state only; RAW printing remains on the Printer Class
-    // interface and is never redirected to a scanner interface.
-    Serial.println("[USB] Interface mode changed: scanner (descriptor detected; RAW printer path unchanged)");
-    configServer.send(200, "application/json", "{\"mode\":\"scanner\"}");
-    return;
-  }
-
-  scannerInterfaceSelected = false;
-  usbHost.setInterfaceSelection(false, RAW_PRINT_INTERFACE, RAW_PRINT_ALT);
-  Serial.printf("[USB] Interface mode changed: printer IF=%u ALT=%u\n", RAW_PRINT_INTERFACE, RAW_PRINT_ALT);
-  configServer.send(200, "application/json", "{\"mode\":\"printer\",\"interface\":1,\"alternate\":0}");
-}
-
-static String endpointDetails(const UsbEndpointInfo &ep, const char *label) {
-  if (!ep.valid()) return String(label) + " none";
-  return String(label) + " 0x" + String(ep.address, HEX)
-      + " attr=0x" + String(ep.attributes, HEX)
-      + " MPS=" + String(ep.maxPacketSize)
-      + " interval=" + String(ep.interval);
 }
 
 String dashboard() {
@@ -262,73 +212,59 @@ String dashboard() {
   const bool printerAttached = usbHost.device().attached;
   const String deviceName = printerAttached && usbHost.device().product.length()
       ? usbHost.device().product
-      : "HP USB printer";
-
-  String printerInterfaceDetails = "Not detected";
-  if (printerAttached && usbHost.device().printer.found) {
-    const UsbPrinterInterfaceInfo &pi = usbHost.device().printer;
-    printerInterfaceDetails = String("Interface ") + String(pi.interfaceNumber)
-        + " · Alternate " + String(pi.alternateSetting)
-        + " · Class 0x07 · Subclass 0x" + String(pi.subclass, HEX)
-        + " · Protocol 0x" + String(pi.protocol, HEX)
-        + " · " + endpointDetails(pi.bulkOut, "Bulk OUT")
-        + " · " + endpointDetails(pi.bulkIn, "Bulk IN");
-  }
-
-  String scannerInterfaceDetails = "Not detected";
-  if (printerAttached) {
-    for (uint8_t i = 0; i < usbHost.device().interfaceCount; ++i) {
-      const UsbInterfaceInfo &si = usbHost.device().interfaces[i];
-      if (!si.isScanner()) continue;
-      scannerInterfaceDetails = String("Interface ") + String(si.interfaceNumber)
-          + " · Alternate " + String(si.alternateSetting)
-          + " · Class 0x" + String(si.classCode, HEX)
-          + " · Subclass 0x" + String(si.subclass, HEX)
-          + " · Protocol 0x" + String(si.protocol, HEX)
-          + " · " + endpointDetails(si.bulkOut, "Bulk OUT")
-          + " · " + endpointDetails(si.bulkIn, "Bulk IN")
-          + " · " + endpointDetails(si.interruptOut, "Interrupt OUT")
-          + " · " + endpointDetails(si.interruptIn, "Interrupt IN");
-      break;
-    }
-  }
+      : "No USB printer";
+  const String networkName = connected ? WiFi.SSID() : String(AP_SSID);
 
   String html;
-  html.reserve(18000);
+  html.reserve(16000);
 
   html += R"HTML(<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#eef2f7"><title>HP Print Server</title>
 <style>
-:root{color-scheme:light;--bg:#eef2f7;--glass:rgba(255,255,255,.62);--glass-strong:rgba(255,255,255,.8);--line:rgba(255,255,255,.78);--text:#101114;--muted:#69707d;--blue:#007aff;--green:#34c759;--red:#ff3b30;--shadow:0 18px 50px rgba(30,45,70,.12)}
+:root{color-scheme:light;--bg:#eef2f7;--glass:rgba(255,255,255,.64);--line:rgba(255,255,255,.8);--text:#101114;--muted:#69707d;--blue:#007aff;--green:#34c759;--red:#ff3b30;--shadow:0 18px 50px rgba(30,45,70,.12)}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;min-height:100vh;color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased;background:radial-gradient(circle at 15% 5%,rgba(255,255,255,.95),transparent 35%),radial-gradient(circle at 90% 10%,rgba(190,215,255,.65),transparent 32%),linear-gradient(145deg,#eef2f7,#e7edf5 55%,#f4f6f9);background-attachment:fixed}
-body:before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(120deg,rgba(255,255,255,.24),transparent 35%,rgba(255,255,255,.18));mix-blend-mode:screen}.app{max-width:1050px;margin:auto;padding:24px 18px 52px;position:relative}.top{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:18px}.brand{display:flex;align-items:center;gap:13px}.logo{width:48px;height:48px;border-radius:16px;background:linear-gradient(145deg,rgba(255,255,255,.86),rgba(215,224,238,.7));border:1px solid rgba(255,255,255,.9);display:grid;place-items:center;font-weight:800;font-size:18px;box-shadow:inset 0 1px 0 #fff,0 10px 28px rgba(30,50,80,.12);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}.eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:700}.title{font-size:28px;font-weight:800;letter-spacing:-.035em}.subtitle{font-size:13px;color:var(--muted);margin-top:2px}.glass{background:var(--glass);border:1px solid var(--line);box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.9);backdrop-filter:blur(24px) saturate(145%);-webkit-backdrop-filter:blur(24px) saturate(145%)}.btn{border:1px solid rgba(255,255,255,.35);border-radius:999px;padding:11px 17px;background:var(--blue);color:#fff;font:inherit;font-weight:700;cursor:pointer;box-shadow:0 7px 20px rgba(0,122,255,.2);transition:transform .16s,opacity .16s}.btn:hover{transform:translateY(-1px)}.btn:active{transform:scale(.98)}.btn.secondary{background:rgba(255,255,255,.58);color:var(--text);border-color:rgba(255,255,255,.8);box-shadow:none}.btn:disabled{opacity:.55;cursor:wait;transform:none}
-.interfaceList{display:grid;gap:11px}.interfaceCard{display:block;width:100%;text-align:left;border:1px solid rgba(255,255,255,.7);border-radius:19px;padding:17px;background:rgba(255,255,255,.34);color:var(--text);font:inherit;cursor:pointer;transition:transform .16s,border-color .16s,box-shadow .16s,background .16s}.interfaceCard:hover{transform:translateY(-1px);background:rgba(255,255,255,.52)}.interfaceCard.active{background:rgba(255,255,255,.84);border-color:rgba(0,122,255,.55);box-shadow:0 9px 26px rgba(0,122,255,.14),inset 0 1px 0 #fff}.interfaceTop{display:flex;justify-content:space-between;align-items:center;gap:12px}.interfaceName{font-size:17px;font-weight:800;letter-spacing:-.015em}.interfaceBadge{font-size:11px;font-weight:800;color:var(--muted);padding:5px 10px;border-radius:999px;background:rgba(255,255,255,.6);border:1px solid rgba(255,255,255,.8)}.interfaceCard.active .interfaceBadge{color:var(--blue);background:rgba(0,122,255,.1);border-color:rgba(0,122,255,.18)}.interfaceDescription{margin-top:7px;font-size:13px;color:var(--text);font-weight:650}.interfaceDetails{margin-top:7px;font-size:12px;line-height:1.65;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;white-space:normal}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.card{border-radius:22px;padding:17px;min-height:112px}.label{font-size:11px;color:var(--muted);font-weight:750;text-transform:uppercase;letter-spacing:.06em}.value{font-size:19px;font-weight:800;margin-top:7px;line-height:1.25;letter-spacing:-.02em}.small{font-size:12px;color:var(--muted);margin-top:5px}.pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;margin-top:9px}.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px rgba(52,199,89,.12)}.dot.off{background:var(--red);box-shadow:0 0 0 3px rgba(255,59,48,.12)}.section{margin-top:14px;border-radius:24px;padding:20px}.sectionHead{display:flex;justify-content:space-between;align-items:flex-start;gap:15px;margin-bottom:15px}.section h2{font-size:19px;letter-spacing:-.02em;margin:0}.section p{margin:7px 0;color:var(--muted);font-size:13px;line-height:1.5}.selectWrap{position:relative}.selectWrap:after{content:"⌄";position:absolute;right:15px;top:50%;transform:translateY(-55%);color:var(--muted);pointer-events:none;font-size:18px}.selectWrap select{appearance:none;-webkit-appearance:none;width:100%;padding:14px 42px 14px 14px;border:1px solid rgba(255,255,255,.85);border-radius:15px;background:rgba(255,255,255,.62);color:var(--text);font:inherit;font-weight:650;outline:none;box-shadow:inset 0 1px 0 #fff}.selectWrap select:focus,.field input:focus{border-color:rgba(0,122,255,.55);box-shadow:0 0 0 4px rgba(0,122,255,.1)}.wifiForm{margin-top:16px;border-top:1px solid rgba(255,255,255,.7);padding-top:16px}.field{margin-bottom:12px}.field label{display:block;font-size:12px;font-weight:700;margin-bottom:6px}.field input{width:100%;padding:13px;border:1px solid rgba(255,255,255,.85);border-radius:14px;font:inherit;background:rgba(255,255,255,.58);outline:none}.hint{font-size:12px;color:var(--muted)}.actions{display:flex;gap:9px;flex-wrap:wrap;align-items:center}.printerHero{display:flex;align-items:center;gap:14px}.printerIcon{width:48px;height:48px;border-radius:15px;background:rgba(255,255,255,.55);display:grid;place-items:center;font-size:22px;border:1px solid rgba(255,255,255,.72)}.statusLine{font-size:13px;color:var(--muted);margin-top:4px}.toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,20px);background:rgba(25,27,32,.9);color:#fff;padding:12px 16px;border-radius:999px;opacity:0;pointer-events:none;transition:.2s;box-shadow:0 8px 25px rgba(0,0,0,.2);font-size:13px;backdrop-filter:blur(15px);-webkit-backdrop-filter:blur(15px)}.toast.show{opacity:1;transform:translate(-50%,0)}
-@media(max-width:760px){.grid{grid-template-columns:1fr 1fr}}@media(max-width:560px){.app{padding:16px 12px 40px}.top{align-items:flex-start}.title{font-size:23px}.top>.btn{padding:9px 13px}.grid{grid-template-columns:1fr 1fr}.section{padding:16px;border-radius:20px}.logo{width:44px;height:44px}}@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(120deg,rgba(255,255,255,.24),transparent 35%,rgba(255,255,255,.18));mix-blend-mode:screen}.app{max-width:1050px;margin:auto;padding:24px 18px 52px;position:relative}.top{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:18px}.brand{display:flex;align-items:center;gap:13px}.logo{width:48px;height:48px;border-radius:16px;background:linear-gradient(145deg,rgba(255,255,255,.86),rgba(215,224,238,.7));border:1px solid rgba(255,255,255,.9);display:grid;place-items:center;font-weight:800;font-size:18px;box-shadow:inset 0 1px 0 #fff,0 10px 28px rgba(30,50,80,.12);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}.eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:700}.title{font-size:28px;font-weight:800;letter-spacing:-.035em}.subtitle{font-size:13px;color:var(--muted);margin-top:3px}.glass{background:var(--glass);border:1px solid var(--line);box-shadow:var(--shadow),inset 0 1px 0 rgba(255,255,255,.9);backdrop-filter:blur(24px) saturate(145%);-webkit-backdrop-filter:blur(24px) saturate(145%)}.btn{border:1px solid rgba(255,255,255,.35);border-radius:999px;padding:11px 17px;background:var(--blue);color:#fff;font:inherit;font-weight:700;cursor:pointer;box-shadow:0 7px 20px rgba(0,122,255,.2);transition:transform .16s,opacity .16s}.btn:hover{transform:translateY(-1px)}.btn:active{transform:scale(.98)}.btn.secondary{background:rgba(255,255,255,.58);color:var(--text);border-color:rgba(255,255,255,.8);box-shadow:none}.btn:disabled{opacity:.55;cursor:wait;transform:none}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.card{border-radius:22px;padding:18px;min-height:128px}.label{font-size:11px;color:var(--muted);font-weight:750;text-transform:uppercase;letter-spacing:.06em}.value{font-size:19px;font-weight:800;margin-top:8px;line-height:1.25;letter-spacing:-.02em}.small{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.45}.pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:700;margin-top:10px}.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 3px rgba(52,199,89,.12)}.dot.off{background:var(--red);box-shadow:0 0 0 3px rgba(255,59,48,.12)}.section{margin-top:14px;border-radius:24px;padding:20px}.sectionHead{display:flex;justify-content:space-between;align-items:flex-start;gap:15px;margin-bottom:15px}.section h2{font-size:19px;letter-spacing:-.02em;margin:0}.section p{margin:7px 0;color:var(--muted);font-size:13px;line-height:1.5}.details{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.detail{padding:14px 15px;border-radius:16px;background:rgba(255,255,255,.4);border:1px solid rgba(255,255,255,.7)}.detailKey{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:750}.detailValue{font-size:14px;font-weight:700;margin-top:5px;line-height:1.45;word-break:break-word}.service{padding:16px;border-radius:17px;background:rgba(255,255,255,.42);border:1px solid rgba(255,255,255,.72)}.service strong{font-size:14px}.address{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:13px;margin-top:7px;word-break:break-all}.selectWrap{position:relative}.selectWrap:after{content:"⌄";position:absolute;right:15px;top:50%;transform:translateY(-55%);color:var(--muted);pointer-events:none;font-size:18px}.selectWrap select{appearance:none;-webkit-appearance:none;width:100%;padding:14px 42px 14px 14px;border:1px solid rgba(255,255,255,.85);border-radius:15px;background:rgba(255,255,255,.62);color:var(--text);font:inherit;font-weight:650;outline:none;box-shadow:inset 0 1px 0 #fff}.selectWrap select:focus,.field input:focus{border-color:rgba(0,122,255,.55);box-shadow:0 0 0 4px rgba(0,122,255,.1)}.wifiForm{margin-top:16px;border-top:1px solid rgba(255,255,255,.7);padding-top:16px}.field{margin-bottom:12px}.field label{display:block;font-size:12px;font-weight:700;margin-bottom:6px}.field input{width:100%;padding:13px;border:1px solid rgba(255,255,255,.85);border-radius:14px;font:inherit;background:rgba(255,255,255,.58);outline:none}.hint{font-size:12px;color:var(--muted)}.actions{display:flex;gap:9px;flex-wrap:wrap;align-items:center}.statusLine{font-size:13px;color:var(--muted);margin-top:8px}.toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,20px);background:rgba(25,27,32,.9);color:#fff;padding:12px 16px;border-radius:999px;opacity:0;pointer-events:none;transition:.2s;box-shadow:0 8px 25px rgba(0,0,0,.2);font-size:13px;backdrop-filter:blur(15px);-webkit-backdrop-filter:blur(15px)}.toast.show{opacity:1;transform:translate(-50%,0)}
+@media(max-width:760px){.grid{grid-template-columns:1fr 1fr}.details{grid-template-columns:1fr}}@media(max-width:560px){.app{padding:16px 12px 40px}.top{align-items:flex-start}.title{font-size:23px}.top>.btn{padding:9px 13px}.grid{grid-template-columns:1fr}.section{padding:16px;border-radius:20px}}@media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style></head><body><main class="app">
-<div class="top"><div class="brand"><div class="logo">HP</div><div><div class="eyebrow">ESP32-S3 print server</div><div class="title">HP Print Server</div><div class="subtitle">JetDirect / AppSocket · TCP 9100</div></div></div><button class="btn secondary" id="refreshBtn" onclick="refreshStatus()">Refresh</button></div>
+<div class="top"><div class="brand"><div class="logo">HP</div><div><div class="eyebrow">ESP32-S3 print server</div><div class="title">HP Print Server</div><div class="subtitle">Your USB printer, available over Wi-Fi</div></div></div><button class="btn secondary" id="refreshBtn" onclick="refreshStatus()">Refresh</button></div>
 
-<div class="sectionHead" style="margin-top:18px;margin-bottom:10px"><div><h2>Printer Status</h2></div></div>
 <div class="grid">
-<div class="card glass"><div class="printerHero"><div class="printerIcon">▣</div><div><div class="label">Printer</div><div id="printer" class="value">)HTML";
+<div class="card glass"><div class="label">Printer</div><div id="printerName" class="value">)HTML";
+  html += esc(deviceName);
+  html += R"HTML(</div><div id="printerState" class="small">)HTML";
   html += esc(printerStateText());
-  html += R"HTML(</div><div id="printerPill" class="pill"><span class="dot"></span><span>)HTML";
-  html += printerAttached ? "USB connected" : "USB not detected";
-  html += R"HTML(</span></div></div></div></div>
-<div class="card glass"><div class="label">Wi-Fi</div><div id="wifi" class="value">)HTML";
+  html += R"HTML(</div><div id="printerPill" class="pill"><span class="dot )HTML";
+  html += printerAttached ? "" : "off";
+  html += R"HTML("></span><span>)HTML";
+  html += printerAttached ? "Connected by USB" : "USB printer not detected";
+  html += R"HTML(</span></div></div>
+<div class="card glass"><div class="label">Wi-Fi</div><div id="wifiName" class="value">)HTML";
+  html += esc(networkName);
+  html += R"HTML(</div><div id="wifiState" class="small">)HTML";
   html += esc(wifiStatusText());
-  html += R"HTML(</div><div class="small">Network connection</div></div>
-<div class="card glass"><div class="label">RAW 9100</div><div id="raw" class="value">Listening</div><div class="small">Transparent print stream</div></div>
+  html += R"HTML(</div></div>
+<div class="card glass"><div class="label">Printing</div><div id="raw" class="value">Ready</div><div class="small">RAW / JetDirect · TCP 9100</div></div>
 </div>
 
-<div class="section glass"><div class="sectionHead"><div><h2>USB Interface</h2><p>Select the USB interface to use. The selected interface is highlighted and its available descriptor information is shown below.</p></div></div>
-<div class="selectWrap"><select id="usbInterfaceSelect" aria-label="USB interface"><option value="printer">Printer</option><option value="scanner")HTML";
-  html += scannerInterfaceDetails == "Not detected" ? " disabled" : "";
-  html += R"HTML(>Scanner</option></select></div>
-<div id="usbInterfaceDetails" class="interfaceDetails" style="margin-top:14px;padding:15px;border-radius:16px;background:rgba(255,255,255,.42);border:1px solid rgba(255,255,255,.72)"></div>
-</div>
+<div class="section glass"><div class="sectionHead"><div><h2>Connection</h2><p>The information you need to confirm the printer is online and add it on another device.</p></div></div>
+<div class="details">
+<div class="detail"><div class="detailKey">USB printer</div><div id="usbDetail" class="detailValue">)HTML";
+  html += printerAttached ? "Connected" : "Not detected";
+  html += R"HTML(</div></div>
+<div class="detail"><div class="detailKey">Printer status</div><div id="usbStatus" class="detailValue">)HTML";
+  html += esc(usbStatusText());
+  html += R"HTML(</div></div>
+<div class="detail"><div class="detailKey">Network address</div><div id="ipDetail" class="detailValue">)HTML";
+  html += esc(ip);
+  html += R"HTML(</div></div>
+<div class="detail"><div class="detailKey">Hostname</div><div class="detailValue">printer.local</div></div>
+</div></div>
 
-<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi</h2><p>Configure the network connection independently from the USB interface.</p></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan Wi-Fi</button></div>
+<div class="section glass"><div class="sectionHead"><div><h2>How to print</h2><p>Add this server as a network printer using RAW / JetDirect (AppSocket). Print data is sent directly to the connected USB printer.</p></div></div>
+<div class="service"><strong>Printer address</strong><div id="printAddress" class="address">socket://printer.local:9100</div><div class="small">If your device does not resolve printer.local, use the network IP address shown above with port 9100.</div></div></div>
+
+<div class="section glass"><div class="sectionHead"><div><h2>Wi-Fi</h2><p>Change the Wi-Fi network used by the print server. Saving a new network restarts the device.</p></div><button class="btn secondary" id="scanBtn" onclick="scanWifi()">Scan Wi-Fi</button></div>
 <div class="selectWrap"><select id="ssidSelect"><option value="">Select a Wi-Fi network…</option></select></div>
 <div id="scanState" class="statusLine" style="display:none"></div>
 <form class="wifiForm" method="POST" action="/save"><div class="field"><label for="ssid">Wi-Fi network</label><input id="ssid" name="ssid" value=")HTML";
@@ -338,23 +274,10 @@ body:before{content:"";position:fixed;inset:0;pointer-events:none;background:lin
 </main><div id="toast" class="toast"></div>
 <script>
 const $=id=>document.getElementById(id);
-let interfaceMode=')HTML";
-  html += scannerInterfaceSelected ? "scanner" : "printer";
-  html += R"HTML(';
-const printerDetails=')HTML";
-  html += jsonEsc(String("Name: ") + deviceName + " · VID: 0x" + String(usbHost.device().vid,HEX) + " · PID: 0x" + String(usbHost.device().pid,HEX) + " · " + printerInterfaceDetails);
-  html += R"HTML(';
-const scannerDetails=')HTML";
-  html += jsonEsc(String("Name: ") + deviceName + " · VID: 0x" + String(usbHost.device().vid,HEX) + " · PID: 0x" + String(usbHost.device().pid,HEX) + " · " + scannerInterfaceDetails);
-  html += R"HTML(';
-function updateUsbInterface(){const scanner=interfaceMode==='scanner';const select=$('usbInterfaceSelect');select.value=scanner?'scanner':'printer';$('usbInterfaceDetails').innerHTML=scanner?'<strong>Scanner</strong><br>'+scannerDetails:'<strong>Printer</strong><br>'+printerDetails;}
-async function setInterfaceMode(mode){if(mode===interfaceMode){updateUsbInterface();return;}const old=interfaceMode;interfaceMode=mode;updateUsbInterface();try{const r=await fetch('/interface.json?mode='+encodeURIComponent(mode)+'&ts='+Date.now());if(!r.ok)throw new Error();const s=await r.json();interfaceMode=s.mode;updateUsbInterface();showToast(interfaceMode==='scanner'?'Scanner interface selected':'Printer interface selected');refreshStatus();}catch(e){interfaceMode=old;updateUsbInterface();showToast('USB interface change failed');}}
-$('usbInterfaceSelect').addEventListener('change',e=>setInterfaceMode(e.target.value));
 $('ssidSelect').addEventListener('change',()=>{$('ssid').value=$('ssidSelect').value;});
 async function scanWifi(){const b=$('scanBtn'),select=$('ssidSelect');b.disabled=true;b.textContent='Scanning…';select.innerHTML='<option value="">Scanning…</option>';try{const r=await fetch('/scan.json?ts='+Date.now());if(!r.ok)throw new Error();const a=await r.json();a.sort((x,y)=>y.rssi-x.rssi);select.innerHTML='<option value="">Select a Wi-Fi network…</option>';a.forEach(x=>{const o=document.createElement('option');o.value=x.ssid;o.textContent=x.ssid+' · '+x.rssi+' dBm · Ch '+x.channel;select.appendChild(o);});if(!a.length){select.innerHTML='<option value="">No visible networks found</option>';$('scanState').style.display='block';$('scanState').textContent='No visible Wi-Fi networks found.';}else{$('scanState').textContent=a.length+' nearby Wi-Fi network'+(a.length===1?'':'s')+' found.';$('scanState').style.display='block';const current=$('ssid').value;if(current&&a.some(x=>x.ssid===current))select.value=current;}}catch(e){select.innerHTML='<option value="">Scan failed</option>';$('scanState').style.display='block';$('scanState').textContent='Wi-Fi scan failed.';}finally{b.disabled=false;b.textContent='Scan Wi-Fi';}}
-async function refreshStatus(){const b=$('refreshBtn');b.disabled=true;b.textContent='Refreshing…';try{const r=await fetch('/status.json?ts='+Date.now());if(!r.ok)throw new Error();const s=await r.json();$('printer').textContent=s.printer;$('wifi').textContent=s.wifi;$('raw').textContent=s.rawConnected?'Job active':'Listening';interfaceMode=s.interfaceMode||interfaceMode;updateUsbInterface();$('printerPill').innerHTML='<span class="dot '+(s.usbAttached?'':'off')+'"></span><span>'+(s.usbAttached?'USB connected':'USB not detected')+'</span>';}catch(e){showToast('Status refresh failed');}finally{b.disabled=false;b.textContent='Refresh';}}
+async function refreshStatus(){const b=$('refreshBtn');b.disabled=true;b.textContent='Refreshing…';try{const r=await fetch('/status.json?ts='+Date.now());if(!r.ok)throw new Error();const s=await r.json();$('printerName').textContent=s.usbAttached?s.printerName:'No USB printer';$('printerState').textContent=s.printer;$('wifiName').textContent=s.ssid||'Not connected';$('wifiState').textContent=s.wifi;$('raw').textContent=s.rawConnected?'Print job active':'Ready';$('usbDetail').textContent=s.usbAttached?'Connected':'Not detected';$('usbStatus').textContent=s.usbStatus;$('ipDetail').textContent=s.ip||'Unavailable';$('printAddress').textContent='socket://'+((s.hostname&&s.hostname.length)?s.hostname:(s.ip||'printer.local'))+':9100';$('printerPill').innerHTML='<span class="dot '+(s.usbAttached?'':'off')+'"></span><span>'+(s.usbAttached?'Connected by USB':'USB printer not detected')+'</span>';}catch(e){showToast('Status refresh failed');}finally{b.disabled=false;b.textContent='Refresh';}}
 function showToast(t){const x=$('toast');x.textContent=t;x.classList.add('show');clearTimeout(window._toast);window._toast=setTimeout(()=>x.classList.remove('show'),2800);}
-updateUsbInterface();
 setInterval(refreshStatus,5000);
 </script></body></html>)HTML";
   return html;
@@ -375,12 +298,6 @@ void handleSave() {
   ESP.restart();
 }
 
-void handleUsbScan() {
-  usbHost.setInterfaceSelection(false, RAW_PRINT_INTERFACE, RAW_PRINT_ALT);
-  String out = "{\"message\":\"USB printer interface selected: IF 1 / alternate 0.\"}";
-  configServer.send(200, "application/json", out);
-}
-
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -394,16 +311,15 @@ void setup() {
 
   startRawDiscovery();
 
-  scannerInterfaceSelected = false;
+  // The printer interface is fixed internally; there is no user-facing USB
+  // interface selector. This preserves the existing RAW printing path.
   usbHost.setInterfaceSelection(false, RAW_PRINT_INTERFACE, RAW_PRINT_ALT);
   usbPrinterBackend.begin();
 
   configServer.on("/", HTTP_GET, handleRoot);
   configServer.on("/scan.json", HTTP_GET, sendJsonScan);
   configServer.on("/status.json", HTTP_GET, sendJsonStatus);
-  configServer.on("/interface.json", HTTP_GET, handleInterfaceMode);
   configServer.on("/save", HTTP_POST, handleSave);
-  configServer.on("/usb-scan", HTTP_GET, handleUsbScan);
   configServer.begin();
 
   Serial.println("[HTTP] Configuration server ready");

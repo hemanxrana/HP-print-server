@@ -2,7 +2,7 @@
 
 Arduino IDE firmware for an **ESP32-S3** wireless print server for USB-connected printers, currently focused on transparent HP RAW/JetDirect-style printing.
 
-## Current architecture
+## Architecture
 
 ```text
 PC / Android / network print client
@@ -13,38 +13,44 @@ ESP32-S3 Wi-Fi RAW server
           |
           | byte-for-byte USB Bulk OUT
           v
-USB Printer Class interface
+classic USB Printer Class interface
           |
           v
 HP printer
 ```
 
-The network printing path is intentionally small:
+The print path is intentionally small:
 
-- **TCP 9100 only**
+- TCP 9100 only
 - no IPP server
-- no HTTP print protocol
-- no Content-Length handling for print data
-- no print queue or LittleFS spool
-- no PDF/PWG/URF/PCLm conversion
-- no print-language modification
-- USB Printer Class interface and Bulk OUT endpoint are discovered from descriptors
-- automatic interface selection prefers the standard bidirectional Printer Class protocol `0x02`
-- manual interface + alternate-setting selection is available from the configuration page
+- no document conversion
+- no print queue or spool
+- no automatic PJL/UEL/form-feed injection
+- no scanner support
+- USB Printer Class interfaces and Bulk endpoints are discovered from descriptors
+- the firmware automatically selects the best RAW-compatible classic Printer Class interface
 
-The ESP32 forwards the received bytes unchanged to the selected USB Bulk OUT endpoint.
+## USB protocol policy
+
+For RAW printing, the firmware accepts classic USB Printer Class protocols:
+
+- `0x01` — unidirectional
+- `0x02` — bidirectional, preferred
+- `0x03` — IEEE 1284.4-compatible
+
+Printer Class protocol `0x04` is **IPP-over-USB** and is deliberately not used as a transparent RAW transport. Vendor-specific protocol `0xFF` is also ignored unless a future device-specific implementation explicitly verifies it.
+
+The selected interface is automatic; there is no user-facing USB interface selector.
 
 ## Important RAW limitation
 
-TCP 9100 is a **transport**, not a document format. The data sent to port 9100 must already be a print stream understood by the printer, such as a valid PCL/PJL stream supported by the connected HP printer.
+TCP 9100 is a transport, not a document format. The data sent to port 9100 must already be a print stream understood by the connected printer, such as a supported PCL/PJL stream.
 
-The firmware deliberately does **not** append a form-feed, PJL `EOJ`, UEL, or other bytes at the end of a job. Adding such bytes would make the server non-transparent and can corrupt formats it does not understand.
-
-After the TCP connection ends, the firmware waits briefly for the final USB transfer to drain before returning the printer backend to Ready. This is transport cleanup only; it does not change the print data.
+The firmware deliberately forwards bytes unchanged. A successful USB Bulk OUT transfer proves that the ESP32 delivered the bytes to the printer; it does not prove that the printer understood the document or physically completed the page.
 
 ## Configuration
 
-On first boot, if no Wi-Fi credentials are saved, the ESP32 starts:
+On first boot, or when saved Wi-Fi cannot be reached, the ESP32 starts a setup access point:
 
 ```text
 SSID:     HP-Print-Server
@@ -57,71 +63,78 @@ Open:
 http://192.168.4.1/
 ```
 
-After Wi-Fi configuration, the web page is available at the ESP32's assigned IP address.
+After Wi-Fi configuration, the dashboard is available at the assigned IP address and, when mDNS starts successfully:
 
-The configuration page provides:
+```text
+http://printer.local/
+```
 
-- Wi-Fi SSID/password
-- nearby Wi-Fi scan
-- USB printer/interface information
-- automatic USB interface selection
-- manual interface/alternate-setting selection
+The dashboard provides:
+
+- printer connection and readiness
+- human-readable USB printer status
+- Wi-Fi network and IP address
 - RAW 9100 status
+- printer address for AppSocket/JetDirect setup
+- Wi-Fi scanning and configuration
 
 ## Printing
 
-Connect the client to:
+Connect a print client to:
 
 ```text
 <ESP32-IP>:9100
 ```
 
-The firmware accepts a TCP stream and forwards it directly to USB.
-
-For example, a Windows Standard TCP/IP printer port can target the ESP32 IP address with RAW protocol on port `9100`.
-
-## USB
-
-The USB implementation:
-
-- enumerates USB Printer Class interfaces
-- discovers Bulk OUT/Bulk IN endpoints dynamically
-- prefers protocol `0x02` when multiple Printer Class interfaces exist
-- supports manual interface selection for diagnostics
-- handles USB disconnect/reconnect
-- uses the production USB Bulk OUT transfer path
-
-For the HP Smart Tank 520/540-family device tested during development, the useful interface was:
+or, when mDNS works on the client:
 
 ```text
-Printer Class protocol: 0x02
-Bulk OUT: 0x08
-Bulk IN:  0x89
+printer.local:9100
 ```
 
-Endpoint numbers are **not hard-coded**; the firmware obtains them from the USB descriptors.
+A Windows Standard TCP/IP printer port can use RAW protocol on port `9100`.
+
+## USB behavior
+
+The USB host implementation:
+
+- enumerates classic USB Printer Class interfaces
+- discovers Bulk OUT/Bulk IN endpoints dynamically
+- prefers protocol `0x02`
+- uses alternate setting `0` only as a tie-breaker, not as a hard-coded requirement
+- optionally uses a separate suitable Printer Class interface for `GET_PORT_STATUS`
+- handles USB disconnect/reconnect
+- suppresses repeated identical status logging
+
+## RAW job handling
+
+The server accepts one active TCP 9100 client at a time.
+
+- TCP receive data is forwarded in bounded chunks so the main loop remains responsive.
+- USB writes are synchronously checked for completion.
+- After TCP closes, a short non-blocking drain period prevents a following job from colliding with the printer's final USB consumption.
+- Aborted jobs reset their byte accounting before the next job.
+
+## Wi-Fi behavior
+
+- Saved Wi-Fi is attempted at boot.
+- If connection fails, the configuration AP is started.
+- The firmware periodically retries the saved Wi-Fi network.
+- If Wi-Fi later recovers, the temporary configuration AP is stopped.
+- The dashboard only shows `printer.local` when mDNS actually started successfully.
 
 ## Arduino ESP32 core
 
-Use **Arduino-ESP32 3.3.10** as the project baseline.
+Project baseline:
 
-For the ESP32-S3 USB-host portion:
+- Arduino IDE
+- `esp32` by Espressif Systems
+- Arduino-ESP32 **3.3.10**
+- ESP32-S3 board target
+- Serial Monitor: **115200 baud**
 
-1. Install Arduino IDE.
-2. Install `esp32` by Espressif Systems.
-3. Use Arduino-ESP32 3.3.10.
-4. Select the appropriate ESP32-S3 board.
-5. Open `HP-print-server.ino`.
-6. Compile and upload.
-7. Open Serial Monitor at 115200 baud.
+Open `HP-print-server.ino`, compile, upload, and test with the real printer.
 
-## What was removed
+## Repository policy
 
-The RAW-only firmware no longer contains the previous mobile IPP stack, IPP compatibility profiles, IPP queue/spool, outbound IPP transport, or legacy network-printer discovery helpers. This keeps the Arduino sketch focused on the one active print path: **TCP 9100 → USB Bulk OUT**.
-
-## Physical printer errors
-
-A successful USB Bulk OUT transfer only proves that the ESP32 USB host delivered the bytes to the printer. It does not prove that the printer accepted the document format or physically completed the page.
-
-If the printer reports a paper/page/format error after a RAW job, the first thing to verify is the **actual byte stream sent to TCP 9100**. The ESP32 intentionally does not convert or repair that stream.
-
+Only normal source code and the Arduino compile workflow should live in the repository. Temporary source-editing workflows and scratch files are intentionally excluded.

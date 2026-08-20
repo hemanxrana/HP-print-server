@@ -6,6 +6,7 @@ namespace {
 constexpr uint16_t RAW_PORT = 9100;
 constexpr uint32_t RAW_IDLE_TIMEOUT_MS = 300000;
 constexpr uint32_t RAW_JOB_DRAIN_MS = 3000;
+constexpr uint32_t RAW_CLOSE_GUARD_MS = 250;
 constexpr size_t RAW_RX_CHUNK = 4096;
 constexpr size_t RAW_POLL_BUDGET = 16384;
 constexpr size_t RAW_USB_CHUNK = 1024;
@@ -16,6 +17,8 @@ WiFiClient rawClient;
 bool rawServerStarted = false;
 unsigned long rawLastDataMs = 0;
 uint64_t rawBytesReceived = 0;
+bool rawTransportClosing = false;
+unsigned long rawTransportCloseAtMs = 0;
 static uint8_t rawChunk[RAW_RX_CHUNK];
 
 bool selectedInterfaceUsable(const UsbHostManager &host) {
@@ -56,15 +59,43 @@ bool sendUsbChunk(UsbHostManager &host, const uint8_t *data, size_t length, Stri
 }
 
 void finishRawConnection(UsbPrinterBackend *backend, const char *reason) {
+  if (rawTransportClosing) return;
   if (backend) backend->finishRawJob();
-  if (rawClient) rawClient.stop();
-  Serial.printf("[RAW] TCP 9100 job ended (%s, %llu bytes)\n",
+
+  // Keep the transport reserved for the same drain interval used by the
+  // known-good blocking implementation. This prevents a phone/spooler from
+  // opening a follow-up TCP 9100 connection while the backend is still in
+  // PRINTING/draining state and having that new connection reset immediately.
+  rawTransportClosing = true;
+  rawTransportCloseAtMs = millis() + RAW_JOB_DRAIN_MS + RAW_CLOSE_GUARD_MS;
+
+  Serial.printf("[RAW] TCP 9100 job ended (%s, %llu bytes); draining before socket release\n",
                 reason, (unsigned long long)rawBytesReceived);
   rawBytesReceived = 0;
 }
 
+void serviceRawTransportClose() {
+  if (!rawTransportClosing) return;
+  if ((int32_t)(millis() - rawTransportCloseAtMs) < 0) return;
+
+  if (rawClient) rawClient.stop();
+  rawClient = WiFiClient();
+  rawTransportClosing = false;
+  rawTransportCloseAtMs = 0;
+  Serial.println("[RAW] TCP 9100 socket released after drain guard");
+}
+
 void handleRawServer(UsbPrinterBackend *backend) {
   if (!rawServerStarted) return;
+
+  // Do not dequeue another connection while the previous print job is still
+  // inside its printer drain/close guard. The old implementation achieved the
+  // same effect by blocking the whole loop for 3.25 seconds; this keeps the
+  // loop responsive without resetting a legitimate follow-up client.
+  if (rawTransportClosing) {
+    serviceRawTransportClose();
+    return;
+  }
 
   if (!rawClient) {
     WiFiClient incoming = rawServer.available();
@@ -100,6 +131,7 @@ void handleRawServer(UsbPrinterBackend *backend) {
                     (unsigned long long)rawBytesReceived, error.c_str());
       backend->abortRawJob(error);
       rawClient.stop();
+      rawClient = WiFiClient();
       rawBytesReceived = 0;
       return;
     }
@@ -134,7 +166,7 @@ void startRawServerIfNeeded() {
 } // namespace
 
 bool UsbPrinterBackend::rawClientConnected() const {
-  return (bool)rawClient;
+  return (bool)rawClient && !rawTransportClosing;
 }
 
 bool UsbPrinterBackend::begin() {

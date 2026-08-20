@@ -31,6 +31,7 @@ static unsigned long lastStatus = 0;
 static unsigned long lastWifiRetry = 0;
 static bool mdnsReady = false;
 static bool configApActive = false;
+static bool wifiSleepConfigured = false;
 
 String esc(String s) {
   s.replace("&", "&amp;");
@@ -75,6 +76,13 @@ bool saveConfig() {
   return ssidOk && passOk;
 }
 
+void configureConnectedWiFi() {
+  if (WiFi.status() != WL_CONNECTED || wifiSleepConfigured) return;
+  WiFi.setSleep(false);
+  wifiSleepConfigured = true;
+  Serial.println("[WiFi] Power saving disabled for mDNS reliability");
+}
+
 bool connectWiFi() {
   if (config.ssid.isEmpty()) {
     Serial.println("[WiFi] No saved SSID");
@@ -96,9 +104,11 @@ bool connectWiFi() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.printf("[WiFi] Connection failed, status=%d\n", (int)WiFi.status());
     WiFi.disconnect(false, false);
+    wifiSleepConfigured = false;
     return false;
   }
 
+  configureConnectedWiFi();
   Serial.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
   return true;
 }
@@ -118,24 +128,43 @@ bool startConfigAP() {
 }
 
 void startRawDiscovery() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    mdnsReady = false;
+    Serial.println("[mDNS] Not started: Wi-Fi is not connected");
+    return;
+  }
+
   MDNS.end();
   mdnsReady = false;
   if (!MDNS.begin(RAW_HOSTNAME)) {
-    Serial.println("[mDNS] Failed to start printer.local discovery responder");
+    Serial.printf("[mDNS] Failed to start %s.local at %s\n",
+                  RAW_HOSTNAME, WiFi.localIP().toString().c_str());
     return;
   }
+
+  mdnsReady = true;
   MDNS.setInstanceName("HP Print Server");
-  if (MDNS.addService("pdl-datastream", "tcp", 9100)) {
+
+  const bool httpService = MDNS.addService("http", "tcp", 80);
+  const bool rawService = MDNS.addService("pdl-datastream", "tcp", 9100);
+  if (rawService) {
     MDNS.addServiceTxt("pdl-datastream", "tcp", "txtvers", "1");
     MDNS.addServiceTxt("pdl-datastream", "tcp", "note", "RAW 9100");
-    mdnsReady = true;
-    Serial.println("[mDNS] printer.local -> RAW 9100 discovery advertised");
+  }
+
+  Serial.printf("[mDNS] Hostname active: %s.local -> %s\n",
+                RAW_HOSTNAME, WiFi.localIP().toString().c_str());
+  Serial.printf("[mDNS] Services: HTTP/80=%s RAW/9100=%s\n",
+                httpService ? "advertised" : "failed",
+                rawService ? "advertised" : "failed");
+  if (!httpService || !rawService) {
+    Serial.println("[mDNS] Hostname responder is active, but one or more service advertisements failed");
   }
 }
 
 void maintainWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
+    configureConnectedWiFi();
     if (configApActive) {
       WiFi.softAPdisconnect(true);
       configApActive = false;
@@ -145,12 +174,18 @@ void maintainWiFi() {
     return;
   }
 
+  if (mdnsReady) {
+    Serial.println("[mDNS] Wi-Fi disconnected; hostname responder will restart after reconnection");
+    MDNS.end();
+  }
   mdnsReady = false;
+  wifiSleepConfigured = false;
   if (config.ssid.isEmpty()) return;
   if (millis() - lastWifiRetry < WIFI_RETRY_INTERVAL_MS) return;
   lastWifiRetry = millis();
   Serial.println("[WiFi] Connection lost; retrying saved network");
   WiFi.mode(configApActive ? WIFI_AP_STA : WIFI_STA);
+  WiFi.setHostname(RAW_HOSTNAME);
   WiFi.begin(config.ssid.c_str(), config.password.c_str());
 }
 

@@ -2,19 +2,13 @@
 #include <Arduino.h>
 #include "usb_host_manager.h"
 
-void ensureUsbScannerWebRoutesInstalled();
-
 class UsbPrinterBackend {
 public:
   enum PrinterState : uint8_t { OFFLINE, IDLE, PRINTING, ERROR };
   explicit UsbPrinterBackend(UsbHostManager &host) : host_(host) {}
   bool begin();
   void poll();
-  PrinterState state() const {
-    // The scanner browser page is independent of the USB print transport.
-    ensureUsbScannerWebRoutesInstalled();
-    return state_;
-  }
+  PrinterState state() const { return state_; }
   bool online() const { return state_ == IDLE; }
   const String &statusReason() const { return reason_; }
   const UsbDeviceInfo &device() const { return host_.device(); }

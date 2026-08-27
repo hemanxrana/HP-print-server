@@ -300,7 +300,7 @@ static void scannerUsbTask(void *) {
   scanExistingDevices();
 
   while (true) {
-    const esp_err_t eventResult = usb_host_client_handle_events(g.client, pdMS_TO_TICKS(50));
+    const esp_err_t eventResult = usb_host_client_handle_events(g.client, pdMS_TO_TICKS(100));
     if (eventResult != ESP_OK && eventResult != ESP_ERR_TIMEOUT) {
       Serial.printf("[SCAN] USB event error: %s\n", esp_err_to_name(eventResult));
     }
@@ -939,7 +939,7 @@ static void scannerProxyTask(void *) {
       WiFiClient incoming = server.available();
       if (incoming) handleScannerHttpClient(incoming);
     }
-    vTaskDelay(pdMS_TO_TICKS(5));
+    vTaskDelay(pdMS_TO_TICKS(25));
   }
 }
 } // namespace

@@ -2,7 +2,6 @@
 #include <Arduino.h>
 #include "usb_host_manager.h"
 
-void ensureUsbScannerBackendStarted();
 void ensureUsbScannerWebRoutesInstalled();
 
 class UsbPrinterBackend {
@@ -12,11 +11,7 @@ public:
   bool begin();
   void poll();
   PrinterState state() const {
-    // Lazy-start the independent scanner client only after the normal Arduino
-    // setup path has installed the USB host library. Scanner failure is
-    // intentionally non-fatal to printing. The browser fallback routes are
-    // installed alongside the scanner service and do not alter print handling.
-    ensureUsbScannerBackendStarted();
+    // The scanner browser page is independent of the USB print transport.
     ensureUsbScannerWebRoutesInstalled();
     return state_;
   }

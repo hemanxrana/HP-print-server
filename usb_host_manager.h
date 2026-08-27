@@ -25,6 +25,14 @@ public:
   bool bulkWrite(const uint8_t *data, size_t length, size_t &accepted,
                  uint32_t timeoutMs, String &error);
 
+  // Optional USB Printer Class Bulk-IN backchannel. These methods are
+  // non-blocking and do not affect the existing Bulk-OUT print path.
+  bool backchannelSupported() const;
+  size_t backchannelAvailable() const;
+  size_t readBackchannel(uint8_t *data, size_t capacity);
+  void clearBackchannel();
+  uint32_t backchannelDroppedBytes() const;
+
   bool portStatusValid() const { return device_.portStatus.valid; }
   uint8_t portStatusValue() const { return device_.portStatus.value; }
   bool portStatusError() const { return device_.portStatus.error; }

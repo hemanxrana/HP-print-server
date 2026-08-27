@@ -2,6 +2,7 @@
 #include "esp_intr_alloc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include "usb/usb_host.h"
 #include "usb/usb_helpers.h"
@@ -17,6 +18,7 @@ static constexpr uint8_t USB_PRINTER_STATUS_REQUEST_TYPE = 0xA1;
 static constexpr int MAX_ALREADY_CONNECTED_DEVICES = 8;
 static constexpr uint32_t STATUS_POLL_INTERVAL_MS = 1000;
 static constexpr uint32_t STATUS_TRANSFER_TIMEOUT_MS = 1000;
+static constexpr size_t BACKCHANNEL_BUFFER_BYTES = 4096;
 
 struct TransferWait { SemaphoreHandle_t done = nullptr; };
 
@@ -36,6 +38,15 @@ struct Runtime {
   volatile bool deviceGone = false;
   volatile bool statusPending = false;
   volatile usb_transfer_t *statusTransfer = nullptr;
+
+  // One continuously outstanding Bulk-IN transfer provides a true printer
+  // backchannel without changing the existing synchronous Bulk-OUT path.
+  usb_transfer_t *backchannelTransfer = nullptr;
+  StreamBufferHandle_t backchannelBuffer = nullptr;
+  volatile bool backchannelEnabled = false;
+  volatile uint32_t backchannelDropped = 0;
+  uint8_t backchannelEndpoint = 0;
+  uint16_t backchannelPacketSize = 0;
 
   TaskHandle_t clientTask = nullptr;
   TaskHandle_t hostTask = nullptr;
@@ -124,6 +135,11 @@ static int selectedStatusIndex(const UsbDeviceInfo &d, int printIndex) {
   return best;
 }
 
+static void resetBackchannelBuffer() {
+  if (g.backchannelBuffer) xStreamBufferReset(g.backchannelBuffer);
+  g.backchannelDropped = 0;
+}
+
 static void resetDevice() {
   g.device = nullptr;
   g.address = 0;
@@ -133,10 +149,15 @@ static void resetDevice() {
   g.claimedPrintInterface = 0;
   g.claimedStatusInterface = 0;
   g.statusTransfer = nullptr;
+  g.backchannelEnabled = false;
+  g.backchannelEndpoint = 0;
+  g.backchannelPacketSize = 0;
+  resetBackchannelBuffer();
 }
 
 static void releaseInterfaces() {
   if (!g.deviceOpen || !g.device) return;
+  g.backchannelEnabled = false;
   if (g.statusInterfaceClaimed) {
     usb_host_interface_release(g.client, g.device, g.claimedStatusInterface);
     g.statusInterfaceClaimed = false;
@@ -313,9 +334,104 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
   return true;
 }
 
+static void backchannelTransferCallback(usb_transfer_t *t) {
+  if (!t) return;
+
+  const bool stillActive = g.backchannelEnabled && g.deviceOpen &&
+      g.printInterfaceClaimed && g.device == t->device_handle &&
+      g.backchannelEndpoint == t->bEndpointAddress;
+
+  if (t->status == USB_TRANSFER_STATUS_COMPLETED) {
+    if (t->actual_num_bytes > 0 && g.backchannelBuffer) {
+      const size_t pushed = xStreamBufferSend(g.backchannelBuffer,
+                                               t->data_buffer,
+                                               t->actual_num_bytes,
+                                               0);
+      if (pushed < t->actual_num_bytes) {
+        g.backchannelDropped += (uint32_t)(t->actual_num_bytes - pushed);
+      }
+    }
+
+    if (stillActive) {
+      t->num_bytes = g.backchannelPacketSize;
+      const esp_err_t submit = usb_host_transfer_submit(t);
+      if (submit == ESP_OK) return;
+      Serial.printf("[USB] Backchannel resubmit failed: %s; continuing print-only\n",
+                    esp_err_to_name(submit));
+    }
+  } else if (t->status != USB_TRANSFER_STATUS_NO_DEVICE &&
+             t->status != USB_TRANSFER_STATUS_CANCELED) {
+    Serial.printf("[USB] Backchannel disabled after transfer status=%d; continuing print-only\n",
+                  (int)t->status);
+  }
+
+  g.backchannelEnabled = false;
+  g.backchannelTransfer = nullptr;
+  usb_host_transfer_free(t);
+}
+
+static void startBackchannel() {
+  if (!manager || !g.deviceOpen || !g.printInterfaceClaimed) return;
+  const UsbPrinterInterfaceInfo *print = manager->selectedInterface();
+  if (!print || !print->bulkIn.valid()) {
+    Serial.println("[USB] Printer has no Bulk IN backchannel; RAW printing remains one-way");
+    return;
+  }
+
+  if (g.backchannelTransfer) {
+    Serial.println("[USB] Previous Bulk IN transfer is still finalizing; backchannel remains disabled for this attachment");
+    return;
+  }
+
+  if (!g.backchannelBuffer) {
+    g.backchannelBuffer = xStreamBufferCreate(BACKCHANNEL_BUFFER_BYTES, 1);
+    if (!g.backchannelBuffer) {
+      Serial.println("[USB] Could not allocate backchannel buffer; continuing print-only");
+      return;
+    }
+  }
+  resetBackchannelBuffer();
+
+  const uint16_t packetSize = print->bulkIn.maxPacketSize ? print->bulkIn.maxPacketSize : 64;
+  usb_transfer_t *t = nullptr;
+  const esp_err_t alloc = usb_host_transfer_alloc(packetSize, 0, &t);
+  if (alloc != ESP_OK || !t) {
+    Serial.printf("[USB] Could not allocate Bulk IN backchannel transfer: %s; continuing print-only\n",
+                  esp_err_to_name(alloc));
+    return;
+  }
+
+  g.backchannelEndpoint = print->bulkIn.address;
+  g.backchannelPacketSize = packetSize;
+  g.backchannelEnabled = true;
+  g.backchannelTransfer = t;
+
+  t->num_bytes = packetSize;
+  t->device_handle = g.device;
+  t->bEndpointAddress = g.backchannelEndpoint;
+  t->callback = backchannelTransferCallback;
+  t->context = nullptr;
+  t->timeout_ms = 0;
+
+  const esp_err_t submit = usb_host_transfer_submit(t);
+  if (submit != ESP_OK) {
+    g.backchannelEnabled = false;
+    g.backchannelTransfer = nullptr;
+    usb_host_transfer_free(t);
+    Serial.printf("[USB] Could not start Bulk IN backchannel: %s; continuing print-only\n",
+                  esp_err_to_name(submit));
+    return;
+  }
+
+  Serial.printf("[USB] Full-duplex backchannel enabled on IN=0x%02X MPS=%u buffer=%u bytes\n",
+                g.backchannelEndpoint, g.backchannelPacketSize,
+                (unsigned)BACKCHANNEL_BUFFER_BYTES);
+}
+
 static void publish(const UsbDeviceInfo &d) {
   if (!manager) return;
   manager->onEnumerated(d);
+  startBackchannel();
   Serial.printf("[USB] Printer ready: %s VID=0x%04X PID=0x%04X address=%u\n",
                 d.product.length() ? d.product.c_str() : "USB Printer",
                 d.vid, d.pid, d.address);
@@ -429,6 +545,7 @@ static void clientTask(void *) {
 
     if (g.deviceGone) {
       g.deviceGone = false;
+      g.backchannelEnabled = false;
       closeDevice();
       if (manager) manager->onDetached();
     }
@@ -515,6 +632,27 @@ const UsbPrinterInterfaceInfo *UsbHostManager::selectedInterface() const {
 
 const UsbPrinterInterfaceInfo *UsbHostManager::statusInterface() const {
   return device_.statusInterface.found ? &device_.statusInterface : nullptr;
+}
+
+bool UsbHostManager::backchannelSupported() const {
+  return device_.printer.found && device_.printer.bulkIn.valid() && g.backchannelEnabled;
+}
+
+size_t UsbHostManager::backchannelAvailable() const {
+  return g.backchannelBuffer ? xStreamBufferBytesAvailable(g.backchannelBuffer) : 0;
+}
+
+size_t UsbHostManager::readBackchannel(uint8_t *data, size_t capacity) {
+  if (!data || !capacity || !g.backchannelBuffer) return 0;
+  return xStreamBufferReceive(g.backchannelBuffer, data, capacity, 0);
+}
+
+void UsbHostManager::clearBackchannel() {
+  if (g.backchannelBuffer) xStreamBufferReset(g.backchannelBuffer);
+}
+
+uint32_t UsbHostManager::backchannelDroppedBytes() const {
+  return g.backchannelDropped;
 }
 
 bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accepted,
@@ -630,6 +768,7 @@ void UsbHostManager::onEnumerated(const UsbDeviceInfo &info) {
 void UsbHostManager::onDetached() {
   if (device_.attached) Serial.println("[USB] Device disconnected");
   device_ = UsbDeviceInfo{};
+  clearBackchannel();
   error_.clear();
   state_ = started_ ? RUNNING : STOPPED;
 }

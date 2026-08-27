@@ -12,6 +12,7 @@ constexpr uint32_t RAW_CLOSE_GUARD_MS = 250;
 constexpr size_t RAW_RX_CHUNK = 4096;
 constexpr size_t RAW_POLL_BUDGET = 16384;
 constexpr size_t RAW_USB_CHUNK = 1024;
+constexpr size_t RAW_BACKCHANNEL_CHUNK = 512;
 constexpr uint32_t RAW_USB_TIMEOUT_MS = 30000;
 
 WiFiServer rawServer(RAW_PORT);
@@ -19,12 +20,16 @@ WiFiClient rawClient;
 bool rawServerStarted = false;
 unsigned long rawLastDataMs = 0;
 uint64_t rawBytesReceived = 0;
+uint64_t rawBackchannelBytesSent = 0;
 uint32_t rawJobSequence = 0;
 uint32_t rawActiveJobId = 0;
 bool rawTransportClosing = false;
 bool rawCloseGuardStarted = false;
 unsigned long rawTransportCloseAtMs = 0;
 static uint8_t rawChunk[RAW_RX_CHUNK];
+static uint8_t rawBackchannelChunk[RAW_BACKCHANNEL_CHUNK];
+size_t rawBackchannelPending = 0;
+size_t rawBackchannelOffset = 0;
 
 enum class RawPeerState : uint8_t {
   OPEN,
@@ -48,10 +53,6 @@ RawPeerState rawPeerState(int &socketError) {
   errno = 0;
   const int result = recv(fd, &byte, 1, MSG_DONTWAIT | MSG_PEEK);
 
-  // POSIX TCP semantics: recv()==0 is an orderly shutdown (peer FIN). Check
-  // this before errno. Arduino-ESP32 3.3.10 NetworkClient::connected() does
-  // not make that distinction reliably, so RAW job boundaries are detected
-  // directly from the socket here.
   if (result == 0) return RawPeerState::CLEAN_FIN;
   if (result > 0) return RawPeerState::OPEN;
 
@@ -72,8 +73,6 @@ RawPeerState rawPeerState(int &socketError) {
       return RawPeerState::ERROR;
 
     default:
-      // For strict job accounting, an unexpected socket error is not treated
-      // as a successful print-job terminator.
       return RawPeerState::ERROR;
   }
 }
@@ -115,9 +114,45 @@ bool sendUsbChunk(UsbHostManager &host, const uint8_t *data, size_t length, Stri
   return true;
 }
 
+void serviceRawBackchannel(UsbHostManager &host) {
+  // Without a TCP client, leave asynchronous USB replies buffered. They are
+  // cleared exactly once before the next network job is accepted, avoiding a
+  // reset/write race with the USB callback while still preventing cross-job
+  // response leakage.
+  if (!rawClientAllocated()) {
+    rawBackchannelPending = 0;
+    rawBackchannelOffset = 0;
+    return;
+  }
+
+  const int writableNow = rawClient.availableForWrite();
+  if (writableNow <= 0) return;
+
+  if (rawBackchannelPending == 0) {
+    const size_t available = host.backchannelAvailable();
+    if (!available) return;
+    const size_t want = min(available, sizeof(rawBackchannelChunk));
+    rawBackchannelPending = host.readBackchannel(rawBackchannelChunk, want);
+    rawBackchannelOffset = 0;
+    if (!rawBackchannelPending) return;
+  }
+
+  const size_t want = min(rawBackchannelPending, (size_t)writableNow);
+  const size_t sent = rawClient.write(rawBackchannelChunk + rawBackchannelOffset, want);
+  if (!sent) return;
+
+  rawBackchannelOffset += sent;
+  rawBackchannelPending -= sent;
+  rawBackchannelBytesSent += sent;
+  if (rawBackchannelPending == 0) rawBackchannelOffset = 0;
+}
+
 void resetRawTransportState() {
   rawClient = WiFiClient();
   rawBytesReceived = 0;
+  rawBackchannelBytesSent = 0;
+  rawBackchannelPending = 0;
+  rawBackchannelOffset = 0;
   rawActiveJobId = 0;
   rawTransportClosing = false;
   rawCloseGuardStarted = false;
@@ -127,12 +162,14 @@ void resetRawTransportState() {
 void abortRawConnection(UsbPrinterBackend *backend, const String &reason) {
   const uint32_t jobId = rawActiveJobId;
   const uint64_t bytes = rawBytesReceived;
+  const uint64_t backchannel = rawBackchannelBytesSent;
 
   if (backend && bytes > 0) backend->abortRawJob(reason);
   if (rawClientAllocated()) rawClient.stop();
 
-  Serial.printf("[RAW] Job #%u INCOMPLETE after %llu USB-confirmed bytes: %s\n",
+  Serial.printf("[RAW] Job #%u INCOMPLETE after %llu USB-confirmed bytes (backchannel %llu bytes): %s\n",
                 jobId, (unsigned long long)bytes,
+                (unsigned long long)backchannel,
                 reason.length() ? reason.c_str() : "unknown transport failure");
   resetRawTransportState();
 }
@@ -140,8 +177,6 @@ void abortRawConnection(UsbPrinterBackend *backend, const String &reason) {
 void finishRawConnection(UsbPrinterBackend *backend, const char *reason) {
   if (rawTransportClosing) return;
 
-  // A zero-byte TCP probe is not a print job and must not consume the normal
-  // printer drain interval.
   if (rawBytesReceived == 0) {
     Serial.printf("[RAW] TCP 9100 connection #%u closed without print data (%s)\n",
                   rawActiveJobId, reason);
@@ -155,9 +190,6 @@ void finishRawConnection(UsbPrinterBackend *backend, const char *reason) {
   rawCloseGuardStarted = false;
   rawTransportCloseAtMs = 0;
 
-  // At this point the peer has sent a clean FIN, lwIP has no unread TCP bytes,
-  // and rawBytesReceived counts only data that sendDirect() confirmed was fully
-  // accepted by USB. Keep the socket reserved until printer drain completes.
   Serial.printf("[RAW] Job #%u input complete (%s): %llu bytes USB-confirmed; waiting for printer drain\n",
                 rawActiveJobId, reason,
                 (unsigned long long)rawBytesReceived);
@@ -165,9 +197,6 @@ void finishRawConnection(UsbPrinterBackend *backend, const char *reason) {
 
 void serviceRawTransportClose(UsbPrinterBackend *backend) {
   if (!rawTransportClosing) return;
-
-  // Do not use only a wall-clock approximation here. The TCP job is not
-  // declared complete until the backend itself has left PRINTING/draining.
   if (backend && backend->state() == UsbPrinterBackend::PRINTING) return;
 
   if (!rawCloseGuardStarted) {
@@ -182,28 +211,24 @@ void serviceRawTransportClose(UsbPrinterBackend *backend) {
 
   const uint32_t jobId = rawActiveJobId;
   const uint64_t bytes = rawBytesReceived;
+  const uint64_t backchannel = rawBackchannelBytesSent;
   const bool backendReady = !backend || backend->state() == UsbPrinterBackend::IDLE;
   const String finalReason = backend ? backend->statusReason() : String();
 
-  // The peer has already sent FIN. stop() here releases our local TCP PCB after
-  // all input and USB work is complete; no print data is discarded by this
-  // close because available()==0 was required before entering the drain state.
   if (rawClientAllocated()) rawClient.stop();
 
-  Serial.printf("[RAW] Job #%u COMPLETE: %llu bytes received and accepted by USB; printer-state=%s%s%s\n",
+  Serial.printf("[RAW] Job #%u COMPLETE: %llu bytes accepted by USB, %llu backchannel bytes returned; printer-state=%s%s%s\n",
                 jobId, (unsigned long long)bytes,
+                (unsigned long long)backchannel,
                 backendReady ? "ready" : "not-ready",
                 finalReason.length() ? " reason=" : "",
                 finalReason.length() ? finalReason.c_str() : "");
   resetRawTransportState();
 }
 
-void handleRawServer(UsbPrinterBackend *backend) {
+void handleRawServer(UsbPrinterBackend *backend, UsbHostManager &host) {
   if (!rawServerStarted) return;
 
-  // Preserve the current job slot until its USB drain and close guard finish.
-  // A follow-up Windows/phone connection remains queued in the TCP listener
-  // instead of being dequeued and reset while the prior job is finalizing.
   if (rawTransportClosing) {
     serviceRawTransportClose(backend);
     return;
@@ -218,13 +243,20 @@ void handleRawServer(UsbPrinterBackend *backend) {
         incoming.stop();
         return;
       }
+
+      // Drop unsolicited/stale USB replies from before this TCP session. From
+      // this point onward, Bulk-IN data belongs to this job's backchannel.
+      host.clearBackchannel();
       rawClient = incoming;
       rawClient.setNoDelay(true);
       rawClient.setTimeout(RAW_IDLE_TIMEOUT_MS);
       rawLastDataMs = millis();
       rawBytesReceived = 0;
+      rawBackchannelBytesSent = 0;
+      rawBackchannelPending = 0;
+      rawBackchannelOffset = 0;
       rawActiveJobId = ++rawJobSequence;
-      Serial.printf("[RAW] Job #%u TCP 9100 client connected; transparent USB pass-through\n",
+      Serial.printf("[RAW] Job #%u TCP 9100 client connected; full-duplex when USB Bulk IN is available\n",
                     rawActiveJobId);
     }
     return;
@@ -233,9 +265,6 @@ void handleRawServer(UsbPrinterBackend *backend) {
   bool movedData = false;
   size_t movedThisPoll = 0;
 
-  // Drain receive data even after the peer has sent FIN. TCP close is not the
-  // job boundary until lwIP's receive buffer is empty and every chunk has been
-  // synchronously confirmed by the USB Bulk OUT layer.
   while (rawClient.available() > 0 && movedThisPoll < RAW_POLL_BUDGET) {
     const size_t available = (size_t)rawClient.available();
     const size_t budgetLeft = RAW_POLL_BUDGET - movedThisPoll;
@@ -253,8 +282,6 @@ void handleRawServer(UsbPrinterBackend *backend) {
       return;
     }
 
-    // Count bytes only after the complete USB write succeeded. This is the
-    // authoritative per-job byte count used by the COMPLETE log.
     rawBytesReceived += (size_t)got;
     movedThisPoll += (size_t)got;
     rawLastDataMs = millis();
@@ -277,9 +304,6 @@ void handleRawServer(UsbPrinterBackend *backend) {
     return;
   }
 
-  // A still-open TCP connection that goes silent for five minutes is not a
-  // successful job boundary. Some of its pages may already have streamed to
-  // USB, so flag it as incomplete rather than falsely emitting COMPLETE.
   if (!movedData && millis() - rawLastDataMs >= RAW_IDLE_TIMEOUT_MS) {
     if (rawBytesReceived == 0) {
       Serial.printf("[RAW] TCP 9100 connection #%u idle with no print data; closing\n",
@@ -356,7 +380,13 @@ void UsbPrinterBackend::completeDrainIfReady() {
 void UsbPrinterBackend::poll() {
   startRawServerIfNeeded();
   completeDrainIfReady();
-  handleRawServer(this);
+
+  // Backchannel service is bounded and non-blocking. It runs before and after
+  // the OUT path so immediate printer replies can be returned without ever
+  // becoming a prerequisite for successful printing.
+  serviceRawBackchannel(host_);
+  handleRawServer(this, host_);
+  serviceRawBackchannel(host_);
 
   if (state_ == PRINTING) {
     StatusLed::set(StatusLed::PRINTING);

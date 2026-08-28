@@ -127,14 +127,31 @@ void sendSimple(WiFiClient &client,uint8_t major,uint8_t minor,uint16_t status,u
   IppWriter w; beginResponse(w,major,minor,status,requestId); w.b(0x03); sendHttpIpp(client,w);
 }
 
+void addJobAttributes(IppWriter &w,uint32_t jobId,uint8_t jobState,const String &reason){
+  w.b(0x02);
+  w.integer(0x21,"job-id",(int32_t)jobId);
+  const String jobUri = String("ipp://printer.local:631/ipp/print/job/") + String(jobId);
+  w.str(0x45,"job-uri",jobUri.c_str());
+  w.str(0x45,"job-printer-uri","ipp://printer.local:631/ipp/print");
+  w.integer(0x23,"job-state",jobState);
+  w.str(0x44,"job-state-reasons",reason.length()?reason.c_str():"none");
+}
+
+void sendJobResponse(WiFiClient &client,uint8_t major,uint8_t minor,uint16_t status,uint32_t requestId,
+                     uint32_t jobId,uint8_t jobState,const String &reason){
+  IppWriter w; beginResponse(w,major,minor,status,requestId);
+  if(status==0x0000 && jobId) addJobAttributes(w,jobId,jobState,reason);
+  w.b(0x03); sendHttpIpp(client,w);
+}
+
 void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32_t requestId){
   IppWriter w; beginResponse(w,major,minor,0x0000,requestId); w.b(0x04);
   w.str(0x45,"printer-uri-supported","ipp://printer.local:631/ipp/print");
-  w.str(0x42,"printer-name","HP Smart Tank 520_540 series");
+  w.str(0x42,"printer-name","HP Smart Tank");
   w.str(0x42,"printer-make-and-model","HP Smart Tank 520_540 series");
   w.integer(0x23,"printer-state",3); w.str(0x44,"printer-state-reasons","none"); w.boolean("printer-is-accepting-jobs",true);
   w.str(0x44,"ipp-versions-supported","1.1"); w.str(0x44,nullptr,"2.0");
-  w.integer(0x23,"operations-supported",0x0002); w.integer(0x23,nullptr,0x0004); w.integer(0x23,nullptr,0x0009); w.integer(0x23,nullptr,0x000B);
+  w.integer(0x23,"operations-supported",0x0002); w.integer(0x23,nullptr,0x0004); w.integer(0x23,nullptr,0x0009); w.integer(0x23,nullptr,0x000A); w.integer(0x23,nullptr,0x000B);
   w.str(0x49,"document-format-supported",PCL3_MIME);
   w.str(0x49,"document-format-default",PCL3_MIME);
   w.str(0x41,"document-format-version-supported","PCL3GUI");
@@ -159,17 +176,34 @@ bool parseAttributes(BodyReader &r,String &format){
 }
 }
 
+void IppPcl3Service::refreshJobState(){
+  if(lastJobId_==0 || lastJobState_!=5) return;
+  const auto state = printer_.state();
+  if(state==UsbPrinterBackend::IDLE){
+    lastJobState_=9;
+    lastJobReason_="job-completed-successfully";
+    Serial.printf("[IPP] Job %lu state -> completed\n",(unsigned long)lastJobId_);
+  } else if(state==UsbPrinterBackend::ERROR){
+    lastJobState_=8;
+    lastJobReason_="aborted-by-system";
+    Serial.printf("[IPP] Job %lu state -> aborted: %s\n",(unsigned long)lastJobId_,printer_.statusReason().c_str());
+  }
+}
+
 void IppPcl3Service::begin(){
   if(started_) return; ippServer.begin(); ippServer.setNoDelay(true); started_=true;
   Serial.println("[IPP] PCL3GUI-only IPP service listening on TCP 631");
 }
 
 void IppPcl3Service::poll(){
-  if(!started_) return; WiFiClient client=ippServer.available(); if(client) handleClient(client);
+  if(!started_) return;
+  refreshJobState();
+  WiFiClient client=ippServer.available(); if(client) handleClient(client);
 }
 
 void IppPcl3Service::handleClient(WiFiClient client){
-  clientActive_=true; lastError_=""; lastJobBytes_=0; client.setNoDelay(true); client.setTimeout(CLIENT_TIMEOUT_MS);
+  clientActive_=true; lastError_=""; client.setNoDelay(true); client.setTimeout(CLIENT_TIMEOUT_MS);
+  refreshJobState();
   String header; if(!readHttpHeader(client,header)){lastError_="HTTP header read failed";client.stop();clientActive_=false;return;}
   const String expect=headerValue(header,"Expect"); if(expect.equalsIgnoreCase("100-continue")){client.print("HTTP/1.1 100 Continue\r\n\r\n");client.flush();}
   const String transfer=headerValue(header,"Transfer-Encoding"); const String lengthText=headerValue(header,"Content-Length");
@@ -178,17 +212,51 @@ void IppPcl3Service::handleClient(WiFiClient client){
   const uint8_t major=hdr[0],minor=hdr[1]; const uint16_t op=((uint16_t)hdr[2]<<8)|hdr[3]; const uint32_t requestId=((uint32_t)hdr[4]<<24)|((uint32_t)hdr[5]<<16)|((uint32_t)hdr[6]<<8)|hdr[7];
   String format; if(!parseAttributes(body,format)){lastError_="malformed IPP attributes";sendSimple(client,major,minor,0x0400,requestId);client.stop();clientActive_=false;return;}
   Serial.printf("[IPP] op=0x%04X request-id=%lu format=%s\n",op,(unsigned long)requestId,format.c_str());
-  if(op==0x000B){ sendPrinterAttributes(client,major,minor,requestId); }
-  else if(op==0x0004){ sendSimple(client,major,minor,(format.isEmpty()||format==PCL3_MIME)?0x0000:0x040A,requestId); }
-  else if(op==0x0002){
-    if(format!=PCL3_MIME){ lastError_="Print-Job rejected: only application/vnd.hp-PCL is supported"; sendSimple(client,major,minor,0x040A,requestId); }
-    else if(printer_.rawClientConnected()||!printer_.online()){ lastError_="Printer busy or unavailable"; sendSimple(client,major,minor,0x0507,requestId); }
-    else {
-      bool ok=true; while(true){ size_t n=0; while(n<sizeof(bodyBuffer)){uint8_t b=0;if(!body.readByte(b))break;bodyBuffer[n++]=b;} if(!n)break; String error; if(!printer_.sendDirect(bodyBuffer,n,error)){lastError_=error;ok=false;break;} lastJobBytes_+=n; yield(); }
-      if(ok&&body.done){ printer_.finishRawJob(); Serial.printf("[IPP] PCL3GUI Print-Job complete: %llu bytes sent to classic USB print interface\n",(unsigned long long)lastJobBytes_); sendSimple(client,major,minor,0x0000,requestId); }
-      else { if(lastError_.isEmpty()) lastError_="Print-Job body ended unexpectedly"; printer_.abortRawJob(lastError_); sendSimple(client,major,minor,0x0500,requestId); }
+  if(op==0x000B){
+    sendPrinterAttributes(client,major,minor,requestId);
+  } else if(op==0x0004){
+    sendSimple(client,major,minor,(format.isEmpty()||format==PCL3_MIME)?0x0000:0x040A,requestId);
+  } else if(op==0x0002){
+    if(format!=PCL3_MIME){
+      lastError_="Print-Job rejected: only application/vnd.hp-PCL is supported";
+      sendSimple(client,major,minor,0x040A,requestId);
+    } else if(printer_.rawClientConnected()||!printer_.online()){
+      lastError_="Printer busy or unavailable";
+      sendSimple(client,major,minor,0x0507,requestId);
+    } else {
+      const uint32_t jobId = nextJobId_++;
+      lastJobId_=jobId; lastJobState_=5; lastJobReason_="job-printing"; lastJobBytes_=0;
+      bool ok=true;
+      while(true){
+        size_t n=0;
+        while(n<sizeof(bodyBuffer)){uint8_t b=0;if(!body.readByte(b))break;bodyBuffer[n++]=b;}
+        if(!n)break;
+        String error;
+        if(!printer_.sendDirect(bodyBuffer,n,error)){lastError_=error;ok=false;break;}
+        lastJobBytes_+=n;
+        yield();
+      }
+      if(ok&&body.done){
+        printer_.finishRawJob();
+        Serial.printf("[IPP] PCL3GUI Print-Job accepted: job=%lu %llu bytes sent to classic USB print interface\n",(unsigned long)jobId,(unsigned long long)lastJobBytes_);
+        sendJobResponse(client,major,minor,0x0000,requestId,jobId,lastJobState_,lastJobReason_);
+      } else {
+        if(lastError_.isEmpty()) lastError_="Print-Job body ended unexpectedly";
+        printer_.abortRawJob(lastError_);
+        lastJobState_=8; lastJobReason_="aborted-by-system";
+        sendSimple(client,major,minor,0x0500,requestId);
+      }
     }
-  } else if(op==0x0009){ sendSimple(client,major,minor,0x0000,requestId); }
-  else { sendSimple(client,major,minor,0x0501,requestId); }
+  } else if(op==0x0009 || op==0x000A){
+    refreshJobState();
+    if(lastJobId_){
+      Serial.printf("[IPP] Job status: id=%lu state=%u reason=%s\n",(unsigned long)lastJobId_,lastJobState_,lastJobReason_.c_str());
+      sendJobResponse(client,major,minor,0x0000,requestId,lastJobId_,lastJobState_,lastJobReason_);
+    } else {
+      sendSimple(client,major,minor,0x0000,requestId);
+    }
+  } else {
+    sendSimple(client,major,minor,0x0501,requestId);
+  }
   client.stop(); clientActive_=false;
 }

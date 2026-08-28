@@ -3,7 +3,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
-#include "../../usb_host_manager.h"
+#include "usb_host_manager.h"
 
 // One-flash Android/HP print probe.
 // Safe mode is the default: IPP is fully negotiated and PCLm is extracted,
@@ -174,7 +174,6 @@ struct HttpBodyReader {
     const unsigned long n = strtoul(line.c_str(), &endp, 16);
     if (!endp || *endp != 0) return false;
     if (n == 0) {
-      // Consume optional trailer headers.
       do {
         if (!rawLine(line)) break;
       } while (line.length() != 0);
@@ -312,7 +311,7 @@ void sendJobResponse(WiFiClient &client, uint8_t major, uint8_t minor, uint32_t 
     w.integer(0x21, "job-id", (int32_t)jobId);
     String uri = String("ipp://printer.local:631/ipp/print/job/") + jobId;
     w.str(0x45, "job-uri", uri.c_str());
-    w.integer(0x23, "job-state", 9); // completed
+    w.integer(0x23, "job-state", 9);
     w.str(0x44, "job-state-reasons", "job-completed-successfully");
   }
   w.b(0x03);
@@ -328,8 +327,8 @@ bool parseIppAttributes(HttpBodyReader &r, String &documentFormat, String &jobNa
   while (true) {
     uint8_t tag = 0;
     if (!r.readByte(tag)) return false;
-    if (tag == 0x03) return true; // end-of-attributes
-    if (tag <= 0x0F) { currentName = ""; continue; } // group delimiter
+    if (tag == 0x03) return true;
+    if (tag <= 0x0F) { currentName = ""; continue; }
 
     uint16_t nameLen = 0, valueLen = 0;
     if (!readU16(r, nameLen)) return false;

@@ -207,27 +207,11 @@ static bool claimInterfaces(UsbDeviceInfo &d, String &error) {
 
   if (!d.statusInterfaceSeparate) d.statusInterface = d.printer;
 
+  // Keep protocol-0x04 interfaces unclaimed while classic IF1 printing is in
+  // use. selectIppInterface() can still claim one explicitly later. This keeps
+  // the live IF1 Bulk-IN/Bulk-OUT bridge from spending a scarce HCD channel on
+  // an unrelated idle interface.
   d.ippSelectedIndex = -1;
-  uint8_t ippCandidate = 0;
-  for (uint8_t i = 0; i < d.printerInterfaceCount; ++i) {
-    const auto &ipp = d.printerInterfaces[i];
-    if (!ipp.usableForIppUsb()) continue;
-    const esp_err_t claim = usb_host_interface_claim(g.client, g.device,
-                                                      ipp.interfaceNumber,
-                                                      ipp.alternateSetting);
-    if (claim == ESP_OK) {
-      g.claimedIppInterface = ipp.interfaceNumber;
-      g.ippInterfaceClaimed = true;
-      d.ippSelectedIndex = (int8_t)ippCandidate;
-      Serial.printf("[USB] Claimed IPP-over-USB candidate %u IF=%u ALT=%u\n",
-                    ippCandidate, ipp.interfaceNumber, ipp.alternateSetting);
-      break;
-    }
-    Serial.printf("[USB] IPP-over-USB candidate %u IF=%u ALT=%u claim failed: %s\n",
-                  ippCandidate, ipp.interfaceNumber, ipp.alternateSetting,
-                  esp_err_to_name(claim));
-    ++ippCandidate;
-  }
 
   Serial.printf("[USB] Selected Printer Class IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X\n",
                 d.printer.interfaceNumber, d.printer.alternateSetting,
@@ -678,6 +662,79 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
   return true;
 }
 
+
+bool UsbHostManager::bulkRead(uint8_t *data, size_t capacity, size_t &received,
+                              uint32_t timeoutMs, String &error) {
+  received = 0;
+  const UsbPrinterInterfaceInfo *iface = selectedInterface();
+  if (!data || !capacity) { error = "empty classic Bulk-IN read buffer"; return false; }
+  if (!g.deviceOpen || !g.printInterfaceClaimed || !iface || !iface->bulkIn.valid()) {
+    error = "classic Printer Class Bulk-IN endpoint is not ready";
+    return false;
+  }
+  if (capacity > 16384) { error = "classic Bulk-IN read exceeds 16 KiB"; return false; }
+
+  usb_transfer_t *t = nullptr;
+  esp_err_t e = usb_host_transfer_alloc(capacity, 0, &t);
+  if (e != ESP_OK || !t) {
+    error = String("classic Bulk-IN alloc failed: ") + esp_err_to_name(e);
+    return false;
+  }
+  TransferWait w;
+  w.done = xSemaphoreCreateBinary();
+  if (!w.done) {
+    usb_host_transfer_free(t);
+    error = "unable to allocate classic Bulk-IN completion semaphore";
+    return false;
+  }
+
+  t->num_bytes = capacity;
+  t->device_handle = g.device;
+  t->bEndpointAddress = iface->bulkIn.address;
+  t->callback = bulkTransferCallback;
+  t->context = &w;
+  t->timeout_ms = timeoutMs;
+
+  e = usb_host_transfer_submit(t);
+  if (e != ESP_OK) {
+    vSemaphoreDelete(w.done);
+    usb_host_transfer_free(t);
+    error = String("classic Bulk-IN submit failed: ") + esp_err_to_name(e);
+    return false;
+  }
+
+  const TickType_t waitTicks = timeoutMs ? pdMS_TO_TICKS(timeoutMs + 250) : portMAX_DELAY;
+  if (xSemaphoreTake(w.done, waitTicks) != pdTRUE) {
+    // This is an abnormal host/callback timeout, not the normal transfer timeout.
+    usb_host_endpoint_halt(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_flush(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_clear(t->device_handle, t->bEndpointAddress);
+    xSemaphoreTake(w.done, portMAX_DELAY);
+  }
+
+  received = static_cast<size_t>(t->actual_num_bytes);
+  const usb_transfer_status_t status = t->status;
+  if (status == USB_TRANSFER_STATUS_COMPLETED && received) {
+    memcpy(data, t->data_buffer, received);
+  }
+  vSemaphoreDelete(w.done);
+  usb_host_transfer_free(t);
+
+  // A short poll timing out is expected when the printer has no backchannel
+  // data. Treat it as an empty successful poll so the TCP->USB direction never
+  // stalls waiting for IN traffic.
+  if (status == USB_TRANSFER_STATUS_TIMED_OUT ||
+      (status == USB_TRANSFER_STATUS_COMPLETED && received == 0)) {
+    received = 0;
+    return true;
+  }
+  if (status != USB_TRANSFER_STATUS_COMPLETED) {
+    error = String("classic Bulk-IN failed status=") + String((int)status) +
+            " received=" + String((unsigned)received);
+    return false;
+  }
+  return true;
+}
 
 bool UsbHostManager::ippBulkWrite(const uint8_t *data, size_t length, size_t &accepted,
                                   uint32_t timeoutMs, String &error) {

@@ -36,6 +36,13 @@ UsbHostManager usbHost;
 
 static uint8_t ippResponseBuffer[IPP_RESPONSE_BUFFER_SIZE];
 static uint8_t documentBuffer[DOCUMENT_BUFFER_SIZE];
+static uint8_t rawNetBuffer[4096];
+static uint8_t rawUsbInBuffer[1024];
+
+bool rawBridgeActive = false;
+uint64_t rawBridgeLastNetToUsb = 0;
+uint64_t rawBridgeLastUsbToNet = 0;
+String rawBridgeLastError;
 
 enum ProbeMode : uint8_t { MODE_SAFE = 0, MODE_CLASSIC_RAW = 1, MODE_IPP_USB = 2 };
 ProbeMode probeMode = MODE_SAFE;
@@ -844,21 +851,120 @@ void serviceIpp() {
 void serviceRaw() {
   WiFiClient client = rawServer.available();
   if (!client) return;
-  Serial.printf("[PROBE][RAW] :9100 connection from %s:%u\n", client.remoteIP().toString().c_str(), client.remotePort());
-  uint8_t first[256] = {}; size_t firstLen = 0; uint64_t total = 0;
-  uint32_t last = millis();
-  while (client.connected() || client.available()) {
-    while (client.available()) {
-      uint8_t b = (uint8_t)client.read();
-      if (firstLen < sizeof(first)) first[firstLen++] = b;
-      ++total; last = millis();
+  client.setNoDelay(true);
+
+  rawBridgeActive = true;
+  rawBridgeLastNetToUsb = 0;
+  rawBridgeLastUsbToNet = 0;
+  rawBridgeLastError = "";
+
+  const UsbPrinterInterfaceInfo *raw = usbHost.selectedInterface();
+  Serial.printf("[PROBE][RAW] LIVE duplex :9100 from %s:%u\n",
+                client.remoteIP().toString().c_str(), client.remotePort());
+  if (usbHost.state() != UsbHostManager::PRINTER_READY || !raw ||
+      !raw->bulkOut.valid() || !raw->bulkIn.valid()) {
+    rawBridgeLastError = "IF1-style classic printer Bulk-IN/Bulk-OUT interface is not ready";
+    Serial.printf("[PROBE][RAW] bridge refused: %s\n", rawBridgeLastError.c_str());
+    client.stop();
+    rawBridgeActive = false;
+    return;
+  }
+
+  Serial.printf("[PROBE][RAW] transparent bridge IF=%u ALT=%u proto=0x%02X OUT=0x%02X IN=0x%02X\n",
+                raw->interfaceNumber, raw->alternateSetting, raw->protocol,
+                raw->bulkOut.address, raw->bulkIn.address);
+
+  uint32_t lastActivity = millis();
+  uint32_t lastProgress = millis();
+  bool bridgeOk = true;
+
+  while ((client.connected() || client.available()) && bridgeOk) {
+    // Wi-Fi -> USB Bulk OUT. Preserve bytes exactly; no parsing, PJL insertion,
+    // PCL transformation, framing, or buffering of the full job.
+    while (client.available() > 0 && bridgeOk) {
+      const int want = min((int)sizeof(rawNetBuffer), client.available());
+      const int got = client.read(rawNetBuffer, want);
+      if (got <= 0) break;
+      size_t offset = 0;
+      while (offset < (size_t)got) {
+        const size_t part = min((size_t)USB_CHUNK, (size_t)got - offset);
+        size_t accepted = 0;
+        String error;
+        if (!usbHost.bulkWrite(rawNetBuffer + offset, part, accepted, 30000, error) || accepted != part) {
+          rawBridgeLastError = error.length() ? error : "classic Bulk-OUT short write";
+          bridgeOk = false;
+          break;
+        }
+        offset += accepted;
+        rawBridgeLastNetToUsb += accepted;
+      }
+      lastActivity = millis();
     }
-    if (millis() - last > 1000) break;
+
+    // USB Bulk IN -> same live TCP connection. Short 10 ms polls keep this
+    // direction responsive without blocking the Wi-Fi -> OUT path.
+    if (bridgeOk) {
+      size_t received = 0;
+      String error;
+      if (!usbHost.bulkRead(rawUsbInBuffer, sizeof(rawUsbInBuffer), received, 10, error)) {
+        rawBridgeLastError = error;
+        bridgeOk = false;
+      } else if (received) {
+        size_t sent = 0;
+        while (sent < received && client.connected()) {
+          const size_t n = client.write(rawUsbInBuffer + sent, received - sent);
+          if (!n) {
+            rawBridgeLastError = "TCP write failed while forwarding printer Bulk-IN";
+            bridgeOk = false;
+            break;
+          }
+          sent += n;
+        }
+        rawBridgeLastUsbToNet += sent;
+        lastActivity = millis();
+      }
+    }
+
+    if (millis() - lastProgress >= 1000) {
+      lastProgress = millis();
+      Serial.printf("[PROBE][RAW] live net->usb=%llu usb->net=%llu\n",
+                    (unsigned long long)rawBridgeLastNetToUsb,
+                    (unsigned long long)rawBridgeLastUsbToNet);
+    }
+
+    // Keep a true session open while the client is connected. Five minutes of
+    // total silence is only a safety escape for broken/stale sockets.
+    if (millis() - lastActivity > 300000UL) {
+      rawBridgeLastError = "RAW bridge idle timeout after 5 minutes";
+      break;
+    }
     delay(1);
   }
-  Serial.printf("[PROBE][RAW] closed after %llu bytes; first=%u bytes captured\n",
-                (unsigned long long)total, (unsigned)firstLen);
+
+  // One final short IN drain lets immediate printer backchannel bytes reach a
+  // still-connected client before close.
+  if (client.connected()) {
+    const uint32_t drainStart = millis();
+    while (millis() - drainStart < 250) {
+      size_t received = 0;
+      String error;
+      if (!usbHost.bulkRead(rawUsbInBuffer, sizeof(rawUsbInBuffer), received, 10, error)) break;
+      if (received) {
+        client.write(rawUsbInBuffer, received);
+        rawBridgeLastUsbToNet += received;
+      }
+      delay(1);
+    }
+  }
+
+  Serial.printf("[PROBE][RAW] LIVE closed net->usb=%llu usb->net=%llu ok=%d%s%s\n",
+                (unsigned long long)rawBridgeLastNetToUsb,
+                (unsigned long long)rawBridgeLastUsbToNet,
+                bridgeOk ? 1 : 0,
+                rawBridgeLastError.length() ? " error=" : "",
+                rawBridgeLastError.c_str());
   client.stop();
+  rawBridgeActive = false;
 }
 
 String hexString(const uint8_t *data, size_t n) {
@@ -985,7 +1091,7 @@ void handleWebRoot() {
   html.reserve(15000);
   html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>Android Print Probe</title><style>body{font-family:system-ui;max-width:1000px;margin:24px auto;padding:0 14px;color:#263238}section{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}button{padding:9px 13px;border-radius:8px;border:1px solid #999;font-weight:600;margin:4px}.warn{background:#fff4e5;border:1px solid #f0c36d;padding:10px;border-radius:8px}.good{background:#edf7ed;border:1px solid #8bc48b;padding:10px;border-radius:8px}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:7px;border-bottom:1px solid #eee}th{width:210px}code{word-break:break-all}label{display:block;margin:8px 0}</style></head><body>";
-  html += "<h1>Android Print Probe — one flash</h1>";
+  html += "<h1>Android Print Probe — live duplex bridge</h1>";
   html += "<section><h2>Recommended next action</h2><div class='good'>" + htmlEscape(recommendedAction()) + "</div></section>";
 
   html += "<section><h2>1. Printer language advertisement</h2><p><b>Current: " + String(advertProfileName()) + "</b></p>";
@@ -1037,6 +1143,13 @@ void handleWebRoot() {
     html += "<form method='POST' action='/physical'><button name='result' value='printed'>Printer printed page</button><button name='result' value='no'>No physical output</button></form>";
   }
   html += "</section>";
+
+  html += "<section><h2>6. Live RAW 9100 ↔ USB IF1 bridge</h2><table>";
+  html += "<tr><th>Status</th><td>" + String(rawBridgeActive ? "ACTIVE" : "idle") + "</td></tr>";
+  html += "<tr><th>Wi-Fi → USB OUT</th><td>" + String((unsigned long long)rawBridgeLastNetToUsb) + " bytes</td></tr>";
+  html += "<tr><th>USB IN → Wi-Fi</th><td>" + String((unsigned long long)rawBridgeLastUsbToNet) + " bytes</td></tr>";
+  if (rawBridgeLastError.length()) html += "<tr><th>Last error</th><td>" + htmlEscape(rawBridgeLastError) + "</td></tr>";
+  html += "</table><p>TCP 9100 is byte-transparent and full-duplex: network bytes go directly to the selected classic Printer Class Bulk-OUT endpoint, and printer Bulk-IN bytes are returned live on the same TCP connection. No PDL conversion is performed.</p></section>";
 
   html += "<section><h2>7. Memory / stability</h2><table>";
   html += "<tr><th>Configured loop stack</th><td>" + String((unsigned)LOOP_STACK_CONFIGURED_BYTES) + " bytes</td></tr>";
@@ -1112,7 +1225,7 @@ void setup() {
   Serial.println();
   Serial.println("=== ESP32-S3 Android Print Probe — one-flash diagnostic dashboard ===");
   Serial.printf("[PROBE] Loop stack configured: %u bytes\n", (unsigned)LOOP_STACK_CONFIGURED_BYTES);
-  Serial.println("[PROBE] Safe Capture is the default after every reboot");
+  Serial.println("[PROBE] Safe Capture is the default after every reboot; TCP 9100 is always a transparent IF1 duplex bridge");
   noteStack("boot", true);
 
   if (!connectSavedWiFi()) startProbeAp();

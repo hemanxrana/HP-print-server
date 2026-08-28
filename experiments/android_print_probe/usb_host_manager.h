@@ -29,6 +29,11 @@ public:
 
   bool bulkWrite(const uint8_t *data, size_t length, size_t &accepted,
                  uint32_t timeoutMs, String &error);
+  // Poll the selected classic Printer Class Bulk-IN endpoint. A normal USB
+  // transfer timeout means "no backchannel bytes available yet" and returns
+  // true with received == 0; hard USB errors return false.
+  bool bulkRead(uint8_t *data, size_t capacity, size_t &received,
+                uint32_t timeoutMs, String &error);
   bool ippBulkWrite(const uint8_t *data, size_t length, size_t &accepted,
                     uint32_t timeoutMs, String &error);
   bool ippBulkRead(uint8_t *data, size_t capacity, size_t &received,

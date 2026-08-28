@@ -1,0 +1,194 @@
+#include "ipp_pcl3_service.h"
+
+namespace {
+constexpr uint16_t IPP_PORT = 631;
+constexpr uint32_t CLIENT_TIMEOUT_MS = 180000;
+constexpr size_t HTTP_HEADER_LIMIT = 4096;
+constexpr size_t BODY_BUFFER = 1024;
+constexpr const char *PCL3_MIME = "application/vnd.hp-PCL";
+WiFiServer ippServer(IPP_PORT);
+static uint8_t bodyBuffer[BODY_BUFFER];
+
+bool readClientByte(WiFiClient &client, uint8_t &out, uint32_t timeoutMs) {
+  const uint32_t started = millis();
+  while (client.connected() || client.available()) {
+    if (client.available() > 0) {
+      const int v = client.read();
+      if (v >= 0) { out = (uint8_t)v; return true; }
+    }
+    if (millis() - started >= timeoutMs) return false;
+    delay(1);
+  }
+  return false;
+}
+
+bool readHttpHeader(WiFiClient &client, String &header) {
+  header = "";
+  header.reserve(1024);
+  uint8_t b = 0;
+  while (header.length() < HTTP_HEADER_LIMIT) {
+    if (!readClientByte(client, b, 10000)) return false;
+    header += (char)b;
+    if (header.endsWith("\r\n\r\n")) return true;
+  }
+  return false;
+}
+
+String headerValue(const String &header, const char *name) {
+  String lower = header; lower.toLowerCase();
+  String key = String(name); key.toLowerCase(); key += ":";
+  const int at = lower.indexOf(key);
+  if (at < 0) return "";
+  int p = at + key.length();
+  while (p < (int)header.length() && (header[p] == ' ' || header[p] == '\t')) ++p;
+  int end = header.indexOf("\r\n", p);
+  if (end < 0) end = header.length();
+  String value = header.substring(p, end); value.trim(); return value;
+}
+
+struct BodyReader {
+  WiFiClient &client;
+  bool chunked = false;
+  int64_t remaining = -1;
+  size_t chunkRemaining = 0;
+  bool done = false;
+
+  explicit BodyReader(WiFiClient &c) : client(c) {}
+  bool rawByte(uint8_t &b) { return readClientByte(client, b, CLIENT_TIMEOUT_MS); }
+  bool rawLine(String &line) {
+    line = "";
+    uint8_t b = 0;
+    while (line.length() < 128) {
+      if (!rawByte(b)) return false;
+      if (b == '\n') { if (line.endsWith("\r")) line.remove(line.length()-1); return true; }
+      line += (char)b;
+    }
+    return false;
+  }
+  bool nextChunk() {
+    String line;
+    do { if (!rawLine(line)) return false; } while (line.length() == 0);
+    const int semi = line.indexOf(';'); if (semi >= 0) line = line.substring(0, semi);
+    line.trim();
+    char *endp = nullptr;
+    const unsigned long n = strtoul(line.c_str(), &endp, 16);
+    if (!endp || *endp != 0) return false;
+    if (n == 0) {
+      do { if (!rawLine(line)) break; } while (line.length() != 0);
+      done = true; return false;
+    }
+    chunkRemaining = (size_t)n; return true;
+  }
+  bool readByte(uint8_t &b) {
+    if (done) return false;
+    if (!chunked) {
+      if (remaining == 0) { done = true; return false; }
+      if (!rawByte(b)) return false;
+      if (remaining > 0) --remaining;
+      return true;
+    }
+    if (chunkRemaining == 0 && !nextChunk()) return false;
+    if (!rawByte(b)) return false;
+    --chunkRemaining;
+    if (chunkRemaining == 0) {
+      uint8_t cr=0, lf=0;
+      if (!rawByte(cr) || !rawByte(lf) || cr != '\r' || lf != '\n') return false;
+    }
+    return true;
+  }
+  bool readExact(uint8_t *dst, size_t n) { for (size_t i=0;i<n;++i) if (!readByte(dst[i])) return false; return true; }
+};
+
+struct IppWriter {
+  uint8_t data[1536]; size_t len=0; bool ok=true;
+  void b(uint8_t v){ if(len<sizeof(data)) data[len++]=v; else ok=false; }
+  void u16(uint16_t v){ b(v>>8); b(v); }
+  void u32(uint32_t v){ b(v>>24); b(v>>16); b(v>>8); b(v); }
+  void raw(const uint8_t *p,size_t n){ if(!ok||len+n>sizeof(data)){ok=false;return;} memcpy(data+len,p,n); len+=n; }
+  void attr(uint8_t tag,const char *name,const uint8_t *value,uint16_t valueLen){
+    const uint16_t nameLen=name?(uint16_t)strlen(name):0; b(tag);u16(nameLen);if(nameLen)raw((const uint8_t*)name,nameLen);u16(valueLen);if(valueLen)raw(value,valueLen);
+  }
+  void str(uint8_t tag,const char *name,const char *value){ attr(tag,name,(const uint8_t*)value,(uint16_t)strlen(value)); }
+  void integer(uint8_t tag,const char *name,int32_t value){ uint8_t v[4]={(uint8_t)(value>>24),(uint8_t)(value>>16),(uint8_t)(value>>8),(uint8_t)value}; attr(tag,name,v,4); }
+  void boolean(const char *name,bool value){ const uint8_t v=value?1:0; attr(0x22,name,&v,1); }
+};
+
+void beginResponse(IppWriter &w,uint8_t major,uint8_t minor,uint16_t status,uint32_t requestId){
+  w.b(major?major:2); w.b(major?minor:0); w.u16(status); w.u32(requestId); w.b(0x01);
+  w.str(0x47,"attributes-charset","utf-8"); w.str(0x48,"attributes-natural-language","en");
+}
+
+void sendHttpIpp(WiFiClient &client,const IppWriter &w){
+  client.print("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nConnection: close\r\n");
+  client.printf("Content-Length: %u\r\n\r\n",(unsigned)w.len); client.write(w.data,w.len); client.flush();
+}
+
+void sendSimple(WiFiClient &client,uint8_t major,uint8_t minor,uint16_t status,uint32_t requestId){
+  IppWriter w; beginResponse(w,major,minor,status,requestId); w.b(0x03); sendHttpIpp(client,w);
+}
+
+void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32_t requestId){
+  IppWriter w; beginResponse(w,major,minor,0x0000,requestId); w.b(0x04);
+  w.str(0x45,"printer-uri-supported","ipp://printer.local:631/ipp/print");
+  w.str(0x42,"printer-name","HP Smart Tank 520_540 series");
+  w.str(0x42,"printer-make-and-model","HP Smart Tank 520_540 series");
+  w.integer(0x23,"printer-state",3); w.str(0x44,"printer-state-reasons","none"); w.boolean("printer-is-accepting-jobs",true);
+  w.str(0x44,"ipp-versions-supported","1.1"); w.str(0x44,nullptr,"2.0");
+  w.integer(0x23,"operations-supported",0x0002); w.integer(0x23,nullptr,0x0004); w.integer(0x23,nullptr,0x0009); w.integer(0x23,nullptr,0x000B);
+  w.str(0x49,"document-format-supported",PCL3_MIME);
+  w.str(0x49,"document-format-default",PCL3_MIME);
+  w.str(0x41,"document-format-version-supported","PCL3GUI");
+  w.boolean("color-supported",true);
+  w.str(0x44,"print-color-mode-supported","color"); w.str(0x44,nullptr,"monochrome"); w.str(0x44,"print-color-mode-default","color");
+  w.str(0x44,"media-supported","iso_a4_210x297mm"); w.str(0x44,nullptr,"na_letter_8.5x11in"); w.str(0x44,"media-default","iso_a4_210x297mm");
+  w.str(0x44,"sides-supported","one-sided"); w.str(0x44,"sides-default","one-sided");
+  w.b(0x03); sendHttpIpp(client,w);
+}
+
+bool readU16(BodyReader &r,uint16_t &v){ uint8_t b[2]; if(!r.readExact(b,2)) return false; v=((uint16_t)b[0]<<8)|b[1]; return true; }
+
+bool parseAttributes(BodyReader &r,String &format){
+  String currentName;
+  while(true){
+    uint8_t tag=0; if(!r.readByte(tag)) return false; if(tag==0x03) return true; if(tag<=0x0F){currentName="";continue;}
+    uint16_t nameLen=0,valueLen=0; if(!readU16(r,nameLen)) return false; String name;
+    for(uint16_t i=0;i<nameLen;++i){uint8_t b=0;if(!r.readByte(b))return false;name+=(char)b;} if(nameLen) currentName=name;
+    if(!readU16(r,valueLen)) return false; String value; const bool keep=currentName=="document-format"; if(keep)value.reserve(valueLen);
+    for(uint16_t i=0;i<valueLen;++i){uint8_t b=0;if(!r.readByte(b))return false;if(keep)value+=(char)b;} if(keep)format=value;
+  }
+}
+}
+
+void IppPcl3Service::begin(){
+  if(started_) return; ippServer.begin(); ippServer.setNoDelay(true); started_=true;
+  Serial.println("[IPP] PCL3GUI-only IPP service listening on TCP 631");
+}
+
+void IppPcl3Service::poll(){
+  if(!started_) return; WiFiClient client=ippServer.available(); if(client) handleClient(client);
+}
+
+void IppPcl3Service::handleClient(WiFiClient client){
+  clientActive_=true; lastError_=""; lastJobBytes_=0; client.setNoDelay(true); client.setTimeout(CLIENT_TIMEOUT_MS);
+  String header; if(!readHttpHeader(client,header)){lastError_="HTTP header read failed";client.stop();clientActive_=false;return;}
+  const String expect=headerValue(header,"Expect"); if(expect.equalsIgnoreCase("100-continue")){client.print("HTTP/1.1 100 Continue\r\n\r\n");client.flush();}
+  const String transfer=headerValue(header,"Transfer-Encoding"); const String lengthText=headerValue(header,"Content-Length");
+  BodyReader body(client); body.chunked=transfer.equalsIgnoreCase("chunked"); body.remaining=body.chunked?-1:(lengthText.length()?lengthText.toInt():-1);
+  uint8_t hdr[8]; if(!body.readExact(hdr,sizeof(hdr))){lastError_="truncated IPP header";client.stop();clientActive_=false;return;}
+  const uint8_t major=hdr[0],minor=hdr[1]; const uint16_t op=((uint16_t)hdr[2]<<8)|hdr[3]; const uint32_t requestId=((uint32_t)hdr[4]<<24)|((uint32_t)hdr[5]<<16)|((uint32_t)hdr[6]<<8)|hdr[7];
+  String format; if(!parseAttributes(body,format)){lastError_="malformed IPP attributes";sendSimple(client,major,minor,0x0400,requestId);client.stop();clientActive_=false;return;}
+  Serial.printf("[IPP] op=0x%04X request-id=%lu format=%s\n",op,(unsigned long)requestId,format.c_str());
+  if(op==0x000B){ sendPrinterAttributes(client,major,minor,requestId); }
+  else if(op==0x0004){ sendSimple(client,major,minor,(format.isEmpty()||format==PCL3_MIME)?0x0000:0x040A,requestId); }
+  else if(op==0x0002){
+    if(format!=PCL3_MIME){ lastError_="Print-Job rejected: only application/vnd.hp-PCL is supported"; sendSimple(client,major,minor,0x040A,requestId); }
+    else if(printer_.rawClientConnected()||!printer_.online()){ lastError_="Printer busy or unavailable"; sendSimple(client,major,minor,0x0507,requestId); }
+    else {
+      bool ok=true; while(true){ size_t n=0; while(n<sizeof(bodyBuffer)){uint8_t b=0;if(!body.readByte(b))break;bodyBuffer[n++]=b;} if(!n)break; String error; if(!printer_.sendDirect(bodyBuffer,n,error)){lastError_=error;ok=false;break;} lastJobBytes_+=n; yield(); }
+      if(ok&&body.done){ printer_.finishRawJob(); Serial.printf("[IPP] PCL3GUI Print-Job complete: %llu bytes sent to classic USB print interface\n",(unsigned long long)lastJobBytes_); sendSimple(client,major,minor,0x0000,requestId); }
+      else { if(lastError_.isEmpty()) lastError_="Print-Job body ended unexpectedly"; printer_.abortRawJob(lastError_); sendSimple(client,major,minor,0x0500,requestId); }
+    }
+  } else if(op==0x0009){ sendSimple(client,major,minor,0x0000,requestId); }
+  else { sendSimple(client,major,minor,0x0501,requestId); }
+  client.stop(); clientActive_=false;
+}

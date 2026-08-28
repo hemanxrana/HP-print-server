@@ -4,11 +4,13 @@
 #include <Preferences.h>
 #include <ESPmDNS.h>
 #include "usb_printer_backend.h"
+#include "ipp_pcl3_service.h"
 
-// ESP32-S3 USB-to-Wi-Fi RAW print server.
-// Network side: JetDirect/AppSocket on TCP 9100 only.
-// Print data is forwarded byte-for-byte to an automatically selected classic
-// USB Printer Class interface. IPP-over-USB/eSCL is intentionally not used.
+// ESP32-S3 USB-to-Wi-Fi print server.
+// Network side: RAW JetDirect/AppSocket on TCP 9100 plus IPP on TCP 631.
+// IPP advertises PCL3GUI only and forwards the IPP document payload to the
+// same classic USB Printer Class interface used by RAW printing. No IPP-over-USB
+// interface is selected or used for printing.
 
 static constexpr const char *RAW_HOSTNAME = "printer";
 static constexpr const char *AP_SSID = "HP-Print-Server";
@@ -19,6 +21,7 @@ WebServer configServer(80);
 Preferences preferences;
 UsbHostManager usbHost;
 UsbPrinterBackend usbPrinterBackend(usbHost);
+IppPcl3Service ippService(usbPrinterBackend);
 
 void ensureUsbScannerWebRoutesInstalled();
 
@@ -132,6 +135,19 @@ void startRawDiscovery() {
     MDNS.addServiceTxt("pdl-datastream", "tcp", "note", "RAW 9100");
     Serial.println("[mDNS] printer.local -> RAW 9100 discovery advertised");
   }
+
+  if (MDNS.addService("ipp", "tcp", 631)) {
+    MDNS.addServiceTxt("ipp", "tcp", "txtvers", "1");
+    MDNS.addServiceTxt("ipp", "tcp", "qtotal", "1");
+    MDNS.addServiceTxt("ipp", "tcp", "rp", "ipp/print");
+    MDNS.addServiceTxt("ipp", "tcp", "ty", "HP Smart Tank 520_540 series");
+    MDNS.addServiceTxt("ipp", "tcp", "product", "(HP Smart Tank 520_540 series)");
+    MDNS.addServiceTxt("ipp", "tcp", "pdl", "application/vnd.hp-PCL");
+    MDNS.addServiceTxt("ipp", "tcp", "usb_MFG", "HP");
+    MDNS.addServiceTxt("ipp", "tcp", "usb_MDL", "HP Smart Tank 520_540 series");
+    MDNS.addServiceTxt("ipp", "tcp", "usb_CMD", "PCL3GUI");
+    Serial.println("[mDNS] printer.local -> IPP 631 advertised as PCL3GUI only");
+  }
 }
 
 String printerStateText() {
@@ -235,7 +251,7 @@ String dashboard() {
   html.reserve(9000);
   html += R"HTML(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f3f5f7"><title>Print Server</title><style>
 *{box-sizing:border-box}body{margin:0;background:#f3f5f7;color:#344054;font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}.app{max-width:940px;margin:auto;padding:22px 16px 40px}.top{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}.title{font-size:25px;font-weight:650;letter-spacing:-.02em}.subtitle,.small,.hint,.statusLine,.section p{color:#758195;font-size:13px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.btn{border:1px solid #d8e1e8;border-radius:9px;padding:8px 12px;background:#edf3f7;color:#466681;font:inherit;font-weight:600;cursor:pointer}.btn.primary{background:#557b9a;color:#fff;border-color:#557b9a}.btn:disabled{opacity:.55}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.card,.section{background:#fbfcfd;border:1px solid #e1e7ec;border-radius:14px}.card{padding:15px;min-height:112px}.section{margin-top:11px;padding:17px}.label,.detailKey{font-size:11px;text-transform:uppercase;letter-spacing:.045em;color:#7b8797;font-weight:600}.value{font-size:18px;font-weight:650;margin-top:6px;line-height:1.3}.pill{display:flex;align-items:center;gap:7px;font-size:12px;color:#637083;margin-top:8px}.dot{width:8px;height:8px;border-radius:50%;background:#719b7d}.dot.off{background:#b47b72}.sectionHead{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:12px}.section h2{font-size:17px;font-weight:650;margin:0}.section p{margin:4px 0}.details{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.detail,.service{padding:11px 12px;border-radius:10px;background:#f6f8fa;border:1px solid #e7ebef}.detailValue{font-size:13px;font-weight:600;margin-top:3px;word-break:break-word}.address{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;margin-top:6px;word-break:break-all;color:#536272}.selectWrap select,.field input{width:100%;padding:10px 11px;border:1px solid #dce3e9;border-radius:9px;background:#fff;color:#344054;font:inherit;outline:none}.selectWrap select:focus,.field input:focus{border-color:#9eb5c7}.wifiForm{margin-top:13px;border-top:1px solid #e7ebef;padding-top:13px}.field{margin-bottom:10px}.field label{display:block;font-size:12px;font-weight:600;margin-bottom:5px;color:#596779}.check{display:flex;align-items:center;gap:8px;font-size:12px;color:#758195;margin:0 0 12px}.toast{position:fixed;left:50%;bottom:18px;transform:translate(-50%,15px);background:#475467;color:#fff;padding:9px 13px;border-radius:9px;opacity:0;transition:.18s}.toast.show{opacity:1;transform:translate(-50%,0)}a.btn{text-decoration:none}@media(max-width:720px){.grid{grid-template-columns:1fr}.details{grid-template-columns:1fr}}@media(max-width:520px){.app{padding:16px 11px 32px}.title{font-size:22px}.top{align-items:flex-start}.section{padding:14px}}
-</style></head><body><main class="app"><div class="top"><div><div class="title">Print Server</div><div class="subtitle">USB printer over Wi-Fi</div></div><div class="actions"><a class="btn" href="/scan">Scanner</a><button class="btn" id="refreshBtn" onclick="refreshStatus()">Refresh</button></div></div><div class="grid"><div class="card"><div class="label">Printer</div><div id="printerName" class="value">)HTML";
+</style></head><body><main class="app"><div class="top"><div><div class="title">Print Server</div><div class="subtitle">USB printer over Wi-Fi</div></div><div class="actions"><a class="btn" href="/scan">Scanner (disabled)</a><button class="btn" id="refreshBtn" onclick="refreshStatus()">Refresh</button></div></div><div class="grid"><div class="card"><div class="label">Printer</div><div id="printerName" class="value">)HTML";
   html += esc(deviceName);
   html += R"HTML(</div><div id="printerState" class="small">)HTML";
   html += esc(printerStateText());
@@ -259,8 +275,9 @@ String dashboard() {
   html += esc(ip.length() ? ip : "Unavailable");
   html += R"HTML(</div></div><div class="detail"><div class="detailKey">Hostname</div><div id="hostDetail" class="detailValue">)HTML";
   html += mdnsReady ? "printer.local" : "Unavailable";
-  html += R"HTML(</div></div></div></div><div class="section"><div class="sectionHead"><div><h2>Print address</h2><p>Use RAW / JetDirect with the printer's normal HP driver.</p></div></div><div class="service"><div id="printAddress" class="address">)HTML";
+  html += R"HTML(</div></div></div></div><div class="section"><div class="sectionHead"><div><h2>Print addresses</h2><p>RAW remains available; IPP advertises only HP PCL3GUI.</p></div></div><div class="service"><div id="printAddress" class="address">)HTML";
   html += mdnsReady ? "socket://printer.local:9100" : (ip.length() ? String("socket://") + ip + ":9100" : "Unavailable");
+  html += R"HTML(</div></div><div class="service" style="margin-top:8px"><div class="label">IPP · PCL3GUI only</div><div class="address">ipp://printer.local:631/ipp/print</div>)HTML";
   html += R"HTML(</div></div></div><div class="section"><div class="sectionHead"><div><h2>Wi-Fi</h2><p>Change the network used by this print server.</p></div><button class="btn" id="scanBtn" onclick="scanWifi()">Scan networks</button></div><div class="selectWrap"><select id="ssidSelect"><option value="">Select a Wi-Fi network…</option></select></div><div id="scanState" class="statusLine" style="display:none"></div><form class="wifiForm" method="POST" action="/save"><div class="field"><label for="ssid">Wi-Fi network</label><input id="ssid" name="ssid" value=")HTML";
   html += esc(config.ssid);
   html += R"HTML(" maxlength="32" autocomplete="off" placeholder="Select a network or enter a hidden SSID"></div><div class="field"><label for="password">Password</label><input id="password" type="password" name="password" placeholder="Leave blank to keep the saved password"></div><label class="check"><input type="checkbox" name="clearPassword" value="1"> Clear saved password for an open network</label><div class="actions"><button class="btn primary" type="submit">Save &amp; restart</button><span class="hint">Hidden SSIDs can be entered manually.</span></div></form></div></main><div id="toast" class="toast"></div><script>
@@ -300,14 +317,16 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println();
-  Serial.println("=== ESP32-S3 RAW 9100 USB Print Server ===");
-  Serial.println("[MODE] RAW JetDirect/AppSocket only; classic USB Printer Class is selected automatically");
+  Serial.println("=== ESP32-S3 HP PCL3GUI Print Server ===");
+  Serial.println("[MODE] RAW 9100 + IPP 631 PCL3GUI; both print through the classic USB Printer Class interface");
+  Serial.println("[MODE] IPP-over-USB printing is disabled/not used; scanner USB backend is disabled");
 
   loadConfig();
   if (!connectWiFi()) startConfigAP();
   startRawDiscovery();
 
   usbPrinterBackend.begin();
+  ippService.begin();
 
   configServer.on("/", HTTP_GET, handleRoot);
   configServer.on("/scan.json", HTTP_GET, sendJsonScan);
@@ -320,12 +339,14 @@ void setup() {
   Serial.printf("[HTTP] Open http://%s\n",
                 mdnsReady ? "printer.local" : (activeIp().length() ? activeIp().c_str() : "device-address"));
   Serial.println("[RAW] TCP 9100 server enabled");
+  Serial.println("[IPP] TCP 631 service enabled; document-format-supported=application/vnd.hp-PCL; version=PCL3GUI");
 }
 
 void loop() {
   configServer.handleClient();
   usbHost.poll();
   usbPrinterBackend.poll();
+  ippService.poll();
 
   if (millis() - lastStatus > 1000) {
     lastStatus = millis();

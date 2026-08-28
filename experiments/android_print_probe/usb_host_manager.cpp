@@ -30,6 +30,8 @@ struct Runtime {
   bool deviceOpen = false;
   bool printInterfaceClaimed = false;
   bool statusInterfaceClaimed = false;
+  bool ippInterfaceClaimed = false;
+  uint8_t claimedIppInterface = 0;
 
   volatile bool newDevice = false;
   volatile uint8_t newAddress = 0;
@@ -130,13 +132,19 @@ static void resetDevice() {
   g.deviceOpen = false;
   g.printInterfaceClaimed = false;
   g.statusInterfaceClaimed = false;
+  g.ippInterfaceClaimed = false;
   g.claimedPrintInterface = 0;
   g.claimedStatusInterface = 0;
+  g.claimedIppInterface = 0;
   g.statusTransfer = nullptr;
 }
 
 static void releaseInterfaces() {
   if (!g.deviceOpen || !g.device) return;
+  if (g.ippInterfaceClaimed) {
+    usb_host_interface_release(g.client, g.device, g.claimedIppInterface);
+    g.ippInterfaceClaimed = false;
+  }
   if (g.statusInterfaceClaimed) {
     usb_host_interface_release(g.client, g.device, g.claimedStatusInterface);
     g.statusInterfaceClaimed = false;
@@ -198,6 +206,28 @@ static bool claimInterfaces(UsbDeviceInfo &d, String &error) {
   }
 
   if (!d.statusInterfaceSeparate) d.statusInterface = d.printer;
+
+  d.ippSelectedIndex = -1;
+  uint8_t ippCandidate = 0;
+  for (uint8_t i = 0; i < d.printerInterfaceCount; ++i) {
+    const auto &ipp = d.printerInterfaces[i];
+    if (!ipp.usableForIppUsb()) continue;
+    const esp_err_t claim = usb_host_interface_claim(g.client, g.device,
+                                                      ipp.interfaceNumber,
+                                                      ipp.alternateSetting);
+    if (claim == ESP_OK) {
+      g.claimedIppInterface = ipp.interfaceNumber;
+      g.ippInterfaceClaimed = true;
+      d.ippSelectedIndex = (int8_t)ippCandidate;
+      Serial.printf("[USB] Claimed IPP-over-USB candidate %u IF=%u ALT=%u\n",
+                    ippCandidate, ipp.interfaceNumber, ipp.alternateSetting);
+      break;
+    }
+    Serial.printf("[USB] IPP-over-USB candidate %u IF=%u ALT=%u claim failed: %s\n",
+                  ippCandidate, ipp.interfaceNumber, ipp.alternateSetting,
+                  esp_err_to_name(claim));
+    ++ippCandidate;
+  }
 
   Serial.printf("[USB] Selected Printer Class IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X\n",
                 d.printer.interfaceNumber, d.printer.alternateSetting,
@@ -267,13 +297,10 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
 
       if (i->bInterfaceClass == USB_PRINTER_CLASS_CODE &&
           i->bInterfaceSubClass == USB_PRINTER_SUBCLASS_CODE) {
-        if (i->bInterfaceProtocol == 0x04) {
-          Serial.printf("[USB] Ignoring IF=%u ALT=%u: protocol 0x04 is IPP-over-USB, not RAW printing\n",
+        if (i->bInterfaceProtocol == 0xFF) {
+          Serial.printf("[USB] Ignoring IF=%u ALT=%u: vendor-specific Printer Class protocol 0xFF is not verified\n",
                         i->bInterfaceNumber, i->bAlternateSetting);
-        } else if (i->bInterfaceProtocol == 0xFF) {
-          Serial.printf("[USB] Ignoring IF=%u ALT=%u: vendor-specific Printer Class protocol 0xFF is not verified for RAW\n",
-                        i->bInterfaceNumber, i->bAlternateSetting);
-        } else if (i->bInterfaceProtocol >= 0x01 && i->bInterfaceProtocol <= 0x03 &&
+        } else if (i->bInterfaceProtocol >= 0x01 && i->bInterfaceProtocol <= 0x04 &&
                    out.printerInterfaceCount < UsbDeviceInfo::MAX_PRINTER_INTERFACES) {
           printerCurrent = &out.printerInterfaces[out.printerInterfaceCount++];
           printerCurrent->found = true;
@@ -299,11 +326,19 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
     return false;
   }
 
+  uint8_t rawNumber = 0;
+  uint8_t ippNumber = 0;
   for (uint8_t i = 0; i < out.printerInterfaceCount; ++i) {
     const auto &p = out.printerInterfaces[i];
-    Serial.printf("[USB] RAW candidate %u: IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X score=%d\n",
-                  i, p.interfaceNumber, p.alternateSetting, p.protocol,
-                  p.bulkOut.address, p.bulkIn.address, printScore(p));
+    if (p.usableForIppUsb()) {
+      Serial.printf("[USB] IPP-over-USB candidate %u: IF=%u ALT=%u OUT=0x%02X IN=0x%02X\n",
+                    ippNumber++, p.interfaceNumber, p.alternateSetting,
+                    p.bulkOut.address, p.bulkIn.address);
+    } else if (p.usableForRawPrint()) {
+      Serial.printf("[USB] RAW candidate %u: IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X score=%d\n",
+                    rawNumber++, p.interfaceNumber, p.alternateSetting, p.protocol,
+                    p.bulkOut.address, p.bulkIn.address, printScore(p));
+    }
   }
 
   if (!claimInterfaces(out, error)) {
@@ -517,6 +552,64 @@ const UsbPrinterInterfaceInfo *UsbHostManager::statusInterface() const {
   return device_.statusInterface.found ? &device_.statusInterface : nullptr;
 }
 
+
+uint8_t UsbHostManager::ippInterfaceCount() const {
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < device_.printerInterfaceCount; ++i) {
+    if (device_.printerInterfaces[i].usableForIppUsb()) ++count;
+  }
+  return count;
+}
+
+const UsbPrinterInterfaceInfo *UsbHostManager::ippInterfaceAt(uint8_t index) const {
+  uint8_t seen = 0;
+  for (uint8_t i = 0; i < device_.printerInterfaceCount; ++i) {
+    const auto &p = device_.printerInterfaces[i];
+    if (!p.usableForIppUsb()) continue;
+    if (seen == index) return &p;
+    ++seen;
+  }
+  return nullptr;
+}
+
+bool UsbHostManager::selectIppInterface(uint8_t index, String &error) {
+  const UsbPrinterInterfaceInfo *target = ippInterfaceAt(index);
+  if (!target) {
+    error = "Invalid IPP-over-USB interface index";
+    return false;
+  }
+  if (!g.deviceOpen || !g.device) {
+    error = "USB device is not open";
+    return false;
+  }
+  if (target->interfaceNumber == device_.printer.interfaceNumber) {
+    error = "IPP-over-USB candidate conflicts with active RAW interface";
+    return false;
+  }
+  if (device_.ippSelectedIndex == (int8_t)index && g.ippInterfaceClaimed) return true;
+
+  if (g.ippInterfaceClaimed) {
+    usb_host_interface_release(g.client, g.device, g.claimedIppInterface);
+    g.ippInterfaceClaimed = false;
+    device_.ippSelectedIndex = -1;
+  }
+
+  const esp_err_t e = usb_host_interface_claim(g.client, g.device,
+                                                target->interfaceNumber,
+                                                target->alternateSetting);
+  if (e != ESP_OK) {
+    error = String("IPP-over-USB interface claim failed: ") + esp_err_to_name(e);
+    return false;
+  }
+  g.claimedIppInterface = target->interfaceNumber;
+  g.ippInterfaceClaimed = true;
+  device_.ippSelectedIndex = (int8_t)index;
+  Serial.printf("[USB] Selected IPP-over-USB candidate %u IF=%u ALT=%u OUT=0x%02X IN=0x%02X\n",
+                index, target->interfaceNumber, target->alternateSetting,
+                target->bulkOut.address, target->bulkIn.address);
+  return true;
+}
+
 bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accepted,
                                uint32_t timeoutMs, String &error) {
   accepted = 0;
@@ -580,6 +673,109 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
   if (status != USB_TRANSFER_STATUS_COMPLETED || accepted != length) {
     error = String("USB bulk transfer failed status=") + String((int)status) +
             " accepted=" + String((unsigned)accepted) + "/" + String((unsigned)length);
+    return false;
+  }
+  return true;
+}
+
+
+bool UsbHostManager::ippBulkWrite(const uint8_t *data, size_t length, size_t &accepted,
+                                  uint32_t timeoutMs, String &error) {
+  accepted = 0;
+  const int8_t selected = device_.ippSelectedIndex;
+  const UsbPrinterInterfaceInfo *iface = selected >= 0 ? ippInterfaceAt((uint8_t)selected) : nullptr;
+  if (!data || !length) { error = "empty IPP-over-USB transfer"; return false; }
+  if (!g.deviceOpen || !g.ippInterfaceClaimed || !iface || !iface->usableForIppUsb()) {
+    error = "IPP-over-USB interface is not claimed/ready";
+    return false;
+  }
+  if (length > 16384) { error = "IPP-over-USB transfer chunk exceeds 16 KiB"; return false; }
+
+  usb_transfer_t *t = nullptr;
+  esp_err_t e = usb_host_transfer_alloc(length, 0, &t);
+  if (e != ESP_OK || !t) { error = String("usb_host_transfer_alloc failed: ") + esp_err_to_name(e); return false; }
+  TransferWait w;
+  w.done = xSemaphoreCreateBinary();
+  if (!w.done) { usb_host_transfer_free(t); error = "unable to allocate transfer completion semaphore"; return false; }
+
+  memcpy(t->data_buffer, data, length);
+  t->num_bytes = length;
+  t->device_handle = g.device;
+  t->bEndpointAddress = iface->bulkOut.address;
+  t->callback = bulkTransferCallback;
+  t->context = &w;
+  t->timeout_ms = timeoutMs;
+
+  e = usb_host_transfer_submit(t);
+  if (e != ESP_OK) {
+    vSemaphoreDelete(w.done); usb_host_transfer_free(t);
+    error = String("IPP-over-USB OUT submit failed: ") + esp_err_to_name(e);
+    return false;
+  }
+  const TickType_t waitTicks = timeoutMs ? pdMS_TO_TICKS(timeoutMs + 250) : portMAX_DELAY;
+  if (xSemaphoreTake(w.done, waitTicks) != pdTRUE) {
+    usb_host_endpoint_halt(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_flush(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_clear(t->device_handle, t->bEndpointAddress);
+    xSemaphoreTake(w.done, portMAX_DELAY);
+  }
+  accepted = static_cast<size_t>(t->actual_num_bytes);
+  const usb_transfer_status_t status = t->status;
+  vSemaphoreDelete(w.done); usb_host_transfer_free(t);
+  if (status != USB_TRANSFER_STATUS_COMPLETED || accepted != length) {
+    error = String("IPP-over-USB OUT failed status=") + String((int)status) +
+            " accepted=" + String((unsigned)accepted) + "/" + String((unsigned)length);
+    return false;
+  }
+  return true;
+}
+
+bool UsbHostManager::ippBulkRead(uint8_t *data, size_t capacity, size_t &received,
+                                 uint32_t timeoutMs, String &error) {
+  received = 0;
+  const int8_t selected = device_.ippSelectedIndex;
+  const UsbPrinterInterfaceInfo *iface = selected >= 0 ? ippInterfaceAt((uint8_t)selected) : nullptr;
+  if (!data || !capacity) { error = "empty IPP-over-USB read buffer"; return false; }
+  if (!g.deviceOpen || !g.ippInterfaceClaimed || !iface || !iface->usableForIppUsb()) {
+    error = "IPP-over-USB interface is not claimed/ready";
+    return false;
+  }
+  if (capacity > 16384) capacity = 16384;
+
+  usb_transfer_t *t = nullptr;
+  esp_err_t e = usb_host_transfer_alloc(capacity, 0, &t);
+  if (e != ESP_OK || !t) { error = String("usb_host_transfer_alloc failed: ") + esp_err_to_name(e); return false; }
+  TransferWait w;
+  w.done = xSemaphoreCreateBinary();
+  if (!w.done) { usb_host_transfer_free(t); error = "unable to allocate transfer completion semaphore"; return false; }
+
+  t->num_bytes = capacity;
+  t->device_handle = g.device;
+  t->bEndpointAddress = iface->bulkIn.address;
+  t->callback = bulkTransferCallback;
+  t->context = &w;
+  t->timeout_ms = timeoutMs;
+
+  e = usb_host_transfer_submit(t);
+  if (e != ESP_OK) {
+    vSemaphoreDelete(w.done); usb_host_transfer_free(t);
+    error = String("IPP-over-USB IN submit failed: ") + esp_err_to_name(e);
+    return false;
+  }
+  const TickType_t waitTicks = timeoutMs ? pdMS_TO_TICKS(timeoutMs + 250) : portMAX_DELAY;
+  if (xSemaphoreTake(w.done, waitTicks) != pdTRUE) {
+    usb_host_endpoint_halt(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_flush(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_clear(t->device_handle, t->bEndpointAddress);
+    xSemaphoreTake(w.done, portMAX_DELAY);
+  }
+  received = static_cast<size_t>(t->actual_num_bytes);
+  const usb_transfer_status_t status = t->status;
+  if (status == USB_TRANSFER_STATUS_COMPLETED && received) memcpy(data, t->data_buffer, received);
+  vSemaphoreDelete(w.done); usb_host_transfer_free(t);
+  if (status != USB_TRANSFER_STATUS_COMPLETED || received == 0) {
+    error = String("IPP-over-USB IN failed status=") + String((int)status) +
+            " received=" + String((unsigned)received);
     return false;
   }
   return true;

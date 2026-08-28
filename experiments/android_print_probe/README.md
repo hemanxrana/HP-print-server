@@ -47,3 +47,8 @@ Useful outcomes include:
 PCAPdroid can capture application traffic without root by using Android's local VPN API. Filter the capture to the HP Print Service (or the system print service), reproduce discovery/printing, then export the PCAP. A PCAP is useful because it also shows DNS/mDNS and connections the ESP32 probe may not be listening for.
 
 For the first run, the ESP32 probe logs are usually easier because they immediately tell us whether ports 631 or 9100 were contacted.
+
+
+## One-flash diagnostic dashboard
+
+The probe now boots in Safe Capture mode and can switch at runtime between Safe Capture, Classic USB RAW, and experimental IPP-over-USB. The dashboard exposes protocol-0x04 interface candidates, last Android IPP request, PCLm capture completeness, USB bytes accepted, stack/heap telemetry, and the recommended next action. No reflash is required between these transport tests.

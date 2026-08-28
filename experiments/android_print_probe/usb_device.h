@@ -28,8 +28,15 @@ struct UsbPrinterInterfaceInfo {
            bulkOut.valid() && bulkOut.isBulk() && !bulkOut.isIn();
   }
 
+  bool usableForIppUsb() const {
+    return found &&
+           subclass == 0x01 && protocol == 0x04 &&
+           bulkOut.valid() && bulkOut.isBulk() && !bulkOut.isIn() &&
+           bulkIn.valid() && bulkIn.isBulk() && bulkIn.isIn();
+  }
+
   bool usableForStatus() const {
-    return found && subclass == 0x01;
+    return found && subclass == 0x01 && protocol >= 0x01 && protocol <= 0x03;
   }
 };
 
@@ -60,5 +67,6 @@ struct UsbDeviceInfo {
   UsbPrinterInterfaceInfo printer;
   UsbPrinterInterfaceInfo statusInterface;
   bool statusInterfaceSeparate = false;
+  int8_t ippSelectedIndex = -1;
   UsbPortStatus portStatus;
 };

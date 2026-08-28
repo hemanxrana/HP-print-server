@@ -3,6 +3,8 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "usb_host_manager.h"
 
 // One-flash Android/HP print probe.
@@ -22,6 +24,9 @@ constexpr size_t HTTP_HEADER_LIMIT = 4096;
 constexpr size_t IPP_PREFIX_LIMIT = 16384;
 constexpr size_t USB_CHUNK = 1024;
 constexpr size_t PREVIEW_BYTES = 64;
+constexpr size_t IPP_RESPONSE_BUFFER_SIZE = 4096;
+constexpr size_t DOCUMENT_BUFFER_SIZE = 1024;
+constexpr size_t LOOP_STACK_CONFIGURED_BYTES = 16 * 1024;
 
 Preferences prefs;
 WebServer web(80);
@@ -29,8 +34,23 @@ WiFiServer ippServer(IPP_PORT);
 WiFiServer rawServer(RAW_PORT);
 UsbHostManager usbHost;
 
-bool usbForwardingEnabled = false;
+static uint8_t ippResponseBuffer[IPP_RESPONSE_BUFFER_SIZE];
+static uint8_t documentBuffer[DOCUMENT_BUFFER_SIZE];
+
+enum ProbeMode : uint8_t { MODE_SAFE = 0, MODE_CLASSIC_RAW = 1, MODE_IPP_USB = 2 };
+ProbeMode probeMode = MODE_SAFE;
 uint32_t jobSequence = 0;
+size_t minLoopStackFree = (size_t)-1;
+
+struct LastRequest {
+  bool seen = false;
+  uint16_t operation = 0;
+  uint32_t requestId = 0;
+  String transfer;
+  String format;
+  String jobName;
+};
+LastRequest lastRequest;
 
 struct LastJob {
   bool seen = false;
@@ -38,7 +58,9 @@ struct LastJob {
   uint32_t jobId = 0;
   String format;
   String source;
+  String transport;
   uint64_t documentBytes = 0;
+  uint64_t usbAccepted = 0;
   uint32_t fnv1a = 2166136261u;
   uint8_t first[PREVIEW_BYTES] = {};
   size_t firstLen = 0;
@@ -46,8 +68,11 @@ struct LastJob {
   size_t tailLen = 0;
   size_t tailPos = 0;
   bool chunked = false;
+  bool bodyComplete = false;
   bool usbAttempted = false;
   bool usbSuccess = false;
+  bool responseProxied = false;
+  int8_t physicalResult = 0; // 0 unknown, 1 printed, -1 no output
   String usbError;
 };
 
@@ -59,6 +84,29 @@ String htmlEscape(String s) {
   s.replace(">", "&gt;");
   s.replace("\"", "&quot;");
   return s;
+}
+
+const char *modeName() {
+  switch (probeMode) {
+    case MODE_SAFE: return "SAFE CAPTURE";
+    case MODE_CLASSIC_RAW: return "CLASSIC USB RAW";
+    case MODE_IPP_USB: return "IPP-OVER-USB EXPERIMENTAL";
+  }
+  return "UNKNOWN";
+}
+
+size_t currentLoopStackFree() {
+  return (size_t)uxTaskGetStackHighWaterMark(nullptr);
+}
+
+void noteStack(const char *where, bool logNow = false) {
+  const size_t freeNow = currentLoopStackFree();
+  if (freeNow < minLoopStackFree) minLoopStackFree = freeNow;
+  if (logNow) {
+    Serial.printf("[PROBE][MEM] %s loop-stack-free=%u min=%u heap=%u psram=%u\n",
+                  where, (unsigned)freeNow, (unsigned)minLoopStackFree,
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+  }
 }
 
 const char *ippOperationName(uint16_t op) {
@@ -210,15 +258,16 @@ struct HttpBodyReader {
 };
 
 struct IppWriter {
-  uint8_t data[4096];
+  uint8_t *data = ippResponseBuffer;
+  size_t capacity = IPP_RESPONSE_BUFFER_SIZE;
   size_t len = 0;
   bool ok = true;
 
-  void b(uint8_t v) { if (len < sizeof(data)) data[len++] = v; else ok = false; }
+  void b(uint8_t v) { if (len < capacity) data[len++] = v; else ok = false; }
   void u16(uint16_t v) { b((uint8_t)(v >> 8)); b((uint8_t)v); }
   void u32(uint32_t v) { b((uint8_t)(v >> 24)); b((uint8_t)(v >> 16)); b((uint8_t)(v >> 8)); b((uint8_t)v); }
   void raw(const uint8_t *p, size_t n) {
-    if (!ok || len + n > sizeof(data)) { ok = false; return; }
+    if (!ok || len + n > capacity) { ok = false; return; }
     memcpy(data + len, p, n); len += n;
   }
   void attr(uint8_t tag, const char *name, const uint8_t *value, uint16_t valueLen) {
@@ -376,48 +425,184 @@ bool forwardUsb(const uint8_t *data, size_t n, String &error) {
     size_t accepted = 0;
     if (!usbHost.bulkWrite(data + offset, part, accepted, 30000, error)) return false;
     if (accepted != part) { error = "USB short write"; return false; }
+    lastJob.usbAccepted += accepted;
     offset += part;
   }
   return true;
 }
 
-bool consumeDocument(HttpBodyReader &r) {
-  uint8_t buf[4096];
-  bool usbOk = true;
-  lastJob.usbAttempted = usbForwardingEnabled;
-  lastJob.usbSuccess = false;
+bool ippUsbWriteAll(const uint8_t *data, size_t n, String &error) {
+  size_t offset = 0;
+  while (offset < n) {
+    const size_t part = min((size_t)USB_CHUNK, n - offset);
+    size_t accepted = 0;
+    if (!usbHost.ippBulkWrite(data + offset, part, accepted, 30000, error)) return false;
+    if (accepted != part) { error = "IPP-over-USB short write"; return false; }
+    lastJob.usbAccepted += accepted;
+    offset += part;
+  }
+  return true;
+}
 
-  if (usbForwardingEnabled && usbHost.state() != UsbHostManager::PRINTER_READY) {
-    lastJob.usbError = "USB forwarding enabled but printer interface is not ready";
-    usbOk = false;
+bool ippUsbChunk(const uint8_t *data, size_t n, String &error) {
+  char line[20];
+  const int len = snprintf(line, sizeof(line), "%X\r\n", (unsigned)n);
+  if (len <= 0 || !ippUsbWriteAll((const uint8_t *)line, (size_t)len, error)) return false;
+  if (n && !ippUsbWriteAll(data, n, error)) return false;
+  static const uint8_t crlf[] = {'\r','\n'};
+  return ippUsbWriteAll(crlf, sizeof(crlf), error);
+}
+
+bool beginIppUsbRequest(uint8_t major, uint8_t minor, uint32_t requestId,
+                        const String &format, const String &jobName, String &error) {
+  const int8_t selected = usbHost.selectedIppInterfaceIndex();
+  if (selected < 0 || !usbHost.ippInterfaceAt((uint8_t)selected)) {
+    error = "No claimed IPP-over-USB interface";
+    return false;
+  }
+  const String http =
+      "POST /ipp/print HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Content-Type: application/ipp\r\n"
+      "Transfer-Encoding: chunked\r\n"
+      "Connection: close\r\n\r\n";
+  if (!ippUsbWriteAll((const uint8_t *)http.c_str(), http.length(), error)) return false;
+
+  IppWriter w;
+  w.b(major ? major : 2); w.b(major ? minor : 0); w.u16(0x0002); w.u32(requestId);
+  w.b(0x01);
+  w.str(0x47, "attributes-charset", "utf-8");
+  w.str(0x48, "attributes-natural-language", "en");
+  w.str(0x45, "printer-uri", "ipp://localhost/ipp/print");
+  w.str(0x42, "requesting-user-name", "android");
+  w.str(0x42, "job-name", jobName.length() ? jobName.c_str() : "Android Print Job");
+  w.str(0x49, "document-format", format.length() ? format.c_str() : "application/PCLm");
+  w.b(0x03);
+  if (!w.ok) { error = "Unable to build IPP-over-USB request prefix"; return false; }
+  return ippUsbChunk(w.data, w.len, error);
+}
+
+bool proxyIppUsbResponse(WiFiClient &networkClient, bool &anyResponse, String &error) {
+  anyResponse = false;
+  String header;
+  header.reserve(1024);
+  bool headerDone = false;
+  int64_t contentLength = -1;
+  size_t total = 0;
+  size_t headerBytes = 0;
+  const size_t responseLimit = 128 * 1024;
+
+  while (total < responseLimit) {
+    size_t got = 0;
+    String readError;
+    if (!usbHost.ippBulkRead(documentBuffer, DOCUMENT_BUFFER_SIZE, got, 5000, readError)) {
+      if (anyResponse && headerDone && contentLength < 0) return true;
+      error = readError;
+      return false;
+    }
+    anyResponse = true;
+    networkClient.write(documentBuffer, got);
+    networkClient.flush();
+    total += got;
+
+    if (!headerDone && header.length() < HTTP_HEADER_LIMIT) {
+      for (size_t i = 0; i < got && header.length() < HTTP_HEADER_LIMIT; ++i) header += (char)documentBuffer[i];
+      const int end = header.indexOf("\r\n\r\n");
+      if (end >= 0) {
+        headerDone = true;
+        headerBytes = (size_t)end + 4;
+        const String cl = headerValue(header, "Content-Length");
+        if (cl.length()) contentLength = cl.toInt();
+      }
+    }
+    if (headerDone && contentLength >= 0 && total >= headerBytes + (size_t)contentLength) return true;
+    delay(1);
+  }
+  error = "IPP-over-USB response exceeded 128 KiB limit";
+  return false;
+}
+
+bool consumeDocument(HttpBodyReader &r, WiFiClient &networkClient,
+                     uint8_t major, uint8_t minor, uint32_t requestId,
+                     const String &format, const String &jobName,
+                     bool &responseSent) {
+  responseSent = false;
+  bool transportOk = true;
+  bool anyUsbResponse = false;
+  lastJob.usbAttempted = probeMode != MODE_SAFE;
+  lastJob.usbSuccess = false;
+  lastJob.responseProxied = false;
+  lastJob.transport = modeName();
+
+  if (probeMode == MODE_CLASSIC_RAW && usbHost.state() != UsbHostManager::PRINTER_READY) {
+    lastJob.usbError = "Classic RAW selected but printer interface is not ready";
+    transportOk = false;
+  }
+  if (probeMode == MODE_IPP_USB) {
+    String error;
+    if (!beginIppUsbRequest(major, minor, requestId, format, jobName, error)) {
+      lastJob.usbError = error;
+      transportOk = false;
+    }
   }
 
+  uint64_t nextProgress = 256 * 1024ULL;
   while (true) {
     size_t n = 0;
-    while (n < sizeof(buf)) {
+    while (n < DOCUMENT_BUFFER_SIZE) {
       uint8_t b = 0;
       if (!r.readByte(b)) break;
-      buf[n++] = b;
+      documentBuffer[n++] = b;
     }
     if (n == 0) break;
-    noteDocumentBytes(buf, n);
-    if (usbForwardingEnabled && usbOk) {
+    noteDocumentBytes(documentBuffer, n);
+
+    if (transportOk && probeMode == MODE_CLASSIC_RAW) {
       String error;
-      if (!forwardUsb(buf, n, error)) {
-        usbOk = false;
+      if (!forwardUsb(documentBuffer, n, error)) {
+        transportOk = false;
         lastJob.usbError = error;
-        Serial.printf("[PROBE][USB] Forwarding failed after %llu document bytes: %s\n",
-                      (unsigned long long)lastJob.documentBytes, error.c_str());
+      }
+    } else if (transportOk && probeMode == MODE_IPP_USB) {
+      String error;
+      if (!ippUsbChunk(documentBuffer, n, error)) {
+        transportOk = false;
+        lastJob.usbError = error;
+      }
+    }
+
+    if (lastJob.documentBytes >= nextProgress) {
+      Serial.printf("[PROBE][JOB] streamed %llu document bytes mode=%s\n",
+                    (unsigned long long)lastJob.documentBytes, modeName());
+      noteStack("print-stream", true);
+      nextProgress += 256 * 1024ULL;
+    }
+    delay(1);
+  }
+
+  lastJob.bodyComplete = r.done;
+  if (!lastJob.bodyComplete && lastJob.usbError.isEmpty()) lastJob.usbError = "HTTP/IPP document body ended unexpectedly";
+
+  if (probeMode == MODE_IPP_USB && transportOk && lastJob.bodyComplete) {
+    String error;
+    if (!ippUsbChunk(nullptr, 0, error)) {
+      transportOk = false;
+      lastJob.usbError = error;
+    } else {
+      const bool completeResponse = proxyIppUsbResponse(networkClient, anyUsbResponse, error);
+      responseSent = anyUsbResponse;
+      lastJob.responseProxied = anyUsbResponse;
+      if (!completeResponse) {
+        transportOk = false;
+        lastJob.usbError = error;
       }
     }
   }
 
-  if (usbForwardingEnabled && usbOk) {
-    lastJob.usbSuccess = true;
-    Serial.printf("[PROBE][USB] Forwarded %llu PCLm bytes to classic USB print interface\n",
-                  (unsigned long long)lastJob.documentBytes);
-  }
-  return !usbForwardingEnabled || usbOk;
+  if (probeMode == MODE_CLASSIC_RAW) lastJob.usbSuccess = transportOk && lastJob.bodyComplete;
+  else if (probeMode == MODE_IPP_USB) lastJob.usbSuccess = transportOk && lastJob.bodyComplete && anyUsbResponse;
+
+  return probeMode == MODE_SAFE ? lastJob.bodyComplete : lastJob.usbSuccess;
 }
 
 void printPreview(const uint8_t *data, size_t n, const char *label) {
@@ -427,14 +612,15 @@ void printPreview(const uint8_t *data, size_t n, const char *label) {
 }
 
 void printLastJobSummary() {
-  Serial.printf("[PROBE][JOB] id=%lu request-id=%lu format=%s transfer=%s bytes=%llu fnv1a=0x%08lX mode=%s\n",
+  Serial.printf("[PROBE][JOB] id=%lu request-id=%lu format=%s transfer=%s bytes=%llu complete=%d mode=%s usb-accepted=%llu usb-success=%d\n",
                 (unsigned long)lastJob.jobId, (unsigned long)lastJob.requestId,
                 lastJob.format.c_str(), lastJob.chunked ? "chunked" : "content-length",
-                (unsigned long long)lastJob.documentBytes, (unsigned long)lastJob.fnv1a,
-                usbForwardingEnabled ? "USB-FORWARD" : "SAFE-CAPTURE");
+                (unsigned long long)lastJob.documentBytes, (int)lastJob.bodyComplete,
+                lastJob.transport.c_str(), (unsigned long long)lastJob.usbAccepted,
+                (int)lastJob.usbSuccess);
   printPreview(lastJob.first, lastJob.firstLen, "first");
   uint8_t orderedTail[PREVIEW_BYTES] = {};
-  size_t tailN = lastJob.tailLen;
+  const size_t tailN = lastJob.tailLen;
   if (tailN < PREVIEW_BYTES) memcpy(orderedTail, lastJob.tail, tailN);
   else for (size_t i = 0; i < PREVIEW_BYTES; ++i) orderedTail[i] = lastJob.tail[(lastJob.tailPos + i) % PREVIEW_BYTES];
   printPreview(orderedTail, tailN, "tail");
@@ -445,6 +631,8 @@ void printLastJobSummary() {
     }
     Serial.printf("[PROBE][JOB] first ASCII: %s\n", ascii.c_str());
   }
+  if (lastJob.usbError.length()) Serial.printf("[PROBE][USB] %s\n", lastJob.usbError.c_str());
+  noteStack("print-end", true);
 }
 
 void handleIppClient(WiFiClient client) {
@@ -496,21 +684,32 @@ void handleIppClient(WiFiClient client) {
     client.stop(); return;
   }
 
+  lastRequest.seen = true;
+  lastRequest.operation = op;
+  lastRequest.requestId = requestId;
+  lastRequest.transfer = chunked ? "chunked" : "content-length";
+  lastRequest.format = format;
+  lastRequest.jobName = jobName;
+
   if (op == 0x000B) {
     IppWriter w; buildPrinterAttributes(w, major, minor, requestId); sendHttpIpp(client, w);
     Serial.printf("[PROBE][IPP] TX successful-ok Get-Printer-Attributes request-id=%lu\n", (unsigned long)requestId);
   } else if (op == 0x0004) {
     Serial.printf("[PROBE][IPP] Validate-Job format=%s job=%s -> successful-ok\n", format.c_str(), jobName.c_str());
+    noteStack("validate-job", true);
     sendSimpleSuccess(client, major, minor, requestId);
   } else if (op == 0x0002) {
     resetLastJob(requestId, chunked);
     lastJob.format = format;
     lastJob.source = jobName;
-    Serial.printf("[PROBE][IPP] Print-Job format=%s job=%s; extracting document (%s)\n",
-                  format.c_str(), jobName.c_str(), usbForwardingEnabled ? "USB forwarding ON" : "safe capture only");
-    const bool ok = consumeDocument(body);
+    lastJob.transport = modeName();
+    Serial.printf("[PROBE][IPP] Print-Job format=%s job=%s; mode=%s\n",
+                  format.c_str(), jobName.c_str(), modeName());
+    noteStack("print-start", true);
+    bool responseSent = false;
+    const bool ok = consumeDocument(body, client, major, minor, requestId, format, jobName, responseSent);
     printLastJobSummary();
-    sendJobResponse(client, major, minor, requestId, lastJob.jobId, ok);
+    if (!responseSent) sendJobResponse(client, major, minor, requestId, lastJob.jobId, ok);
   } else if (op == 0x0009) {
     const uint32_t id = lastJob.jobId ? lastJob.jobId : 1;
     sendJobResponse(client, major, minor, requestId, id, true);
@@ -555,52 +754,151 @@ String hexString(const uint8_t *data, size_t n) {
   return s;
 }
 
+String asciiPreview() {
+  String out;
+  for (size_t i = 0; i < min(lastJob.firstLen, (size_t)32); ++i) {
+    const uint8_t b = lastJob.first[i]; out += (b >= 32 && b <= 126) ? (char)b : '.';
+  }
+  return out;
+}
+
 String jobSummaryHtml() {
   if (!lastJob.seen) return "<p>No Print-Job captured yet.</p>";
-  String h;
-  h += "<table>";
+  String h = "<table>";
   h += "<tr><th>Job</th><td>" + String(lastJob.jobId) + "</td></tr>";
   h += "<tr><th>Format</th><td>" + htmlEscape(lastJob.format) + "</td></tr>";
   h += "<tr><th>Transfer</th><td>" + String(lastJob.chunked ? "chunked" : "content-length") + "</td></tr>";
   h += "<tr><th>Document bytes</th><td>" + String((unsigned long long)lastJob.documentBytes) + "</td></tr>";
+  h += "<tr><th>Complete body</th><td>" + String(lastJob.bodyComplete ? "YES" : "NO") + "</td></tr>";
+  h += "<tr><th>First ASCII</th><td><code>" + htmlEscape(asciiPreview()) + "</code></td></tr>";
   h += "<tr><th>FNV-1a</th><td>0x" + String(lastJob.fnv1a, HEX) + "</td></tr>";
-  h += "<tr><th>First bytes</th><td><code>" + hexString(lastJob.first, lastJob.firstLen) + "</code></td></tr>";
-  if (lastJob.usbAttempted) {
-    h += "<tr><th>USB result</th><td>" + String(lastJob.usbSuccess ? "Forwarded successfully" : "FAILED: ") +
-         htmlEscape(lastJob.usbError) + "</td></tr>";
-  }
+  h += "<tr><th>Transport</th><td>" + htmlEscape(lastJob.transport) + "</td></tr>";
+  h += "<tr><th>USB bytes accepted</th><td>" + String((unsigned long long)lastJob.usbAccepted) + "</td></tr>";
+  h += "<tr><th>USB result</th><td>" + String(lastJob.usbAttempted ? (lastJob.usbSuccess ? "SUCCESS" : "FAILED") : "not attempted") + "</td></tr>";
+  if (lastJob.usbError.length()) h += "<tr><th>Error</th><td>" + htmlEscape(lastJob.usbError) + "</td></tr>";
+  h += "<tr><th>Physical result</th><td>" + String(lastJob.physicalResult > 0 ? "Printed" : (lastJob.physicalResult < 0 ? "No output" : "Unknown")) + "</td></tr>";
   h += "</table>";
   return h;
 }
 
-void handleWebRoot() {
-  String html;
-  html.reserve(12000);
-  html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Android Print Probe</title><style>body{font-family:system-ui;max-width:980px;margin:24px auto;padding:0 14px;color:#263238}section{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}button{padding:10px 14px;border-radius:8px;border:1px solid #999;font-weight:600}button.danger{background:#b42318;color:white}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:7px;border-bottom:1px solid #eee}th{width:190px}code{word-break:break-all}.warn{background:#fff4e5;border:1px solid #f0c36d;padding:10px;border-radius:8px}</style></head><body>";
-  html += "<h1>Android Print Probe — one flash</h1>";
-  html += "<section><h2>Mode</h2>";
-  html += String("<p><b>") + (usbForwardingEnabled ? "USB FORWARDING ENABLED" : "SAFE CAPTURE ONLY") + "</b></p>";
-  if (!usbForwardingEnabled) {
-    html += "<p class='warn'>Safe mode extracts and verifies PCLm but never sends it to the printer.</p>";
-    html += "<form method='POST' action='/forward'><input type='hidden' name='enable' value='1'><button class='danger'>Enable USB forwarding</button></form>";
-  } else {
-    html += "<p class='warn'>Print-Job document bytes will now be sent to the classic USB printer interface. This setting resets to OFF after reboot.</p>";
-    html += "<form method='POST' action='/forward'><input type='hidden' name='enable' value='0'><button>Disable USB forwarding</button></form>";
+String lastRequestHtml() {
+  if (!lastRequest.seen) return "<p>No Android IPP request observed yet.</p>";
+  String h = "<table>";
+  h += "<tr><th>Operation</th><td>" + String(ippOperationName(lastRequest.operation)) + " (0x" + String(lastRequest.operation, HEX) + ")</td></tr>";
+  h += "<tr><th>Request ID</th><td>" + String(lastRequest.requestId) + "</td></tr>";
+  h += "<tr><th>Transfer</th><td>" + htmlEscape(lastRequest.transfer) + "</td></tr>";
+  h += "<tr><th>Document format</th><td>" + htmlEscape(lastRequest.format) + "</td></tr>";
+  h += "<tr><th>Job name</th><td>" + htmlEscape(lastRequest.jobName) + "</td></tr>";
+  h += "</table>";
+  return h;
+}
+
+String recommendedAction() {
+  if (!lastJob.seen) return "Leave Safe Capture selected and send the same photo from Android.";
+  if (!lastJob.bodyComplete) return "Capture was incomplete. Keep Safe Capture selected and retry before any USB transport test.";
+  if (probeMode == MODE_SAFE) return "Capture is complete. Select Classic USB RAW and send the same photo again.";
+  if (lastJob.transport == "CLASSIC USB RAW") {
+    if (!lastJob.usbSuccess) return "Classic USB RAW failed. Review the USB error before trying another transport.";
+    if (lastJob.physicalResult == 0) return "USB accepted the full document. Check the printer, then mark Printed or No output below.";
+    if (lastJob.physicalResult < 0) return "Classic USB RAW produced no page. Select IPP-over-USB Experimental and retry.";
+    return "The page printed through Classic USB RAW. This transport works for the tested job.";
   }
-  html += "</section><section><h2>USB</h2><p>" + htmlEscape(usbStateText()) + "</p>";
-  if (usbHost.device().attached) html += "<p>VID:PID " + String(usbHost.device().vid, HEX) + ":" + String(usbHost.device().pid, HEX) + " · " + htmlEscape(usbHost.device().product) + "</p>";
-  html += "</section><section><h2>Last IPP print job</h2>" + jobSummaryHtml() + "</section>";
-  html += "<section><h2>What this build handles</h2><p>Get-Printer-Attributes → Validate-Job → Print-Job, HTTP 100-continue, chunked transfer decoding, PCLm extraction, job response, and optional USB forwarding.</p></section>";
-  html += "</body></html>";
-  web.send(200, "text/html; charset=utf-8", html);
+  if (lastJob.transport == "IPP-OVER-USB EXPERIMENTAL") {
+    if (lastJob.usbSuccess) return "IPP-over-USB returned a printer response. Check Android and the physical printer result.";
+    return "IPP-over-USB failed. Try another protocol-0x04 interface candidate from the selector.";
+  }
+  return "Run the next test shown in Test Mode.";
+}
+
+void handleMode() {
+  if (!web.hasArg("mode")) { web.send(400, "text/plain", "Missing mode"); return; }
+  const String mode = web.arg("mode");
+  if (mode == "safe") probeMode = MODE_SAFE;
+  else if (mode == "classic") probeMode = MODE_CLASSIC_RAW;
+  else if (mode == "ippusb") {
+    if (usbHost.selectedIppInterfaceIndex() < 0) {
+      web.send(409, "text/plain", "No IPP-over-USB interface is currently claimed"); return;
+    }
+    probeMode = MODE_IPP_USB;
+  } else { web.send(400, "text/plain", "Invalid mode"); return; }
+  Serial.printf("[PROBE] Test mode changed to %s\n", modeName());
+  web.sendHeader("Location", "/"); web.send(303);
+}
+
+void handleIppUsbSelect() {
+  if (!web.hasArg("index")) { web.send(400, "text/plain", "Missing index"); return; }
+  const int index = web.arg("index").toInt();
+  String error;
+  if (index < 0 || !usbHost.selectIppInterface((uint8_t)index, error)) {
+    web.send(503, "text/plain", String("IPP-over-USB selection failed: ") + error); return;
+  }
+  web.sendHeader("Location", "/"); web.send(303);
+}
+
+void handlePhysical() {
+  if (!lastJob.seen || !web.hasArg("result")) { web.send(400, "text/plain", "No job/result"); return; }
+  lastJob.physicalResult = web.arg("result") == "printed" ? 1 : -1;
+  web.sendHeader("Location", "/"); web.send(303);
 }
 
 void handleForwardToggle() {
-  if (!web.hasArg("enable")) { web.send(400, "text/plain", "Missing enable"); return; }
-  usbForwardingEnabled = web.arg("enable") == "1";
-  Serial.printf("[PROBE] USB forwarding %s from dashboard\n", usbForwardingEnabled ? "ENABLED" : "DISABLED");
+  probeMode = web.hasArg("enable") && web.arg("enable") == "1" ? MODE_CLASSIC_RAW : MODE_SAFE;
   web.sendHeader("Location", "/"); web.send(303);
+}
+
+void handleWebRoot() {
+  noteStack("dashboard", false);
+  String html;
+  html.reserve(15000);
+  html += "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>Android Print Probe</title><style>body{font-family:system-ui;max-width:1000px;margin:24px auto;padding:0 14px;color:#263238}section{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}button{padding:9px 13px;border-radius:8px;border:1px solid #999;font-weight:600;margin:4px}.warn{background:#fff4e5;border:1px solid #f0c36d;padding:10px;border-radius:8px}.good{background:#edf7ed;border:1px solid #8bc48b;padding:10px;border-radius:8px}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:7px;border-bottom:1px solid #eee}th{width:210px}code{word-break:break-all}label{display:block;margin:8px 0}</style></head><body>";
+  html += "<h1>Android Print Probe — one flash</h1>";
+  html += "<section><h2>Recommended next action</h2><div class='good'>" + htmlEscape(recommendedAction()) + "</div></section>";
+
+  html += "<section><h2>1. Test Mode</h2><p><b>Current: " + String(modeName()) + "</b></p><form method='POST' action='/mode'>";
+  html += "<label><input type='radio' name='mode' value='safe' " + String(probeMode == MODE_SAFE ? "checked" : "") + "> Safe capture only — dechunk, parse and verify PCLm; no USB output</label>";
+  html += "<label><input type='radio' name='mode' value='classic' " + String(probeMode == MODE_CLASSIC_RAW ? "checked" : "") + "> Classic USB RAW — extracted PCLm only to IF1-style Printer Class Bulk OUT</label>";
+  html += "<label><input type='radio' name='mode' value='ippusb' " + String(probeMode == MODE_IPP_USB ? "checked" : "") + "> IPP-over-USB experimental — rebuild HTTP/IPP and proxy through protocol 0x04</label><button>Arm selected mode</button></form><p class='warn'>Mode resets to Safe Capture after reboot.</p></section>";
+
+  html += "<section><h2>2. USB printer status</h2><table><tr><th>State</th><td>" + htmlEscape(usbStateText()) + "</td></tr>";
+  if (usbHost.device().attached) {
+    html += "<tr><th>Printer</th><td>" + htmlEscape(usbHost.device().product) + "</td></tr>";
+    html += "<tr><th>VID:PID</th><td>" + String(usbHost.device().vid, HEX) + ":" + String(usbHost.device().pid, HEX) + "</td></tr>";
+  }
+  const UsbPrinterInterfaceInfo *raw = usbHost.selectedInterface();
+  if (raw) html += "<tr><th>RAW interface</th><td>IF" + String(raw->interfaceNumber) + " ALT" + String(raw->alternateSetting) + " protocol 0x" + String(raw->protocol, HEX) + " OUT 0x" + String(raw->bulkOut.address, HEX) + " IN 0x" + String(raw->bulkIn.address, HEX) + "</td></tr>";
+  html += "</table></section>";
+
+  html += "<section><h2>3. IPP-over-USB interface selector</h2>";
+  const uint8_t ippCount = usbHost.ippInterfaceCount();
+  if (!ippCount) html += "<p>No protocol-0x04 candidates detected.</p>";
+  else {
+    html += "<form method='POST' action='/ippusb'>";
+    for (uint8_t i = 0; i < ippCount; ++i) {
+      const UsbPrinterInterfaceInfo *it = usbHost.ippInterfaceAt(i); if (!it) continue;
+      html += "<label><input type='radio' name='index' value='" + String(i) + "' " + String(usbHost.selectedIppInterfaceIndex() == (int8_t)i ? "checked" : "") + "> Candidate " + String(i) + ": IF" + String(it->interfaceNumber) + " ALT" + String(it->alternateSetting) + " OUT 0x" + String(it->bulkOut.address, HEX) + " IN 0x" + String(it->bulkIn.address, HEX) + "</label>";
+    }
+    html += "<button>Select interface</button></form>";
+  }
+  html += "</section>";
+
+  html += "<section><h2>4. Last Android request</h2>" + lastRequestHtml() + "</section>";
+  html += "<section><h2>5. Captured document / transport result</h2>" + jobSummaryHtml();
+  if (lastJob.seen && lastJob.usbAttempted) {
+    html += "<form method='POST' action='/physical'><button name='result' value='printed'>Printer printed page</button><button name='result' value='no'>No physical output</button></form>";
+  }
+  html += "</section>";
+
+  html += "<section><h2>6. Memory / stability</h2><table>";
+  html += "<tr><th>Configured loop stack</th><td>" + String((unsigned)LOOP_STACK_CONFIGURED_BYTES) + " bytes</td></tr>";
+  html += "<tr><th>Current stack free</th><td>" + String((unsigned)currentLoopStackFree()) + "</td></tr>";
+  html += "<tr><th>Minimum stack free</th><td>" + String((unsigned)(minLoopStackFree == (size_t)-1 ? 0 : minLoopStackFree)) + "</td></tr>";
+  html += "<tr><th>Free heap</th><td>" + String((unsigned)ESP.getFreeHeap()) + " bytes</td></tr>";
+  html += "<tr><th>Free PSRAM</th><td>" + String((unsigned)ESP.getFreePsram()) + " bytes</td></tr></table></section>";
+
+  html += "<section><h2>Dashboard steps</h2><p>1) Safe Capture → print from Android. 2) Confirm Complete body=YES and PCLm signature. 3) Select Classic USB RAW → print again. 4) Mark physical result. 5) If no output, select IPP-over-USB and try candidate 0, then candidates 1/2 only if needed.</p></section>";
+  html += "</body></html>";
+  web.send(200, "text/html; charset=utf-8", html);
 }
 
 void handlePrinterIcon() {
@@ -658,8 +956,10 @@ void advertiseProbe() {
 void setup() {
   Serial.begin(115200); delay(500);
   Serial.println();
-  Serial.println("=== ESP32-S3 Android Print Probe — one-flash build ===");
-  Serial.println("[PROBE] Safe capture mode is ON by default; USB forwarding must be enabled from dashboard");
+  Serial.println("=== ESP32-S3 Android Print Probe — one-flash diagnostic dashboard ===");
+  Serial.printf("[PROBE] Loop stack configured: %u bytes\n", (unsigned)LOOP_STACK_CONFIGURED_BYTES);
+  Serial.println("[PROBE] Safe Capture is the default after every reboot");
+  noteStack("boot", true);
 
   if (!connectSavedWiFi()) startProbeAp();
   advertiseProbe();
@@ -669,13 +969,16 @@ void setup() {
 
   ippServer.begin(); rawServer.begin(); ippServer.setNoDelay(true); rawServer.setNoDelay(true);
   web.on("/", HTTP_GET, handleWebRoot);
+  web.on("/mode", HTTP_POST, handleMode);
+  web.on("/ippusb", HTTP_POST, handleIppUsbSelect);
+  web.on("/physical", HTTP_POST, handlePhysical);
   web.on("/forward", HTTP_POST, handleForwardToggle);
   web.on("/webApps/images/printer.png", HTTP_GET, handlePrinterIcon);
   web.begin();
 
   const String ip = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
   Serial.printf("[PROBE] Dashboard: http://%s/ (or http://printer.local/)\n", ip.c_str());
-  Serial.println("[PROBE] First run: leave SAFE CAPTURE enabled and print once from HP Print Service.");
+  Serial.println("[PROBE] First run: leave SAFE CAPTURE selected and print once from HP Print Service.");
 }
 
 void loop() {
@@ -683,5 +986,10 @@ void loop() {
   usbHost.poll();
   serviceIpp();
   serviceRaw();
+  static unsigned long lastMem = 0;
+  if (millis() - lastMem >= 1000) {
+    lastMem = millis();
+    noteStack("loop", false);
+  }
   delay(1);
 }

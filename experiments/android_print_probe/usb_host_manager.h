@@ -22,8 +22,17 @@ public:
   const UsbPrinterInterfaceInfo *selectedInterface() const;
   const UsbPrinterInterfaceInfo *statusInterface() const;
 
+  uint8_t ippInterfaceCount() const;
+  const UsbPrinterInterfaceInfo *ippInterfaceAt(uint8_t index) const;
+  int8_t selectedIppInterfaceIndex() const { return device_.ippSelectedIndex; }
+  bool selectIppInterface(uint8_t index, String &error);
+
   bool bulkWrite(const uint8_t *data, size_t length, size_t &accepted,
                  uint32_t timeoutMs, String &error);
+  bool ippBulkWrite(const uint8_t *data, size_t length, size_t &accepted,
+                    uint32_t timeoutMs, String &error);
+  bool ippBulkRead(uint8_t *data, size_t capacity, size_t &received,
+                   uint32_t timeoutMs, String &error);
 
   bool portStatusValid() const { return device_.portStatus.valid; }
   uint8_t portStatusValue() const { return device_.portStatus.value; }

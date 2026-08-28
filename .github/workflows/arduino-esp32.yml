@@ -27,3 +27,7 @@ jobs:
       - name: Compile standalone Android print probe
         run: |
           arduino-cli compile --fqbn esp32:esp32:esp32s3 --warnings all --output-dir build-probe experiments/android_print_probe
+
+      - name: Compile Android print probe v2
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32s3 --warnings all --output-dir build-probe-v2 experiments/android_print_probe_v2

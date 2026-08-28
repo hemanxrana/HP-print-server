@@ -23,3 +23,7 @@ jobs:
       - name: Compile ESP32-S3 firmware
         run: |
           arduino-cli compile --fqbn esp32:esp32:esp32s3 --warnings all --output-dir build .
+
+      - name: Compile standalone Android print probe
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32s3 --warnings all --output-dir build-probe experiments/android_print_probe

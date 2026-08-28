@@ -572,7 +572,7 @@ bool ippUsbWriteAll(const uint8_t *data, size_t n, String &error) {
   while (offset < n) {
     const size_t part = min((size_t)USB_CHUNK, n - offset);
     size_t accepted = 0;
-    if (!usbHost.ippBulkWrite(data + offset, part, accepted, 30000, error)) return false;
+    if (!usbHost.ippLiveWrite(data + offset, part, accepted, 30000, error)) return false;
     if (accepted != part) { error = "IPP-over-USB short write"; return false; }
     lastJob.usbAccepted += accepted;
     offset += part;
@@ -837,8 +837,9 @@ bool pumpLiveIppUsbIn(WiFiClient &client, bool &gotBytes, bool &finalResponseSee
                       uint32_t pollMs, String &error) {
   gotBytes = false;
   size_t received = 0;
-  if (!usbHost.ippBulkReadPoll(ippLiveUsbInBuffer, sizeof(ippLiveUsbInBuffer), received,
-                               pollMs, error)) return false;
+  (void)pollMs;
+  if (!usbHost.ippLiveReadAvailable(ippLiveUsbInBuffer, sizeof(ippLiveUsbInBuffer),
+                                    received, error)) return false;
   if (!received) return true;
   gotBytes = true;
   ++ippLiveInTransfers;
@@ -901,10 +902,19 @@ void handleLiveIppUsb(WiFiClient &client, const String &networkHeader) {
                 (int)selected, iface->interfaceNumber, iface->alternateSetting,
                 iface->bulkOut.address, iface->bulkIn.address);
 
-  const String usbHeader = normalizeLiveIppHeader(networkHeader);
   String error;
+  if (!usbHost.beginIppLiveIo(error)) {
+    ippLiveLastError = error;
+    client.print("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    client.stop();
+    ippLiveActive = false;
+    return;
+  }
+
+  const String usbHeader = normalizeLiveIppHeader(networkHeader);
   if (!liveIppUsbWrite((const uint8_t *)usbHeader.c_str(), usbHeader.length(), error)) {
     ippLiveLastError = error;
+    usbHost.endIppLiveIo();
     client.stop();
     ippLiveActive = false;
     return;
@@ -992,6 +1002,7 @@ void handleLiveIppUsb(WiFiClient &client, const String &networkHeader) {
                 ok ? 1 : 0, ippLiveLastResponse.c_str(),
                 ippLiveLastError.length() ? " error=" : "",
                 ippLiveLastError.c_str());
+  usbHost.endIppLiveIo();
   client.stop();
   ippLiveActive = false;
 }
@@ -1399,7 +1410,7 @@ void handleWebRoot() {
   html += "<tr><th>IN transfers with data</th><td>" + String((unsigned long)ippLiveInTransfers) + "</td></tr>";
   if (ippLiveLastResponse.length()) html += "<tr><th>Last USB HTTP response</th><td><code>" + htmlEscape(ippLiveLastResponse) + "</code></td></tr>";
   if (ippLiveLastError.length()) html += "<tr><th>Last error</th><td>" + htmlEscape(ippLiveLastError) + "</td></tr>";
-  html += "</table><p>In Live IPP USB Duplex mode the ESP32 only normalizes Host/Connection headers. The IPP body and HTTP chunk bytes are forwarded unchanged, and protocol-0x04 Bulk-IN is polled between every small OUT transfer so 100-Continue, status and final responses can reach Android during the request.</p></section>";
+  html += "</table><p>In Live IPP USB Duplex mode the ESP32 only normalizes Host/Connection headers. The IPP body and HTTP chunk bytes are forwarded unchanged, and protocol-0x04 Bulk-IN stays persistently armed while a reusable Bulk-OUT transfer sends data, so 100-Continue, status and final responses can arrive even while an OUT transfer is in flight.</p></section>";
 
   html += "<section><h2>7. Live RAW 9100 ↔ USB IF1 bridge</h2><table>";
   html += "<tr><th>Status</th><td>" + String(rawBridgeActive ? "ACTIVE" : "idle") + "</td></tr>";

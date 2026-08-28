@@ -43,6 +43,16 @@ public:
   bool ippBulkReadPoll(uint8_t *data, size_t capacity, size_t &received,
                        uint32_t timeoutMs, String &error);
 
+  // Persistent full-duplex IPP-over-USB session. Bulk-IN remains armed while
+  // Bulk-OUT writes are in flight, so printer responses can arrive truly
+  // concurrently instead of being polled only between writes.
+  bool beginIppLiveIo(String &error);
+  void endIppLiveIo();
+  bool ippLiveWrite(const uint8_t *data, size_t length, size_t &accepted,
+                    uint32_t timeoutMs, String &error);
+  bool ippLiveReadAvailable(uint8_t *data, size_t capacity, size_t &received,
+                            String &error);
+
   bool portStatusValid() const { return device_.portStatus.valid; }
   uint8_t portStatusValue() const { return device_.portStatus.value; }
   bool portStatusError() const { return device_.portStatus.error; }

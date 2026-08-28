@@ -4,7 +4,7 @@ namespace {
 constexpr uint16_t IPP_PORT = 631;
 constexpr uint32_t CLIENT_TIMEOUT_MS = 180000;
 constexpr size_t HTTP_HEADER_LIMIT = 4096;
-constexpr size_t BODY_BUFFER = 1024;
+constexpr size_t BODY_BUFFER = 8192;
 constexpr const char *PCL3_MIME = "application/vnd.hp-PCL";
 WiFiServer ippServer(IPP_PORT);
 static uint8_t bodyBuffer[BODY_BUFFER];
@@ -20,6 +20,22 @@ bool readClientByte(WiFiClient &client, uint8_t &out, uint32_t timeoutMs) {
     delay(1);
   }
   return false;
+}
+
+size_t readClientBlock(WiFiClient &client, uint8_t *dst, size_t capacity, uint32_t timeoutMs) {
+  if (!dst || !capacity) return 0;
+  const uint32_t started = millis();
+  while (client.connected() || client.available()) {
+    const int available = client.available();
+    if (available > 0) {
+      const size_t want = min(capacity, (size_t)available);
+      const int got = client.read(dst, want);
+      if (got > 0) return (size_t)got;
+    }
+    if (millis() - started >= timeoutMs) return 0;
+    delay(1);
+  }
+  return 0;
 }
 
 bool readHttpHeader(WiFiClient &client, String &header) {
@@ -52,61 +68,134 @@ struct BodyReader {
   int64_t remaining = -1;
   size_t chunkRemaining = 0;
   bool done = false;
+  bool framingError = false;
 
   explicit BodyReader(WiFiClient &c) : client(c) {}
+
   bool rawByte(uint8_t &b) { return readClientByte(client, b, CLIENT_TIMEOUT_MS); }
+
   bool rawLine(String &line) {
     line = "";
     uint8_t b = 0;
     while (line.length() < 128) {
       if (!rawByte(b)) return false;
-      if (b == '\n') { if (line.endsWith("\r")) line.remove(line.length()-1); return true; }
+      if (b == '\n') {
+        if (line.endsWith("\r")) line.remove(line.length() - 1);
+        return true;
+      }
       line += (char)b;
     }
     return false;
   }
+
   bool nextChunk() {
     String line;
-    do { if (!rawLine(line)) return false; } while (line.length() == 0);
-    const int semi = line.indexOf(';'); if (semi >= 0) line = line.substring(0, semi);
+    do {
+      if (!rawLine(line)) { framingError = true; return false; }
+    } while (line.length() == 0);
+
+    const int semi = line.indexOf(';');
+    if (semi >= 0) line = line.substring(0, semi);
     line.trim();
     char *endp = nullptr;
     const unsigned long n = strtoul(line.c_str(), &endp, 16);
-    if (!endp || *endp != 0) return false;
+    if (!endp || *endp != 0) { framingError = true; return false; }
+
     if (n == 0) {
-      do { if (!rawLine(line)) break; } while (line.length() != 0);
-      done = true; return false;
+      do {
+        if (!rawLine(line)) break;
+      } while (line.length() != 0);
+      done = true;
+      return false;
     }
-    chunkRemaining = (size_t)n; return true;
+
+    chunkRemaining = (size_t)n;
+    return true;
   }
+
   bool readByte(uint8_t &b) {
-    if (done) return false;
+    if (done || framingError) return false;
     if (!chunked) {
       if (remaining == 0) { done = true; return false; }
       if (!rawByte(b)) return false;
       if (remaining > 0) --remaining;
+      if (remaining == 0) done = true;
       return true;
     }
+
     if (chunkRemaining == 0 && !nextChunk()) return false;
     if (!rawByte(b)) return false;
     --chunkRemaining;
     if (chunkRemaining == 0) {
-      uint8_t cr=0, lf=0;
-      if (!rawByte(cr) || !rawByte(lf) || cr != '\r' || lf != '\n') return false;
+      uint8_t cr = 0, lf = 0;
+      if (!rawByte(cr) || !rawByte(lf) || cr != '\r' || lf != '\n') {
+        framingError = true;
+        return false;
+      }
     }
     return true;
   }
-  bool readExact(uint8_t *dst, size_t n) { for (size_t i=0;i<n;++i) if (!readByte(dst[i])) return false; return true; }
+
+  bool readExact(uint8_t *dst, size_t n) {
+    for (size_t i = 0; i < n; ++i) if (!readByte(dst[i])) return false;
+    return true;
+  }
+
+  // Fast document path. IPP headers/attributes are still parsed byte-wise, but
+  // after the end-of-attributes tag the document is dechunked into large blocks.
+  size_t readBlock(uint8_t *dst, size_t capacity) {
+    if (!dst || !capacity || done || framingError) return 0;
+
+    if (!chunked) {
+      if (remaining == 0) { done = true; return 0; }
+      size_t want = capacity;
+      if (remaining > 0) want = min(want, (size_t)remaining);
+      const size_t got = readClientBlock(client, dst, want, CLIENT_TIMEOUT_MS);
+      if (!got) {
+        if (remaining < 0 && !client.connected() && client.available() == 0) done = true;
+        return 0;
+      }
+      if (remaining > 0) {
+        remaining -= (int64_t)got;
+        if (remaining == 0) done = true;
+      }
+      return got;
+    }
+
+    size_t total = 0;
+    while (total < capacity && !done && !framingError) {
+      if (chunkRemaining == 0) {
+        if (!nextChunk()) break;
+      }
+
+      const size_t want = min(capacity - total, chunkRemaining);
+      const size_t got = readClientBlock(client, dst + total, want, CLIENT_TIMEOUT_MS);
+      if (!got) break;
+
+      total += got;
+      chunkRemaining -= got;
+
+      if (chunkRemaining == 0) {
+        uint8_t cr = 0, lf = 0;
+        if (!rawByte(cr) || !rawByte(lf) || cr != '\r' || lf != '\n') {
+          framingError = true;
+          break;
+        }
+      }
+    }
+    return total;
+  }
 };
 
 struct IppWriter {
-  uint8_t data[1536]; size_t len=0; bool ok=true;
-  void b(uint8_t v){ if(len<sizeof(data)) data[len++]=v; else ok=false; }
-  void u16(uint16_t v){ b(v>>8); b(v); }
-  void u32(uint32_t v){ b(v>>24); b(v>>16); b(v>>8); b(v); }
-  void raw(const uint8_t *p,size_t n){ if(!ok||len+n>sizeof(data)){ok=false;return;} memcpy(data+len,p,n); len+=n; }
+  uint8_t data[1536]; size_t len = 0; bool ok = true;
+  void b(uint8_t v){ if(len < sizeof(data)) data[len++] = v; else ok = false; }
+  void u16(uint16_t v){ b(v >> 8); b(v); }
+  void u32(uint32_t v){ b(v >> 24); b(v >> 16); b(v >> 8); b(v); }
+  void raw(const uint8_t *p,size_t n){ if(!ok || len + n > sizeof(data)){ok=false;return;} memcpy(data+len,p,n); len+=n; }
   void attr(uint8_t tag,const char *name,const uint8_t *value,uint16_t valueLen){
-    const uint16_t nameLen=name?(uint16_t)strlen(name):0; b(tag);u16(nameLen);if(nameLen)raw((const uint8_t*)name,nameLen);u16(valueLen);if(valueLen)raw(value,valueLen);
+    const uint16_t nameLen = name ? (uint16_t)strlen(name) : 0;
+    b(tag); u16(nameLen); if(nameLen) raw((const uint8_t*)name,nameLen); u16(valueLen); if(valueLen) raw(value,valueLen);
   }
   void str(uint8_t tag,const char *name,const char *value){ attr(tag,name,(const uint8_t*)value,(uint16_t)strlen(value)); }
   void integer(uint8_t tag,const char *name,int32_t value){ uint8_t v[4]={(uint8_t)(value>>24),(uint8_t)(value>>16),(uint8_t)(value>>8),(uint8_t)value}; attr(tag,name,v,4); }
@@ -120,7 +209,9 @@ void beginResponse(IppWriter &w,uint8_t major,uint8_t minor,uint16_t status,uint
 
 void sendHttpIpp(WiFiClient &client,const IppWriter &w){
   client.print("HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nConnection: close\r\n");
-  client.printf("Content-Length: %u\r\n\r\n",(unsigned)w.len); client.write(w.data,w.len); client.flush();
+  client.printf("Content-Length: %u\r\n\r\n",(unsigned)w.len);
+  client.write(w.data,w.len);
+  client.flush();
 }
 
 void sendSimple(WiFiClient &client,uint8_t major,uint8_t minor,uint16_t status,uint32_t requestId){
@@ -162,19 +253,33 @@ void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32
   w.b(0x03); sendHttpIpp(client,w);
 }
 
-bool readU16(BodyReader &r,uint16_t &v){ uint8_t b[2]; if(!r.readExact(b,2)) return false; v=((uint16_t)b[0]<<8)|b[1]; return true; }
+bool readU16(BodyReader &r,uint16_t &v){
+  uint8_t b[2]; if(!r.readExact(b,2)) return false; v=((uint16_t)b[0]<<8)|b[1]; return true;
+}
 
 bool parseAttributes(BodyReader &r,String &format){
   String currentName;
   while(true){
-    uint8_t tag=0; if(!r.readByte(tag)) return false; if(tag==0x03) return true; if(tag<=0x0F){currentName="";continue;}
-    uint16_t nameLen=0,valueLen=0; if(!readU16(r,nameLen)) return false; String name;
-    for(uint16_t i=0;i<nameLen;++i){uint8_t b=0;if(!r.readByte(b))return false;name+=(char)b;} if(nameLen) currentName=name;
-    if(!readU16(r,valueLen)) return false; String value; const bool keep=currentName=="document-format"; if(keep)value.reserve(valueLen);
-    for(uint16_t i=0;i<valueLen;++i){uint8_t b=0;if(!r.readByte(b))return false;if(keep)value+=(char)b;} if(keep)format=value;
+    uint8_t tag=0;
+    if(!r.readByte(tag)) return false;
+    if(tag==0x03) return true;
+    if(tag<=0x0F){ currentName=""; continue; }
+
+    uint16_t nameLen=0,valueLen=0;
+    if(!readU16(r,nameLen)) return false;
+    String name;
+    for(uint16_t i=0;i<nameLen;++i){ uint8_t b=0; if(!r.readByte(b)) return false; name+=(char)b; }
+    if(nameLen) currentName=name;
+    if(!readU16(r,valueLen)) return false;
+
+    String value;
+    const bool keep=currentName=="document-format";
+    if(keep) value.reserve(valueLen);
+    for(uint16_t i=0;i<valueLen;++i){ uint8_t b=0; if(!r.readByte(b)) return false; if(keep) value+=(char)b; }
+    if(keep) format=value;
   }
 }
-}
+} // namespace
 
 void IppPcl3Service::refreshJobState(){
   if(lastJobId_==0 || lastJobState_!=5) return;
@@ -191,27 +296,59 @@ void IppPcl3Service::refreshJobState(){
 }
 
 void IppPcl3Service::begin(){
-  if(started_) return; ippServer.begin(); ippServer.setNoDelay(true); started_=true;
-  Serial.println("[IPP] PCL3GUI-only IPP service listening on TCP 631");
+  if(started_) return;
+  ippServer.begin(); ippServer.setNoDelay(true); started_=true;
+  Serial.printf("[IPP] PCL3GUI-only IPP service listening on TCP 631; document buffer=%u bytes\n",(unsigned)BODY_BUFFER);
 }
 
 void IppPcl3Service::poll(){
   if(!started_) return;
   refreshJobState();
-  WiFiClient client=ippServer.available(); if(client) handleClient(client);
+  WiFiClient client=ippServer.available();
+  if(client) handleClient(client);
 }
 
 void IppPcl3Service::handleClient(WiFiClient client){
   clientActive_=true; lastError_=""; client.setNoDelay(true); client.setTimeout(CLIENT_TIMEOUT_MS);
   refreshJobState();
-  String header; if(!readHttpHeader(client,header)){lastError_="HTTP header read failed";client.stop();clientActive_=false;return;}
-  const String expect=headerValue(header,"Expect"); if(expect.equalsIgnoreCase("100-continue")){client.print("HTTP/1.1 100 Continue\r\n\r\n");client.flush();}
-  const String transfer=headerValue(header,"Transfer-Encoding"); const String lengthText=headerValue(header,"Content-Length");
-  BodyReader body(client); body.chunked=transfer.equalsIgnoreCase("chunked"); body.remaining=body.chunked?-1:(lengthText.length()?lengthText.toInt():-1);
-  uint8_t hdr[8]; if(!body.readExact(hdr,sizeof(hdr))){lastError_="truncated IPP header";client.stop();clientActive_=false;return;}
-  const uint8_t major=hdr[0],minor=hdr[1]; const uint16_t op=((uint16_t)hdr[2]<<8)|hdr[3]; const uint32_t requestId=((uint32_t)hdr[4]<<24)|((uint32_t)hdr[5]<<16)|((uint32_t)hdr[6]<<8)|hdr[7];
-  String format; if(!parseAttributes(body,format)){lastError_="malformed IPP attributes";sendSimple(client,major,minor,0x0400,requestId);client.stop();clientActive_=false;return;}
-  Serial.printf("[IPP] op=0x%04X request-id=%lu format=%s\n",op,(unsigned long)requestId,format.c_str());
+
+  String header;
+  if(!readHttpHeader(client,header)){
+    lastError_="HTTP header read failed";
+    client.stop(); clientActive_=false; return;
+  }
+
+  const String expect=headerValue(header,"Expect");
+  if(expect.equalsIgnoreCase("100-continue")){
+    client.print("HTTP/1.1 100 Continue\r\n\r\n"); client.flush();
+  }
+
+  const String transfer=headerValue(header,"Transfer-Encoding");
+  const String lengthText=headerValue(header,"Content-Length");
+  BodyReader body(client);
+  body.chunked=transfer.equalsIgnoreCase("chunked");
+  body.remaining=body.chunked ? -1 : (lengthText.length()?lengthText.toInt():-1);
+
+  uint8_t hdr[8];
+  if(!body.readExact(hdr,sizeof(hdr))){
+    lastError_="truncated IPP header";
+    client.stop(); clientActive_=false; return;
+  }
+
+  const uint8_t major=hdr[0],minor=hdr[1];
+  const uint16_t op=((uint16_t)hdr[2]<<8)|hdr[3];
+  const uint32_t requestId=((uint32_t)hdr[4]<<24)|((uint32_t)hdr[5]<<16)|((uint32_t)hdr[6]<<8)|hdr[7];
+
+  String format;
+  if(!parseAttributes(body,format)){
+    lastError_="malformed IPP attributes";
+    sendSimple(client,major,minor,0x0400,requestId);
+    client.stop(); clientActive_=false; return;
+  }
+
+  Serial.printf("[IPP] op=0x%04X request-id=%lu format=%s transfer=%s\n",
+                op,(unsigned long)requestId,format.c_str(),body.chunked?"chunked":"fixed");
+
   if(op==0x000B){
     sendPrinterAttributes(client,major,minor,requestId);
   } else if(op==0x0004){
@@ -227,21 +364,44 @@ void IppPcl3Service::handleClient(WiFiClient client){
       const uint32_t jobId = nextJobId_++;
       lastJobId_=jobId; lastJobState_=5; lastJobReason_="job-printing"; lastJobBytes_=0;
       bool ok=true;
+      uint32_t networkReadMs=0;
+      uint32_t usbSendMs=0;
+      const uint32_t streamStarted=millis();
+
       while(true){
-        size_t n=0;
-        while(n<sizeof(bodyBuffer)){uint8_t b=0;if(!body.readByte(b))break;bodyBuffer[n++]=b;}
-        if(!n)break;
+        const uint32_t readStarted=millis();
+        const size_t n=body.readBlock(bodyBuffer,sizeof(bodyBuffer));
+        networkReadMs += millis()-readStarted;
+        if(!n) break;
+
         String error;
-        if(!printer_.sendDirect(bodyBuffer,n,error)){lastError_=error;ok=false;break;}
+        const uint32_t usbStarted=millis();
+        const bool sent=printer_.sendDirect(bodyBuffer,n,error);
+        usbSendMs += millis()-usbStarted;
+        if(!sent){ lastError_=error; ok=false; break; }
+
         lastJobBytes_+=n;
         yield();
       }
-      if(ok&&body.done){
+
+      const uint32_t totalMs=millis()-streamStarted;
+      const uint64_t kibPerSecond = totalMs ? ((lastJobBytes_ * 1000ULL) / 1024ULL / totalMs) : 0;
+      Serial.printf("[IPP][PERF] job=%lu bytes=%llu total=%lu ms net-read=%lu ms usb-send=%lu ms avg=%llu KiB/s buffer=%u\n",
+                    (unsigned long)jobId,
+                    (unsigned long long)lastJobBytes_,
+                    (unsigned long)totalMs,
+                    (unsigned long)networkReadMs,
+                    (unsigned long)usbSendMs,
+                    (unsigned long long)kibPerSecond,
+                    (unsigned)BODY_BUFFER);
+
+      if(ok && body.done && !body.framingError){
         printer_.finishRawJob();
-        Serial.printf("[IPP] PCL3GUI Print-Job accepted: job=%lu %llu bytes sent to classic USB print interface\n",(unsigned long)jobId,(unsigned long long)lastJobBytes_);
+        Serial.printf("[IPP] PCL3GUI Print-Job accepted: job=%lu %llu bytes sent to classic USB print interface\n",
+                      (unsigned long)jobId,(unsigned long long)lastJobBytes_);
         sendJobResponse(client,major,minor,0x0000,requestId,jobId,lastJobState_,lastJobReason_);
       } else {
-        if(lastError_.isEmpty()) lastError_="Print-Job body ended unexpectedly";
+        if(lastError_.isEmpty()) lastError_=body.framingError ? "HTTP chunk framing error" : "Print-Job body ended unexpectedly";
         printer_.abortRawJob(lastError_);
         lastJobState_=8; lastJobReason_="aborted-by-system";
         sendSimple(client,major,minor,0x0500,requestId);
@@ -250,7 +410,8 @@ void IppPcl3Service::handleClient(WiFiClient client){
   } else if(op==0x0009 || op==0x000A){
     refreshJobState();
     if(lastJobId_){
-      Serial.printf("[IPP] Job status: id=%lu state=%u reason=%s\n",(unsigned long)lastJobId_,lastJobState_,lastJobReason_.c_str());
+      Serial.printf("[IPP] Job status: id=%lu state=%u reason=%s\n",
+                    (unsigned long)lastJobId_,lastJobState_,lastJobReason_.c_str());
       sendJobResponse(client,major,minor,0x0000,requestId,lastJobId_,lastJobState_,lastJobReason_);
     } else {
       sendSimple(client,major,minor,0x0000,requestId);
@@ -258,5 +419,6 @@ void IppPcl3Service::handleClient(WiFiClient client){
   } else {
     sendSimple(client,major,minor,0x0501,requestId);
   }
+
   client.stop(); clientActive_=false;
 }

@@ -46,6 +46,6 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add experiments/android_print_probe
-          git rm tools/apply_live_bulk_bridge.py .github/workflows/apply-live-bulk-bridge.yml
+          git rm -f tools/apply_live_bulk_bridge.py .github/workflows/apply-live-bulk-bridge.yml
           git commit -m 'Add transparent live TCP9100 to IF1 duplex bridge'
           git push origin HEAD:experiment/android-print-probe

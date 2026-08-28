@@ -572,7 +572,7 @@ bool ippUsbWriteAll(const uint8_t *data, size_t n, String &error) {
   while (offset < n) {
     const size_t part = min((size_t)USB_CHUNK, n - offset);
     size_t accepted = 0;
-    if (!usbHost.ippLiveWrite(data + offset, part, accepted, 30000, error)) return false;
+    if (!usbHost.ippBulkWrite(data + offset, part, accepted, 30000, error)) return false;
     if (accepted != part) { error = "IPP-over-USB short write"; return false; }
     lastJob.usbAccepted += accepted;
     offset += part;
@@ -807,7 +807,7 @@ bool liveIppUsbWrite(const uint8_t *data, size_t length, String &error) {
   while (offset < length) {
     const size_t part = min((size_t)USB_CHUNK, length - offset);
     size_t accepted = 0;
-    if (!usbHost.ippBulkWrite(data + offset, part, accepted, 30000, error)) return false;
+    if (!usbHost.ippLiveWrite(data + offset, part, accepted, 30000, error)) return false;
     if (accepted != part) {
       error = "live IPP USB short OUT write";
       return false;

@@ -838,6 +838,76 @@ bool UsbHostManager::ippBulkRead(uint8_t *data, size_t capacity, size_t &receive
   return true;
 }
 
+bool UsbHostManager::ippBulkReadPoll(uint8_t *data, size_t capacity, size_t &received,
+                                     uint32_t timeoutMs, String &error) {
+  received = 0;
+  const int8_t selected = device_.ippSelectedIndex;
+  const UsbPrinterInterfaceInfo *iface = selected >= 0 ? ippInterfaceAt((uint8_t)selected) : nullptr;
+  if (!data || !capacity) { error = "empty IPP-over-USB poll buffer"; return false; }
+  if (!g.deviceOpen || !g.ippInterfaceClaimed || !iface || !iface->usableForIppUsb()) {
+    error = "IPP-over-USB interface is not claimed/ready";
+    return false;
+  }
+  if (capacity > 16384) capacity = 16384;
+
+  usb_transfer_t *t = nullptr;
+  esp_err_t e = usb_host_transfer_alloc(capacity, 0, &t);
+  if (e != ESP_OK || !t) {
+    error = String("IPP-over-USB poll alloc failed: ") + esp_err_to_name(e);
+    return false;
+  }
+  TransferWait w;
+  w.done = xSemaphoreCreateBinary();
+  if (!w.done) {
+    usb_host_transfer_free(t);
+    error = "unable to allocate IPP-over-USB poll semaphore";
+    return false;
+  }
+
+  t->num_bytes = capacity;
+  t->device_handle = g.device;
+  t->bEndpointAddress = iface->bulkIn.address;
+  t->callback = bulkTransferCallback;
+  t->context = &w;
+  t->timeout_ms = timeoutMs;
+
+  e = usb_host_transfer_submit(t);
+  if (e != ESP_OK) {
+    vSemaphoreDelete(w.done);
+    usb_host_transfer_free(t);
+    error = String("IPP-over-USB poll submit failed: ") + esp_err_to_name(e);
+    return false;
+  }
+
+  const TickType_t waitTicks = timeoutMs ? pdMS_TO_TICKS(timeoutMs + 250) : portMAX_DELAY;
+  if (xSemaphoreTake(w.done, waitTicks) != pdTRUE) {
+    usb_host_endpoint_halt(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_flush(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_clear(t->device_handle, t->bEndpointAddress);
+    xSemaphoreTake(w.done, portMAX_DELAY);
+  }
+
+  received = static_cast<size_t>(t->actual_num_bytes);
+  const usb_transfer_status_t status = t->status;
+  if (status == USB_TRANSFER_STATUS_COMPLETED && received) {
+    memcpy(data, t->data_buffer, received);
+  }
+  vSemaphoreDelete(w.done);
+  usb_host_transfer_free(t);
+
+  if (status == USB_TRANSFER_STATUS_TIMED_OUT ||
+      (status == USB_TRANSFER_STATUS_COMPLETED && received == 0)) {
+    received = 0;
+    return true;
+  }
+  if (status != USB_TRANSFER_STATUS_COMPLETED) {
+    error = String("IPP-over-USB poll failed status=") + String((int)status) +
+            " received=" + String((unsigned)received);
+    return false;
+  }
+  return true;
+}
+
 void UsbHostManager::onPortStatusTransfer(bool valid, uint8_t value, const String &error) {
   static String lastStatusError;
   if (!valid) {

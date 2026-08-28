@@ -38,6 +38,10 @@ public:
                     uint32_t timeoutMs, String &error);
   bool ippBulkRead(uint8_t *data, size_t capacity, size_t &received,
                    uint32_t timeoutMs, String &error);
+  // Interactive IPP bridge poll: a normal transfer timeout means that the
+  // printer has no response bytes right now and returns true with received=0.
+  bool ippBulkReadPoll(uint8_t *data, size_t capacity, size_t &received,
+                       uint32_t timeoutMs, String &error);
 
   bool portStatusValid() const { return device_.portStatus.valid; }
   uint8_t portStatusValue() const { return device_.portStatus.value; }

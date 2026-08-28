@@ -2,21 +2,13 @@
 #include <Arduino.h>
 #include "usb_host_manager.h"
 
-void ensureUsbScannerBackendStarted();
-
 class UsbPrinterBackend {
 public:
   enum PrinterState : uint8_t { OFFLINE, IDLE, PRINTING, ERROR };
   explicit UsbPrinterBackend(UsbHostManager &host) : host_(host) {}
   bool begin();
   void poll();
-  PrinterState state() const {
-    // Start the scanner client lazily only after the USB host has been installed.
-    // The check is constant-time after the first call and scanner failure is
-    // intentionally non-fatal to RAW printing.
-    ensureUsbScannerBackendStarted();
-    return state_;
-  }
+  PrinterState state() const { return state_; }
   bool online() const { return state_ == IDLE; }
   const String &statusReason() const { return reason_; }
   const UsbDeviceInfo &device() const { return host_.device(); }

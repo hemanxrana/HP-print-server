@@ -19,8 +19,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Apply live duplex bridge patch
-        run: python3 tools/apply_live_bulk_bridge.py
+      - name: Repair patch marker and apply live duplex bridge patch
+        run: |
+          sed -i 's/<h2>6\. Memory \/ stability/<h2>7. Memory \/ stability/' tools/apply_live_bulk_bridge.py
+          python3 tools/apply_live_bulk_bridge.py
 
       - name: Install Arduino CLI
         uses: arduino/setup-arduino-cli@v2

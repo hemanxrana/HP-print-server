@@ -12,9 +12,8 @@ namespace {
 static constexpr uint8_t USB_PRINTER_CLASS_CODE = 0x07;
 static constexpr uint8_t USB_PRINTER_SUBCLASS_CODE = 0x01;
 static constexpr uint8_t USB_ENDPOINT_XFER_BULK_CODE = 0x02;
-static constexpr uint8_t USB_ENDPOINT_XFER_INT_CODE = 0x03;
 static constexpr uint8_t USB_PRINTER_GET_PORT_STATUS = 0x01;
-static constexpr uint8_t USB_PRINTER_STATUS_REQUEST_TYPE = 0xA1; // IN | CLASS | INTERFACE
+static constexpr uint8_t USB_PRINTER_STATUS_REQUEST_TYPE = 0xA1;
 static constexpr int MAX_ALREADY_CONNECTED_DEVICES = 8;
 static constexpr uint32_t STATUS_POLL_INTERVAL_MS = 1000;
 static constexpr uint32_t STATUS_TRANSFER_TIMEOUT_MS = 1000;
@@ -35,8 +34,6 @@ struct Runtime {
   volatile bool newDevice = false;
   volatile uint8_t newAddress = 0;
   volatile bool deviceGone = false;
-  volatile usb_device_handle_t goneHandle = nullptr;
-  volatile bool selectionPending = false;
   volatile bool statusPending = false;
   volatile usb_transfer_t *statusTransfer = nullptr;
 
@@ -67,10 +64,6 @@ static bool bulk(const usb_ep_desc_t *e) {
   return e && ((e->bmAttributes & 0x03) == USB_ENDPOINT_XFER_BULK_CODE);
 }
 
-static bool interruptEndpoint(const usb_ep_desc_t *e) {
-  return e && ((e->bmAttributes & 0x03) == USB_ENDPOINT_XFER_INT_CODE);
-}
-
 static void storeEndpoint(UsbEndpointInfo &slot, const usb_ep_desc_t *ept) {
   if (!ept || slot.valid()) return;
   slot.address = ept->bEndpointAddress;
@@ -81,31 +74,17 @@ static void storeEndpoint(UsbEndpointInfo &slot, const usb_ep_desc_t *ept) {
 
 static int printScore(const UsbPrinterInterfaceInfo &p) {
   if (!p.usableForRawPrint()) return -1000;
-  if (p.protocol == 0x02) return 112 + (p.bulkIn.valid() ? 10 : 0) + (p.alternateSetting == 0 ? 2 : 0);
-  if (p.protocol == 0x01 || p.protocol == 0x03) return 72 + (p.bulkIn.valid() ? 10 : 0);
-  if (p.protocol == 0x04) return 82 + (p.bulkIn.valid() ? 10 : 0);
-  if (p.protocol == 0xFF) return 20;
-  return 10;
+  if (p.protocol == 0x02) return 120 + (p.bulkIn.valid() ? 10 : 0) + (p.alternateSetting == 0 ? 2 : 0);
+  if (p.protocol == 0x03) return 90 + (p.bulkIn.valid() ? 10 : 0) + (p.alternateSetting == 0 ? 2 : 0);
+  if (p.protocol == 0x01) return 70 + (p.alternateSetting == 0 ? 2 : 0);
+  return -1000;
 }
 
 static int selectedPrintIndex(const UsbDeviceInfo &d) {
   int best = -1;
   int bestScore = -1001;
-  if (!manager) return -1;
-
   for (uint8_t i = 0; i < d.printerInterfaceCount; ++i) {
-    const auto &p = d.printerInterfaces[i];
-    if (!p.usableForRawPrint()) continue;
-
-    if (!manager->automaticInterfaceSelection()) {
-      if (p.interfaceNumber == manager->manualInterfaceNumber() &&
-          p.alternateSetting == manager->manualAlternateSetting()) {
-        return i;
-      }
-      continue;
-    }
-
-    const int s = printScore(p);
+    const int s = printScore(d.printerInterfaces[i]);
     if (s > bestScore) {
       bestScore = s;
       best = i;
@@ -118,8 +97,7 @@ static int statusScore(const UsbPrinterInterfaceInfo &p) {
   if (!p.usableForStatus()) return -1000;
   int score = 10;
   if (p.bulkIn.valid()) score += 20;
-  if (p.protocol == 0x04) score += 35;
-  else if (p.protocol == 0x03) score += 30;
+  if (p.protocol == 0x03) score += 30;
   else if (p.protocol == 0x02) score += 20;
   else if (p.protocol == 0x01) score += 10;
   if (p.alternateSetting == 0) score += 3;
@@ -129,7 +107,6 @@ static int statusScore(const UsbPrinterInterfaceInfo &p) {
 static int selectedStatusIndex(const UsbDeviceInfo &d, int printIndex) {
   int best = -1;
   int bestScore = -1001;
-
   for (uint8_t i = 0; i < d.printerInterfaceCount; ++i) {
     const auto &p = d.printerInterfaces[i];
     if ((int)i == printIndex) continue;
@@ -138,7 +115,6 @@ static int selectedStatusIndex(const UsbDeviceInfo &d, int printIndex) {
       sameInterfaceAsPrint = p.interfaceNumber == d.printerInterfaces[printIndex].interfaceNumber;
     }
     if (sameInterfaceAsPrint || !p.usableForStatus()) continue;
-
     const int s = statusScore(p);
     if (s > bestScore) {
       bestScore = s;
@@ -184,9 +160,7 @@ static void closeDevice() {
 static bool claimInterfaces(UsbDeviceInfo &d, String &error) {
   const int printIndex = selectedPrintIndex(d);
   if (printIndex < 0) {
-    error = manager && manager->automaticInterfaceSelection()
-              ? "No usable Printer Class Bulk OUT interface"
-              : "Configured printer interface not found";
+    error = "No RAW-compatible USB Printer Class interface";
     return false;
   }
 
@@ -217,26 +191,23 @@ static bool claimInterfaces(UsbDeviceInfo &d, String &error) {
       d.statusInterface = status;
       d.statusInterfaceSeparate = true;
     } else {
-      Serial.printf("[USB] Status interface IF=%u ALT=%u could not be claimed: %s; falling back to print interface\n",
+      Serial.printf("[USB] Status interface IF=%u ALT=%u could not be claimed: %s; using print interface for status\n",
                     status.interfaceNumber, status.alternateSetting,
                     esp_err_to_name(e));
     }
   }
 
-  if (!d.statusInterfaceSeparate) {
-    d.statusInterface = d.printer;
-  }
+  if (!d.statusInterfaceSeparate) d.statusInterface = d.printer;
 
-  Serial.printf("[USB] PRINT interface IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X\n",
+  Serial.printf("[USB] Selected Printer Class IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X\n",
                 d.printer.interfaceNumber, d.printer.alternateSetting,
                 d.printer.protocol, d.printer.bulkOut.address,
                 d.printer.bulkIn.address);
   if (d.statusInterfaceSeparate) {
-    Serial.printf("[USB] STATUS interface IF=%u ALT=%u protocol=0x%02X IN=0x%02X (separate)\n",
-                  d.statusInterface.interfaceNumber, d.statusInterface.alternateSetting,
-                  d.statusInterface.protocol, d.statusInterface.bulkIn.address);
-  } else {
-    Serial.println("[USB] STATUS interface: same as PRINT (no separate suitable interface)");
+    Serial.printf("[USB] Status IF=%u ALT=%u protocol=0x%02X (separate)\n",
+                  d.statusInterface.interfaceNumber,
+                  d.statusInterface.alternateSetting,
+                  d.statusInterface.protocol);
   }
   return true;
 }
@@ -288,47 +259,32 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
   const usb_standard_desc_t *d = usb_parse_next_descriptor(
       (const usb_standard_desc_t *)cd, total, &offset);
   UsbPrinterInterfaceInfo *printerCurrent = nullptr;
-  UsbInterfaceInfo *genericCurrent = nullptr;
 
   while (d) {
     if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
       const usb_intf_desc_t *i = (const usb_intf_desc_t *)d;
       printerCurrent = nullptr;
-      genericCurrent = nullptr;
-
-      if (out.interfaceCount < UsbDeviceInfo::MAX_INTERFACES) {
-        genericCurrent = &out.interfaces[out.interfaceCount++];
-        genericCurrent->found = true;
-        genericCurrent->interfaceNumber = i->bInterfaceNumber;
-        genericCurrent->alternateSetting = i->bAlternateSetting;
-        genericCurrent->classCode = i->bInterfaceClass;
-        genericCurrent->subclass = i->bInterfaceSubClass;
-        genericCurrent->protocol = i->bInterfaceProtocol;
-      }
 
       if (i->bInterfaceClass == USB_PRINTER_CLASS_CODE &&
-          i->bInterfaceSubClass == USB_PRINTER_SUBCLASS_CODE &&
-          ((i->bInterfaceProtocol >= 1 && i->bInterfaceProtocol <= 4) ||
-           i->bInterfaceProtocol == 0xFF) &&
-          out.printerInterfaceCount < UsbDeviceInfo::MAX_PRINTER_INTERFACES) {
-        printerCurrent = &out.printerInterfaces[out.printerInterfaceCount++];
-        printerCurrent->found = true;
-        printerCurrent->interfaceNumber = i->bInterfaceNumber;
-        printerCurrent->alternateSetting = i->bAlternateSetting;
-        printerCurrent->subclass = i->bInterfaceSubClass;
-        printerCurrent->protocol = i->bInterfaceProtocol;
+          i->bInterfaceSubClass == USB_PRINTER_SUBCLASS_CODE) {
+        if (i->bInterfaceProtocol == 0x04) {
+          Serial.printf("[USB] Ignoring IF=%u ALT=%u: protocol 0x04 is IPP-over-USB, not RAW printing\n",
+                        i->bInterfaceNumber, i->bAlternateSetting);
+        } else if (i->bInterfaceProtocol == 0xFF) {
+          Serial.printf("[USB] Ignoring IF=%u ALT=%u: vendor-specific Printer Class protocol 0xFF is not verified for RAW\n",
+                        i->bInterfaceNumber, i->bAlternateSetting);
+        } else if (i->bInterfaceProtocol >= 0x01 && i->bInterfaceProtocol <= 0x03 &&
+                   out.printerInterfaceCount < UsbDeviceInfo::MAX_PRINTER_INTERFACES) {
+          printerCurrent = &out.printerInterfaces[out.printerInterfaceCount++];
+          printerCurrent->found = true;
+          printerCurrent->interfaceNumber = i->bInterfaceNumber;
+          printerCurrent->alternateSetting = i->bAlternateSetting;
+          printerCurrent->subclass = i->bInterfaceSubClass;
+          printerCurrent->protocol = i->bInterfaceProtocol;
+        }
       }
     } else if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
       const usb_ep_desc_t *ept = (const usb_ep_desc_t *)d;
-      if (genericCurrent) {
-        if (bulk(ept)) {
-          if ((ept->bEndpointAddress & 0x80) != 0) storeEndpoint(genericCurrent->bulkIn, ept);
-          else storeEndpoint(genericCurrent->bulkOut, ept);
-        } else if (interruptEndpoint(ept)) {
-          if ((ept->bEndpointAddress & 0x80) != 0) storeEndpoint(genericCurrent->interruptIn, ept);
-          else storeEndpoint(genericCurrent->interruptOut, ept);
-        }
-      }
       if (printerCurrent && bulk(ept)) {
         if ((ept->bEndpointAddress & 0x80) != 0) storeEndpoint(printerCurrent->bulkIn, ept);
         else storeEndpoint(printerCurrent->bulkOut, ept);
@@ -338,25 +294,16 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
   }
 
   if (!out.printerInterfaceCount) {
-    error = "USB device has no USB Printer Class interface";
+    error = "USB device has no RAW-compatible Printer Class interface";
     closeDevice();
     return false;
   }
 
-  for (uint8_t i = 0; i < out.interfaceCount; ++i) {
-    const auto &u = out.interfaces[i];
-    Serial.printf("[USB] Interface %u: IF=%u ALT=%u class=0x%02X subclass=0x%02X protocol=0x%02X%s\n",
-                  i, u.interfaceNumber, u.alternateSetting,
-                  u.classCode, u.subclass, u.protocol,
-                  u.isScanner() ? " [SCANNER]" : "");
-  }
-
   for (uint8_t i = 0; i < out.printerInterfaceCount; ++i) {
     const auto &p = out.printerInterfaces[i];
-    Serial.printf("[USB] Candidate %u: IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X printScore=%d statusScore=%d\n",
+    Serial.printf("[USB] RAW candidate %u: IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X score=%d\n",
                   i, p.interfaceNumber, p.alternateSetting, p.protocol,
-                  p.bulkOut.address, p.bulkIn.address,
-                  printScore(p), statusScore(p));
+                  p.bulkOut.address, p.bulkIn.address, printScore(p));
   }
 
   if (!claimInterfaces(out, error)) {
@@ -369,16 +316,9 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
 static void publish(const UsbDeviceInfo &d) {
   if (!manager) return;
   manager->onEnumerated(d);
-  Serial.printf("[USB] %s VID=0x%04X PID=0x%04X address=%u\n",
+  Serial.printf("[USB] Printer ready: %s VID=0x%04X PID=0x%04X address=%u\n",
                 d.product.length() ? d.product.c_str() : "USB Printer",
                 d.vid, d.pid, d.address);
-  Serial.printf("[USB] ACTIVE PRINT IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X\n",
-                d.printer.interfaceNumber, d.printer.alternateSetting,
-                d.printer.protocol, d.printer.bulkOut.address,
-                d.printer.bulkIn.address);
-  Serial.printf("[USB] ACTIVE STATUS IF=%u ALT=%u protocol=0x%02X separate=%d\n",
-                d.statusInterface.interfaceNumber, d.statusInterface.alternateSetting,
-                d.statusInterface.protocol, (int)d.statusInterfaceSeparate);
 }
 
 static void scanExisting() {
@@ -386,12 +326,14 @@ static void scanExisting() {
   int count = 0;
   if (usb_host_device_addr_list_fill(MAX_ALREADY_CONNECTED_DEVICES, addresses, &count) != ESP_OK) return;
   for (int i = 0; i < count && !g.deviceOpen; ++i) {
+    if (manager) manager->onEnumerationStarted();
     UsbDeviceInfo d;
     String error;
     if (enumerateDevice(addresses[i], d, error)) {
       publish(d);
       return;
     }
+    if (manager) manager->onEnumerationError(error);
     Serial.printf("[USB] Ignored address %u: %s\n", addresses[i], error.c_str());
   }
 }
@@ -405,7 +347,6 @@ static void clientEvent(const usb_host_client_event_msg_t *event, void *) {
     }
   } else if (event->event == USB_HOST_CLIENT_EVENT_DEV_GONE &&
              g.deviceOpen && event->dev_gone.dev_hdl == g.device) {
-    g.goneHandle = event->dev_gone.dev_hdl;
     g.deviceGone = true;
   }
 }
@@ -418,16 +359,13 @@ static void bulkTransferCallback(usb_transfer_t *t) {
 
 static void statusTransferCallback(usb_transfer_t *t) {
   if (!t || !manager) return;
-
   const bool ok = t->status == USB_TRANSFER_STATUS_COMPLETED && t->actual_num_bytes >= 9;
   if (ok) {
-    const uint8_t v = t->data_buffer[8];
-    manager->onPortStatusTransfer(true, v, String());
+    manager->onPortStatusTransfer(true, t->data_buffer[8], String());
   } else {
     manager->onPortStatusTransfer(false, 0,
                                   String("GET_PORT_STATUS transfer status=") + String((int)t->status));
   }
-
   g.statusTransfer = nullptr;
   usb_host_transfer_free(t);
 }
@@ -435,7 +373,6 @@ static void statusTransferCallback(usb_transfer_t *t) {
 static void submitPortStatusIfPending() {
   if (!g.statusPending || g.statusTransfer || !g.deviceOpen || !manager) return;
   if (!manager->device().attached || !manager->statusInterface()) return;
-
   g.statusPending = false;
 
   usb_transfer_t *t = nullptr;
@@ -466,39 +403,7 @@ static void submitPortStatusIfPending() {
                                   String("GET_PORT_STATUS submit failed: ") + esp_err_to_name(submit));
     return;
   }
-
   g.statusTransfer = t;
-}
-
-static void applySelectionIfPending() {
-  if (!g.selectionPending || !g.deviceOpen || !manager) return;
-  g.selectionPending = false;
-
-  UsbDeviceInfo d = manager->device();
-  const int printIndex = selectedPrintIndex(d);
-  if (printIndex < 0) {
-    manager->onEnumerationError("Configured printer interface not found");
-    return;
-  }
-
-  const auto &wanted = d.printerInterfaces[printIndex];
-  if (d.printer.interfaceNumber == wanted.interfaceNumber &&
-      d.printer.alternateSetting == wanted.alternateSetting) {
-    return;
-  }
-
-  if (g.statusTransfer) {
-    usb_host_transfer_free((usb_transfer_t *)g.statusTransfer);
-    g.statusTransfer = nullptr;
-  }
-  releaseInterfaces();
-
-  String error;
-  if (!claimInterfaces(d, error)) {
-    manager->onEnumerationError(error);
-    return;
-  }
-  publish(d);
 }
 
 static void clientTask(void *) {
@@ -528,13 +433,12 @@ static void clientTask(void *) {
       if (manager) manager->onDetached();
     }
 
-    applySelectionIfPending();
     submitPortStatusIfPending();
 
     if (g.newDevice && !g.deviceOpen) {
       const uint8_t address = g.newAddress;
       g.newDevice = false;
-      if (manager) manager->onEnumerationError("enumerating-usb-device");
+      if (manager) manager->onEnumerationStarted();
       UsbDeviceInfo d;
       String error;
       if (enumerateDevice(address, d, error)) {
@@ -605,23 +509,12 @@ void UsbHostManager::poll() {
   g.statusPending = true;
 }
 
-void UsbHostManager::setInterfaceSelection(bool automatic, uint8_t interfaceNumber, uint8_t alternateSetting) {
-  autoSelect_ = automatic;
-  manualInterface_ = interfaceNumber;
-  manualAlt_ = alternateSetting;
-  g.selectionPending = true;
-}
-
 const UsbPrinterInterfaceInfo *UsbHostManager::selectedInterface() const {
   return device_.printer.found ? &device_.printer : nullptr;
 }
 
 const UsbPrinterInterfaceInfo *UsbHostManager::statusInterface() const {
   return device_.statusInterface.found ? &device_.statusInterface : nullptr;
-}
-
-const UsbPrinterInterfaceInfo *UsbHostManager::interfaceAt(uint8_t index) const {
-  return index < device_.printerInterfaceCount ? &device_.printerInterfaces[index] : nullptr;
 }
 
 bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accepted,
@@ -694,16 +587,12 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
 
 void UsbHostManager::onPortStatusTransfer(bool valid, uint8_t value, const String &error) {
   static String lastStatusError;
-
   if (!valid) {
-    device_.portStatus.valid = false;
-    if (error.length()) {
-      if (error != lastStatusError) {
-        Serial.printf("[USB] GET_PORT_STATUS error: %s\n", error.c_str());
-        lastStatusError = error;
-      }
-      error_ = error;
+    if (error.length() && error != lastStatusError) {
+      Serial.printf("[USB] GET_PORT_STATUS error: %s\n", error.c_str());
+      lastStatusError = error;
     }
+    if (error.length()) error_ = error;
     return;
   }
 
@@ -726,6 +615,12 @@ void UsbHostManager::onPortStatusTransfer(bool valid, uint8_t value, const Strin
   }
 }
 
+void UsbHostManager::onEnumerationStarted() {
+  if (!started_) return;
+  state_ = ENUMERATING;
+  error_.clear();
+}
+
 void UsbHostManager::onEnumerated(const UsbDeviceInfo &info) {
   device_ = info;
   error_.clear();
@@ -741,5 +636,5 @@ void UsbHostManager::onDetached() {
 
 void UsbHostManager::onEnumerationError(const String &error) {
   error_ = error;
-  if (started_) state_ = RUNNING;
+  if (started_ && state_ != ERROR) state_ = RUNNING;
 }

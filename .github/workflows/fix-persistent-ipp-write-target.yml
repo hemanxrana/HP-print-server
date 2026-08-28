@@ -1,0 +1,44 @@
+name: Fix persistent IPP writer routing
+
+on:
+  push:
+    branches:
+      - experiment/android-print-probe
+    paths:
+      - tools/fix_persistent_ipp_write_target.py
+      - .github/workflows/fix-persistent-ipp-write-target.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply routing fix
+        run: python3 tools/fix_persistent_ipp_write_target.py
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+      - name: Install ESP32 core 3.3.10
+        run: |
+          arduino-cli config init
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.10
+      - name: Compile standalone Android print probe
+        run: |
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi \
+            --warnings all \
+            --output-dir /tmp/probe-build \
+            experiments/android_print_probe
+      - name: Commit verified fix and remove temporary patcher
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add experiments/android_print_probe
+          git rm -f tools/fix_persistent_ipp_write_target.py .github/workflows/fix-persistent-ipp-write-target.yml
+          git commit -m 'Route live IPP proxy through persistent USB transfers'
+          git push origin HEAD:experiment/android-print-probe

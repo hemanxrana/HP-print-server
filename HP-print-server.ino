@@ -5,6 +5,7 @@
 #include <ESPmDNS.h>
 #include "usb_printer_backend.h"
 #include "ipp_pcl3_service.h"
+#include "system_diagnostics.h"
 
 // ESP32-S3 USB-to-Wi-Fi print server.
 // Network side: RAW JetDirect/AppSocket on TCP 9100 plus IPP on TCP 631.
@@ -101,7 +102,7 @@ void handleRoot() { configServer.send(200, "text/html; charset=utf-8", dashboard
 void handleSave() { if (!configServer.hasArg("ssid") || configServer.arg("ssid").isEmpty()) { configServer.send(400, "text/plain; charset=utf-8", "Wi-Fi network name is required."); return; } config.ssid = configServer.arg("ssid"); if (configServer.hasArg("clearPassword")) config.password = ""; else if (configServer.hasArg("password") && !configServer.arg("password").isEmpty()) config.password = configServer.arg("password"); if (!saveConfig()) { configServer.send(500, "text/plain; charset=utf-8", "Could not save Wi-Fi settings. The device was not restarted."); return; } configServer.send(200, "text/html; charset=utf-8", "<p>Wi-Fi settings saved. Rebooting…</p>"); delay(300); ESP.restart(); }
 
 void setup() {
-  Serial.begin(115200); delay(500); Serial.println(); Serial.println("=== ESP32-S3 HP PCL3GUI Print Server ===");
+  Serial.begin(115200); delay(500); Serial.println(); SystemDiagnostics::logBoot(); Serial.println("=== ESP32-S3 HP PCL3GUI Print Server ===");
   Serial.println("[MODE] RAW 9100 + IPP 631 PCL3GUI; both print through the classic USB Printer Class interface");
   Serial.println("[MODE] IPP-over-USB printing is disabled/not used; scanner USB backend is disabled");
   loadConfig(); if (!connectWiFi()) startConfigAP(); startRawDiscovery();

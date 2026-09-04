@@ -17,6 +17,7 @@ static constexpr uint8_t USB_PRINTER_STATUS_REQUEST_TYPE = 0xA1;
 static constexpr int MAX_ALREADY_CONNECTED_DEVICES = 8;
 static constexpr uint32_t STATUS_POLL_INTERVAL_MS = 1000;
 static constexpr uint32_t STATUS_TRANSFER_TIMEOUT_MS = 1000;
+static constexpr size_t BULK_OUT_BUFFER_SIZE = 1024;
 
 struct TransferWait { SemaphoreHandle_t done = nullptr; };
 
@@ -36,6 +37,10 @@ struct Runtime {
   volatile bool deviceGone = false;
   volatile bool statusPending = false;
   volatile usb_transfer_t *statusTransfer = nullptr;
+
+  usb_transfer_t *bulkOutTransfer = nullptr;
+  TransferWait bulkOutWait;
+  volatile bool bulkOutInFlight = false;
 
   TaskHandle_t clientTask = nullptr;
   TaskHandle_t hostTask = nullptr;
@@ -124,6 +129,39 @@ static int selectedStatusIndex(const UsbDeviceInfo &d, int printIndex) {
   return best;
 }
 
+static void freeBulkOutResources() {
+  if (g.bulkOutTransfer && !g.bulkOutInFlight) {
+    usb_host_transfer_free(g.bulkOutTransfer);
+    g.bulkOutTransfer = nullptr;
+  }
+  if (g.bulkOutWait.done && !g.bulkOutInFlight) {
+    vSemaphoreDelete(g.bulkOutWait.done);
+    g.bulkOutWait.done = nullptr;
+  }
+}
+
+static bool ensureBulkOutResources(String &error) {
+  if (!g.bulkOutWait.done) {
+    g.bulkOutWait.done = xSemaphoreCreateBinary();
+    if (!g.bulkOutWait.done) {
+      error = "unable to allocate persistent USB completion semaphore";
+      return false;
+    }
+  }
+  if (!g.bulkOutTransfer) {
+    const esp_err_t e = usb_host_transfer_alloc(BULK_OUT_BUFFER_SIZE, 0, &g.bulkOutTransfer);
+    if (e != ESP_OK || !g.bulkOutTransfer) {
+      error = String("persistent usb_host_transfer_alloc failed: ") + esp_err_to_name(e);
+      vSemaphoreDelete(g.bulkOutWait.done);
+      g.bulkOutWait.done = nullptr;
+      return false;
+    }
+    Serial.printf("[USB] Persistent Bulk OUT transfer allocated once (%u bytes)\n",
+                  (unsigned)BULK_OUT_BUFFER_SIZE);
+  }
+  return true;
+}
+
 static void resetDevice() {
   g.device = nullptr;
   g.address = 0;
@@ -133,6 +171,7 @@ static void resetDevice() {
   g.claimedPrintInterface = 0;
   g.claimedStatusInterface = 0;
   g.statusTransfer = nullptr;
+  freeBulkOutResources();
 }
 
 static void releaseInterfaces() {
@@ -353,6 +392,7 @@ static void clientEvent(const usb_host_client_event_msg_t *event, void *) {
 
 static void bulkTransferCallback(usb_transfer_t *t) {
   if (!t) return;
+  if (t == g.bulkOutTransfer) g.bulkOutInFlight = false;
   TransferWait *w = static_cast<TransferWait *>(t->context);
   if (w && w->done) xSemaphoreGive(w->done);
 }
@@ -520,63 +560,49 @@ const UsbPrinterInterfaceInfo *UsbHostManager::statusInterface() const {
 bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accepted,
                                uint32_t timeoutMs, String &error) {
   accepted = 0;
-  if (!data || !length) {
-    error = "empty USB transfer";
-    return false;
-  }
+  if (!data || !length) { error = "empty USB transfer"; return false; }
   if (!g.deviceOpen || !g.printInterfaceClaimed || !device_.printer.usableForRawPrint()) {
-    error = "USB printer interface is not claimed/ready";
-    return false;
+    error = "USB printer interface is not claimed/ready"; return false;
   }
-  if (length > 16384) {
-    error = "USB transfer chunk exceeds 16 KiB";
-    return false;
+  if (length > BULK_OUT_BUFFER_SIZE) {
+    error = String("USB transfer chunk exceeds persistent buffer: ") + String((unsigned)length) +
+            "/" + String((unsigned)BULK_OUT_BUFFER_SIZE); return false;
   }
+  if (g.bulkOutInFlight) { error = "previous USB Bulk OUT transfer is still in flight"; return false; }
+  if (!ensureBulkOutResources(error)) return false;
+  while (xSemaphoreTake(g.bulkOutWait.done, 0) == pdTRUE) {}
 
-  usb_transfer_t *t = nullptr;
-  esp_err_t e = usb_host_transfer_alloc(length, 0, &t);
-  if (e != ESP_OK || !t) {
-    error = String("usb_host_transfer_alloc failed: ") + esp_err_to_name(e);
-    return false;
-  }
-
-  TransferWait w;
-  w.done = xSemaphoreCreateBinary();
-  if (!w.done) {
-    usb_host_transfer_free(t);
-    error = "unable to allocate transfer completion semaphore";
-    return false;
-  }
-
+  usb_transfer_t *t = g.bulkOutTransfer;
   memcpy(t->data_buffer, data, length);
   t->num_bytes = length;
   t->device_handle = g.device;
   t->bEndpointAddress = device_.printer.bulkOut.address;
   t->callback = bulkTransferCallback;
-  t->context = &w;
+  t->context = &g.bulkOutWait;
   t->timeout_ms = timeoutMs;
 
-  e = usb_host_transfer_submit(t);
+  g.bulkOutInFlight = true;
+  const esp_err_t e = usb_host_transfer_submit(t);
   if (e != ESP_OK) {
-    vSemaphoreDelete(w.done);
-    usb_host_transfer_free(t);
+    g.bulkOutInFlight = false;
     error = String("usb_host_transfer_submit failed: ") + esp_err_to_name(e);
     return false;
   }
 
   const TickType_t waitTicks = timeoutMs ? pdMS_TO_TICKS(timeoutMs + 250) : portMAX_DELAY;
-  if (xSemaphoreTake(w.done, waitTicks) != pdTRUE) {
+  if (xSemaphoreTake(g.bulkOutWait.done, waitTicks) != pdTRUE) {
+    Serial.println("[USB] Bulk OUT completion wait exceeded transfer timeout; recovering endpoint");
     usb_host_endpoint_halt(t->device_handle, t->bEndpointAddress);
     usb_host_endpoint_flush(t->device_handle, t->bEndpointAddress);
     usb_host_endpoint_clear(t->device_handle, t->bEndpointAddress);
-    xSemaphoreTake(w.done, portMAX_DELAY);
+    if (xSemaphoreTake(g.bulkOutWait.done, pdMS_TO_TICKS(1500)) != pdTRUE) {
+      error = "USB Bulk OUT callback did not complete after endpoint recovery";
+      return false;
+    }
   }
 
   accepted = static_cast<size_t>(t->actual_num_bytes);
   const usb_transfer_status_t status = t->status;
-  vSemaphoreDelete(w.done);
-  usb_host_transfer_free(t);
-
   if (status != USB_TRANSFER_STATUS_COMPLETED || accepted != length) {
     error = String("USB bulk transfer failed status=") + String((int)status) +
             " accepted=" + String((unsigned)accepted) + "/" + String((unsigned)length);

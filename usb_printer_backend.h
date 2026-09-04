@@ -35,6 +35,9 @@ private:
   PrinterState state_ = OFFLINE;
   String reason_ = "usb-host-not-initialized";
   uint64_t jobBytes_ = 0;
+  uint64_t nextHealthLogAt_ = 512ULL * 1024ULL;
   bool drainPending_ = false;
   unsigned long drainUntilMs_ = 0;
+  unsigned long drainStartedMs_ = 0;
+  uint32_t drainStatusAtStart_ = 0;
 };

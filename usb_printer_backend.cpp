@@ -3,11 +3,16 @@
 #include <WiFi.h>
 #include <errno.h>
 #include <lwip/sockets.h>
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 namespace {
 constexpr uint16_t RAW_PORT = 9100;
 constexpr uint32_t RAW_IDLE_TIMEOUT_MS = 300000;
-constexpr uint32_t RAW_JOB_DRAIN_MS = 3000;
+constexpr uint32_t RAW_JOB_DRAIN_MS = 8000;
+constexpr uint32_t POST_JOB_STATUS_WAIT_MAX_MS = 15000;
+constexpr uint64_t HEALTH_LOG_INTERVAL_BYTES = 512ULL * 1024ULL;
 constexpr uint32_t RAW_CLOSE_GUARD_MS = 250;
 constexpr size_t RAW_RX_CHUNK = 4096;
 constexpr size_t RAW_POLL_BUDGET = 16384;
@@ -82,6 +87,15 @@ bool statusSaysReady(const UsbPrinterBackend &backend) {
   return backend.usbStatusSelected() &&
          !backend.usbPaperEmpty() &&
          !backend.usbStatusError();
+}
+
+void logTransportHealth(uint64_t bytes) {
+  Serial.printf("[PRINT][HEALTH] bytes=%llu free-heap=%lu min-free-heap=%lu largest-block=%u loop-stack-watermark=%u words\n",
+                (unsigned long long)bytes,
+                (unsigned long)ESP.getFreeHeap(),
+                (unsigned long)ESP.getMinFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }
 
 const char *statusReasonText(const UsbPrinterBackend &backend) {
@@ -293,35 +307,41 @@ bool UsbPrinterBackend::begin() {
   state_ = OFFLINE;
   reason_ = "waiting-for-usb-printer";
   jobBytes_ = 0;
+  nextHealthLogAt_ = HEALTH_LOG_INTERVAL_BYTES;
   drainPending_ = false;
+  drainStartedMs_ = 0;
+  drainStatusAtStart_ = 0;
   return true;
 }
 
 void UsbPrinterBackend::completeDrainIfReady() {
   if (!drainPending_ || state_ != PRINTING) return;
-  if ((int32_t)(millis() - drainUntilMs_) < 0) return;
-
-  drainPending_ = false;
   if (usbStatusValid() && usbStatusError()) {
-    state_ = ERROR;
-    reason_ = "usb-printer-reports-error-after-job";
+    drainPending_ = false; state_ = ERROR; reason_ = "usb-printer-reports-error-after-job";
     StatusLed::set(StatusLed::ERROR);
-  } else if (usbStatusValid() && (usbPaperEmpty() || !usbStatusSelected())) {
-    state_ = OFFLINE;
-    reason_ = statusReasonText(*this);
+    Serial.printf("[PRINT][FINALIZE] printer reported error after %llu USB-confirmed bytes\n", (unsigned long long)jobBytes_);
+    jobBytes_ = 0; return;
+  }
+  if (usbStatusValid() && (usbPaperEmpty() || !usbStatusSelected())) {
+    drainPending_ = false; state_ = OFFLINE; reason_ = statusReasonText(*this);
     StatusLed::set(StatusLed::WAITING_FOR_PRINTER);
-  } else {
-    state_ = IDLE;
-    reason_ = usbStatusValid() ? "usb-printer-ready" : "printer-interface-ready";
-    StatusLed::set(StatusLed::PRINTER_READY);
+    Serial.printf("[PRINT][FINALIZE] printer not ready after job: %s\n", reason_.c_str());
+    jobBytes_ = 0; return;
   }
 
-  Serial.printf("[RAW] USB transport complete: %llu bytes; final USB status=%s%s%s%s\n",
-                (unsigned long long)jobBytes_,
-                usbStatusValid() ? "valid" : "unavailable",
-                usbStatusValid() ? " selected=" : "",
-                usbStatusValid() ? (usbStatusSelected() ? "yes" : "no") : "",
-                usbStatusValid() ? (usbStatusError() ? " error=yes" : " error=no") : "");
+  const unsigned long now = millis();
+  if ((int32_t)(now - drainUntilMs_) < 0) return;
+  const bool statusUnavailable = !usbStatusValid();
+  const bool freshStatus = usbStatusValid() && host_.portStatus().updatedAt > drainStatusAtStart_;
+  if (!statusUnavailable && !freshStatus && now - drainStartedMs_ < POST_JOB_STATUS_WAIT_MAX_MS) return;
+
+  drainPending_ = false; state_ = IDLE;
+  reason_ = freshStatus ? "usb-printer-ready-after-fresh-status" : "printer-ready-after-post-job-guard";
+  StatusLed::set(StatusLed::PRINTER_READY);
+  Serial.printf("[PRINT][FINALIZE] transport complete: %llu bytes; waited=%lu ms; status=%s fresh=%s value=0x%02X\n",
+                (unsigned long long)jobBytes_, (unsigned long)(now - drainStartedMs_),
+                usbStatusValid() ? "valid" : "unavailable", freshStatus ? "yes" : "no",
+                usbStatusValid() ? usbPortStatus() : 0);
   jobBytes_ = 0;
 }
 
@@ -391,6 +411,7 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
 
   if (state_ == IDLE) {
     jobBytes_ = 0;
+    nextHealthLogAt_ = HEALTH_LOG_INTERVAL_BYTES;
     drainPending_ = false;
   }
   state_ = PRINTING;
@@ -399,6 +420,10 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
     return false;
   }
   jobBytes_ += length;
+  if (jobBytes_ >= nextHealthLogAt_) {
+    logTransportHealth(jobBytes_);
+    while (nextHealthLogAt_ <= jobBytes_) nextHealthLogAt_ += HEALTH_LOG_INTERVAL_BYTES;
+  }
   reason_ = "raw-job-in-progress";
   return true;
 }
@@ -406,8 +431,12 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
 void UsbPrinterBackend::finishRawJob() {
   if (state_ != PRINTING || drainPending_) return;
   drainPending_ = true;
-  drainUntilMs_ = millis() + RAW_JOB_DRAIN_MS;
+  drainStartedMs_ = millis();
+  drainUntilMs_ = drainStartedMs_ + RAW_JOB_DRAIN_MS;
+  drainStatusAtStart_ = usbStatusValid() ? host_.portStatus().updatedAt : 0;
   reason_ = "raw-job-draining";
+  Serial.printf("[PRINT][FINALIZE] last USB document byte accepted; guard=%lu ms status-at-start=%lu\n",
+                (unsigned long)RAW_JOB_DRAIN_MS, (unsigned long)drainStatusAtStart_);
 }
 
 void UsbPrinterBackend::abortRawJob(const String &reason) {

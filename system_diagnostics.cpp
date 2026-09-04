@@ -22,12 +22,14 @@ const char *resetReasonName(esp_reset_reason_t r) {
   }
 }
 }
+
 namespace SystemDiagnostics {
 void logBoot() {
   const esp_reset_reason_t reason = esp_reset_reason();
-  Serial.printf("[BOOT] reset-reason=%d (%s)\\n", (int)reason, resetReasonName(reason));
-  Serial.printf("[BOOT][HEALTH] free-heap=%lu min-free-heap=%lu largest-block=%u stack-watermark=%u words\\n",
-                (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMinFreeHeap(),
+  Serial.printf("[BOOT] reset-reason=%d (%s)\n", (int)reason, resetReasonName(reason));
+  Serial.printf("[BOOT][HEALTH] free-heap=%lu min-free-heap=%lu largest-block=%u stack-watermark=%u words\n",
+                (unsigned long)ESP.getFreeHeap(),
+                (unsigned long)ESP.getMinFreeHeap(),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
                 (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 }

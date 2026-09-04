@@ -10,7 +10,7 @@ def rep(path, old, new):
 
 def rx(path, pattern, repl):
     p = Path(path); s = p.read_text()
-    out, n = re.subn(pattern, repl, s, count=1, flags=re.S)
+    out, n = re.subn(pattern, lambda _m: repl, s, count=1, flags=re.S)
     if n != 1: raise RuntimeError(f"regex failed in {path}, matches={n}: {pattern[:120]!r}")
     p.write_text(out)
 

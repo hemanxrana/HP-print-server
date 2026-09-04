@@ -288,10 +288,16 @@ void IppPcl3Service::refreshJobState(){
     lastJobState_=9;
     lastJobReason_="job-completed-successfully";
     Serial.printf("[IPP] Job %lu state -> completed\n",(unsigned long)lastJobId_);
+  } else if(state==UsbPrinterBackend::OFFLINE){
+    lastJobState_=6;
+    lastJobReason_="printer-stopped";
+    Serial.printf("[IPP] Job %lu state -> stopped: %s\n",
+                  (unsigned long)lastJobId_,printer_.statusReason().c_str());
   } else if(state==UsbPrinterBackend::ERROR){
     lastJobState_=8;
     lastJobReason_="aborted-by-system";
-    Serial.printf("[IPP] Job %lu state -> aborted: %s\n",(unsigned long)lastJobId_,printer_.statusReason().c_str());
+    Serial.printf("[IPP] Job %lu state -> aborted: %s\n",
+                  (unsigned long)lastJobId_,printer_.statusReason().c_str());
   }
 }
 
@@ -304,7 +310,7 @@ void IppPcl3Service::begin(){
 void IppPcl3Service::poll(){
   if(!started_) return;
   refreshJobState();
-  WiFiClient client=ippServer.available();
+  WiFiClient client=ippServer.accept();
   if(client) handleClient(client);
 }
 

@@ -1,0 +1,42 @@
+name: Apply final printer-state batch
+
+on:
+  push:
+    paths:
+      - tools/apply_finalization_batch.py
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Apply finalization batch
+        run: python3 tools/apply_finalization_batch.py
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core 3.3.10
+        run: |
+          arduino-cli config init
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.10
+
+      - name: Compile exact ESP32-S3 N16R8 target
+        run: arduino-cli compile --fqbn 'esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi' --warnings all --output-dir build .
+
+      - name: Commit verified finalization batch
+        run: |
+          rm -f tools/apply_finalization_batch.py .github/workflows/apply-finalization-batch.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Harden printer completion and long-job status"
+          git push origin HEAD:main

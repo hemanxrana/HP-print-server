@@ -192,3 +192,4 @@ s = s.replace("rawActiveJobId,\n                    (unsigned long long)rawBytes
 Path("usb_printer_backend.cpp").write_text(s)
 
 print("Applied finalization/status batch")
+# trigger after workflow creation

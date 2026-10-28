@@ -135,8 +135,18 @@ Project baseline:
 - Arduino IDE
 - `esp32` by Espressif Systems
 - Arduino-ESP32 **3.3.10**
-- ESP32-S3 board target
+- ESP32-S3 board target (N16R8: 16 MB flash, 8 MB octal PSRAM)
 - Serial Monitor: **115200 baud**
+- Library: **NimBLE-Arduino 2.5.1**
+
+Tools menu settings must match the CI build:
+
+- Flash Size: **16MB (128Mb)**
+- PSRAM: **OPI PSRAM**
+- Partition Scheme: **16M Flash (3MB APP/9.9MB FATFS)** (`app3M_fat9M_16MB`)
+
+Changing the partition scheme requires one full flash over USB; OTA can only
+update inside the existing layout.
 
 Open `HP-print-server.ino`, compile, upload, and test with the real printer.
 
@@ -157,9 +167,11 @@ silently falls back to the previous firmware.
 
 Diagnostics beyond the serial console:
 
-- `/log` returns the recent RAM log ring.
-- `/status.json` includes job counters, last error, IPP job state, free heap,
-  boot count and USB wedge state.
+- `/log` streams the 64 KB RAM log ring (allocated in PSRAM when available).
+- `/status.json` includes job counters, last error, IPP job state, internal
+  heap, PSRAM totals/free, boot count and USB wedge state.
+- The HTML dashboard is rendered into a 16 KB PSRAM buffer and streamed, so it
+  does not churn the internal heap while printing.
 
 The ESP32-S3 exposes a NimBLE-based BLE UART-style diagnostic service named
 `HP-Print-Diagnostics`. Use a BLE GATT application such as nRF Connect to

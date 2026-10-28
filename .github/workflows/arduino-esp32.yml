@@ -23,4 +23,4 @@ jobs:
 
       - name: Compile ESP32-S3 N16R8 firmware
         run: |
-          arduino-cli compile --fqbn 'esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi' --warnings all --output-dir build .
+          arduino-cli compile --fqbn 'esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi' --warnings all --output-dir build .

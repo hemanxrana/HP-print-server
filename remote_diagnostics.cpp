@@ -1,6 +1,7 @@
 #include "remote_diagnostics.h"
 
 #include <NimBLEDevice.h>
+#include <esp_heap_caps.h>
 #include <stdarg.h>
 
 namespace {
@@ -9,7 +10,9 @@ constexpr char BLE_SERVICE_UUID[] = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr char BLE_RX_UUID[] = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr char BLE_TX_UUID[] = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr size_t COMMAND_SIZE = 64;
-constexpr size_t LOG_RING_SIZE = 2560;
+constexpr size_t LOG_RING_SIZE = 64 * 1024;
+constexpr size_t LOG_FALLBACK_SIZE = 4096;
+constexpr size_t BLE_LOG_TAIL = 1200;
 
 NimBLECharacteristic *txCharacteristic = nullptr;
 volatile bool bleConnected = false;
@@ -17,11 +20,25 @@ volatile bool commandReady = false;
 char pendingCommand[COMMAND_SIZE] = {};
 
 RemoteDiagnostics::CommandHook commandHook = nullptr;
-char logRing[LOG_RING_SIZE] = {};
+char fallbackRing[LOG_FALLBACK_SIZE] = {};
+char *logRing = fallbackRing;
+size_t logCapacity = LOG_FALLBACK_SIZE;
 size_t logLength = 0;
+bool ringInPsram = false;
+
+void initRing() {
+  char *psramRing = (char *)heap_caps_malloc(LOG_RING_SIZE, MALLOC_CAP_SPIRAM);
+  if (psramRing) {
+    logRing = psramRing;
+    logCapacity = LOG_RING_SIZE;
+    ringInPsram = true;
+  }
+  logLength = 0;
+  logRing[0] = '\0';
+}
 
 void appendLog(const String &line) {
-  const size_t capacity = sizeof(logRing) - 1;
+  const size_t capacity = logCapacity - 1;
   size_t length = line.length();
   const char *source = line.c_str();
   if (length > capacity) {
@@ -73,6 +90,10 @@ void notifyLine(const String &line) {
 
 namespace RemoteDiagnostics {
 void begin() {
+  initRing();
+  Serial.printf("[LOG] %u-byte log ring in %s; read it at /log\n",
+                (unsigned)logCapacity, ringInPsram ? "PSRAM" : "internal RAM");
+
   NimBLEDevice::init(BLE_DEVICE_NAME);
   NimBLEServer *server = NimBLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());
@@ -139,7 +160,19 @@ void publishf(const char *format, ...) {
   publish(String(buffer));
 }
 
+const char *logData(size_t &length) {
+  length = logLength;
+  return logRing;
+}
+
+bool logInPsram() {
+  return ::ringInPsram;
+}
+
+// Only a tail is returned because the ring can be 64 KB and BLE/notifications
+// and String copies are not meant to move that much data.
 String recentLog() {
-  return String(logRing);
+  const size_t tail = min(logLength, BLE_LOG_TAIL);
+  return String(logRing + (logLength - tail));
 }
 } // namespace RemoteDiagnostics

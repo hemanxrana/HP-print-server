@@ -9,6 +9,7 @@
 #include "remote_diagnostics.h"
 #include <ArduinoOTA.h>
 #include <esp_ota_ops.h>
+#include "esp_heap_caps.h"
 #include "esp_task_wdt.h"
 #if __has_include(<mdns.h>)
 #include <mdns.h>
@@ -138,26 +139,72 @@ static uint32_t bootCount = 0;
 static bool otaValidated = false;
 
 void sendJsonScan() { const int n = WiFi.scanNetworks(false, true); String out = "["; bool first = true; for (int i = 0; i < n; ++i) { String ssid = WiFi.SSID(i); if (ssid.isEmpty()) continue; if (!first) out += ","; first = false; out += String("{\"ssid\":\"") + jsonEsc(ssid) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + ",\"channel\":" + String(WiFi.channel(i)) + "}"; } out += "]"; WiFi.scanDelete(); configServer.send(200, "application/json", out); }
-void sendJsonStatus() { const bool printerAttached = usbHost.device().attached; const String printerName = printerAttached && usbHost.device().product.length() ? usbHost.device().product : "USB printer"; String out; out.reserve(1400); out += "{\"printer\":\"" + jsonEsc(printerStateText()); out += "\",\"printerReason\":\"" + jsonEsc(printerReasonText()); out += "\",\"printerName\":\"" + jsonEsc(printerName); out += "\",\"usbStatus\":\"" + jsonEsc(usbStatusText()); out += "\",\"wifi\":\"" + jsonEsc(wifiStatusText()); out += "\",\"ssid\":\"" + jsonEsc(activeNetworkName()); out += "\",\"rawConnected\":" + String(usbPrinterBackend.rawClientConnected() ? "true" : "false"); out += ",\"usbAttached\":" + String(printerAttached ? "true" : "false");   out += ",\"ip\":\"" + jsonEsc(activeIp()); out += "\",\"mdnsReady\":" + String(mdnsReady ? "true" : "false"); out += ",\"hostname\":\"" + String(mdnsReady ? "printer.local" : "") + "\"";
+void sendJsonStatus() { const bool printerAttached = usbHost.device().attached; const String printerName = printerAttached && usbHost.device().product.length() ? usbHost.device().product : "USB printer"; String out; out.reserve(1600); out += "{\"printer\":\"" + jsonEsc(printerStateText()); out += "\",\"printerReason\":\"" + jsonEsc(printerReasonText()); out += "\",\"printerName\":\"" + jsonEsc(printerName); out += "\",\"usbStatus\":\"" + jsonEsc(usbStatusText()); out += "\",\"wifi\":\"" + jsonEsc(wifiStatusText()); out += "\",\"ssid\":\"" + jsonEsc(activeNetworkName()); out += "\",\"rawConnected\":" + String(usbPrinterBackend.rawClientConnected() ? "true" : "false"); out += ",\"usbAttached\":" + String(printerAttached ? "true" : "false");   out += ",\"ip\":\"" + jsonEsc(activeIp()); out += "\",\"mdnsReady\":" + String(mdnsReady ? "true" : "false"); out += ",\"hostname\":\"" + String(mdnsReady ? "printer.local" : "") + "\"";
   out += ",\"jobsOk\":" + String(usbPrinterBackend.jobsCompleted()) + ",\"jobsFailed\":" + String(usbPrinterBackend.jobsFailed());
   out += ",\"maxDrainMs\":" + String(usbPrinterBackend.maxDrainMs()) + ",\"lastError\":\"" + jsonEsc(usbPrinterBackend.lastError()) + "\"";
   out += ",\"ippJob\":" + String(ippService.lastJobId()) + ",\"ippState\":" + String(ippService.lastJobState()) + ",\"ippReason\":\"" + jsonEsc(ippService.lastJobReason()) + "\"";
   out += ",\"freeHeap\":" + String(ESP.getFreeHeap()) + ",\"boots\":" + String(bootCount) + ",\"usbWedged\":" + String(usbHost.bulkOutWedged() ? "true" : "false");
+  out += ",\"psramTotal\":" + String((unsigned)ESP.getPsramSize()) + ",\"psramFree\":" + String((unsigned)ESP.getFreePsram()) + ",\"logInPsram\":" + String(RemoteDiagnostics::logInPsram() ? "true" : "false");
   out += "}"; configServer.send(200, "application/json", out); }
 
-String dashboard() {
+struct HtmlBuffer {
+  char *data = nullptr;
+  size_t length = 0;
+  size_t capacity = 0;
+
+  bool ensure() {
+    if (data) return true;
+    constexpr size_t cap = 16384;
+    data = (char *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
+    if (!data) data = (char *)heap_caps_malloc(cap, MALLOC_CAP_8BIT);
+    if (!data) return false;
+    capacity = cap;
+    data[0] = '\0';
+    return true;
+  }
+  void clear() { length = 0; if (data) data[0] = '\0'; }
+  void append(const char *text) {
+    if (!data || !text) return;
+    size_t n = strlen(text);
+    if (length + n >= capacity) n = capacity - 1 - length;
+    memcpy(data + length, text, n);
+    length += n;
+    data[length] = '\0';
+  }
+  void append(const String &text) { append(text.c_str()); }
+  void appendEscaped(const String &text) {
+    for (size_t i = 0; i < text.length(); ++i) {
+      const char c = text[i];
+      switch (c) {
+        case '&': append("&amp;"); break;
+        case '<': append("&lt;"); break;
+        case '>': append("&gt;"); break;
+        case 34: append("&quot;"); break;
+        case 39: append("&#39;"); break;
+        default: { char one[2] = {c, '\0'}; append(one); break; }
+      }
+    }
+  }
+  const char *c_str() const { return data ? data : ""; }
+};
+
+static HtmlBuffer dashboardBuffer;
+
+const char *dashboard() {
   const bool printerAttached = usbHost.device().attached;
   const String deviceName = printerAttached && usbHost.device().product.length() ? usbHost.device().product : "No USB printer";
   const String ip = activeIp(); const String networkName = activeNetworkName();
-  String html; html.reserve(9000);
-  html += R"HTML(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f3f5f7"><title>Print Server</title><style>*{box-sizing:border-box}body{margin:0;background:#f3f5f7;color:#344054;font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;font-size:14px;line-height:1.5}.app{max-width:940px;margin:auto;padding:22px 16px 40px}.top{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}.title{font-size:25px;font-weight:650}.subtitle,.small,.hint,.statusLine,.section p{color:#758195;font-size:13px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.btn{border:1px solid #d8e1e8;border-radius:9px;padding:8px 12px;background:#edf3f7;color:#466681;font:inherit;font-weight:600;cursor:pointer}.btn.primary{background:#557b9a;color:#fff;border-color:#557b9a}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.card,.section{background:#fbfcfd;border:1px solid #e1e7ec;border-radius:14px}.card{padding:15px;min-height:112px}.section{margin-top:11px;padding:17px}.label,.detailKey{font-size:11px;text-transform:uppercase;color:#7b8797;font-weight:600}.value{font-size:18px;font-weight:650;margin-top:6px}.pill{display:flex;align-items:center;gap:7px;font-size:12px;color:#637083;margin-top:8px}.dot{width:8px;height:8px;border-radius:50%;background:#719b7d}.dot.off{background:#b47b72}.sectionHead{display:flex;justify-content:space-between;gap:12px;margin-bottom:12px}.section h2{font-size:17px;margin:0}.details{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.detail,.service{padding:11px 12px;border-radius:10px;background:#f6f8fa;border:1px solid #e7ebef}.detailValue{font-size:13px;font-weight:600;margin-top:3px}.address{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;margin-top:6px;color:#536272}.selectWrap select,.field input{width:100%;padding:10px 11px;border:1px solid #dce3e9;border-radius:9px;background:#fff;color:#344054;font:inherit}.wifiForm{margin-top:13px;border-top:1px solid #e7ebef;padding-top:13px}.field{margin-bottom:10px}.field label{display:block;font-size:12px;font-weight:600;margin-bottom:5px}.check{display:flex;align-items:center;gap:8px;font-size:12px;color:#758195;margin:0 0 12px}a.btn{text-decoration:none}@media(max-width:720px){.grid{grid-template-columns:1fr}.details{grid-template-columns:1fr}}</style></head><body><main class="app"><div class="top"><div><div class="title">HP Smart Tank</div><div class="subtitle">USB printer over Wi-Fi</div></div><div class="actions"><a class="btn" href="/scan">Scanner (disabled)</a><button class="btn" id="refreshBtn" onclick="refreshStatus()">Refresh</button></div></div><div class="grid"><div class="card"><div class="label">Printer</div><div id="printerName" class="value">)HTML";
-  html += esc(deviceName);
-  html += R"HTML(</div><div id="printerState" class="small">)HTML"; html += esc(printerStateText()); html += R"HTML(</div><div id="printerReason" class="small">)HTML"; html += esc(printerReasonText()); html += R"HTML(</div><div id="printerPill" class="pill"><span class="dot )HTML"; html += printerAttached ? "" : "off"; html += R"HTML("></span><span>)HTML"; html += printerAttached ? "USB connected" : "USB not detected"; html += R"HTML(</span></div></div><div class="card"><div class="label">Network</div><div id="wifiName" class="value">)HTML"; html += esc(networkName); html += R"HTML(</div><div id="wifiState" class="small">)HTML"; html += esc(wifiStatusText()); html += R"HTML(</div></div><div class="card"><div class="label">RAW printing</div><div id="raw" class="value">)HTML"; html += usbPrinterBackend.rawClientConnected() ? "Active" : (usbPrinterBackend.online() ? "Ready" : "Unavailable");
-  html += R"HTML(</div><div class="small">JetDirect / AppSocket · TCP 9100</div></div></div><div class="section"><div class="sectionHead"><div><h2>Connection</h2><p>Essential device and network details.</p></div></div><div class="details"><div class="detail"><div class="detailKey">USB</div><div id="usbDetail" class="detailValue">)HTML"; html += printerAttached ? "Connected" : "Not detected"; html += R"HTML(</div></div><div class="detail"><div class="detailKey">Printer status</div><div id="usbStatus" class="detailValue">)HTML"; html += esc(usbStatusText()); html += R"HTML(</div></div><div class="detail"><div class="detailKey">IP address</div><div id="ipDetail" class="detailValue">)HTML"; html += esc(ip.length() ? ip : "Unavailable"); html += R"HTML(</div></div><div class="detail"><div class="detailKey">Hostname</div><div id="hostDetail" class="detailValue">)HTML"; html += mdnsReady ? "printer.local" : "Unavailable"; html += R"HTML(</div></div></div></div><div class="section"><div class="sectionHead"><div><h2>Print addresses</h2><p>RAW remains available; IPP advertises only HP PCL3GUI.</p></div></div><div class="service"><div id="printAddress" class="address">)HTML"; html += mdnsReady ? "socket://printer.local:9100" : (ip.length() ? String("socket://") + ip + ":9100" : "Unavailable"); html += R"HTML(</div></div><div class="service" style="margin-top:8px"><div class="label">IPP · PCL3GUI only</div><div class="address">ipp://printer.local:631/ipp/print</div></div></div><div class="section"><div class="sectionHead"><div><h2>Wi-Fi</h2><p>Change the network used by this print server.</p></div><button class="btn" id="scanBtn" onclick="scanWifi()">Scan networks</button></div><div class="selectWrap"><select id="ssidSelect"><option value="">Select a Wi-Fi network…</option></select></div><div id="scanState" class="statusLine" style="display:none"></div><form class="wifiForm" method="POST" action="/save"><div class="field"><label for="ssid">Wi-Fi network</label><input id="ssid" name="ssid" value=")HTML"; html += esc(config.ssid); html += R"HTML(" maxlength="32" autocomplete="off" placeholder="Select a network or enter a hidden SSID"></div><div class="field"><label for="password">Password</label><input id="password" type="password" name="password" placeholder="Leave blank to keep the saved password"></div><label class="check"><input type="checkbox" name="clearPassword" value="1"> Clear saved password for an open network</label><div class="actions"><button class="btn primary" type="submit">Save &amp; restart</button></div></form></div></main><script>const $=id=>document.getElementById(id);$('ssidSelect').addEventListener('change',()=>{$('ssid').value=$('ssidSelect').value;});async function scanWifi(){const b=$('scanBtn'),select=$('ssidSelect');b.disabled=true;select.innerHTML='<option value="">Scanning…</option>';try{const r=await fetch('/scan.json?ts='+Date.now());const a=await r.json();a.sort((x,y)=>y.rssi-x.rssi);select.innerHTML='<option value="">Select a Wi-Fi network…</option>';a.forEach(x=>{const o=document.createElement('option');o.value=x.ssid;o.textContent=x.ssid+' · '+x.rssi+' dBm · Ch '+x.channel;select.appendChild(o);});}finally{b.disabled=false;}}async function refreshStatus(){try{const r=await fetch('/status.json?ts='+Date.now());const s=await r.json();$('printerName').textContent=s.usbAttached?s.printerName:'No USB printer';$('printerState').textContent=s.printer;$('printerReason').textContent=s.printerReason;$('wifiName').textContent=s.ssid||'Not connected';$('wifiState').textContent=s.wifi;$('raw').textContent=s.rawConnected?'Active':(s.printer==='Ready'?'Ready':'Unavailable');$('usbDetail').textContent=s.usbAttached?'Connected':'Not detected';$('usbStatus').textContent=s.usbStatus;$('ipDetail').textContent=s.ip||'Unavailable';$('hostDetail').textContent=s.mdnsReady?'printer.local':'Unavailable';$('printAddress').textContent=s.mdnsReady?'socket://printer.local:9100':(s.ip?'socket://'+s.ip+':9100':'Unavailable');}catch(e){}}setInterval(refreshStatus,5000);</script></body></html>)HTML";
-  return html;
+  HtmlBuffer &out = dashboardBuffer;
+  if (!out.ensure()) return "";
+  out.clear();
+  out.append(R"HTML(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f3f5f7"><title>Print Server</title><style>*{box-sizing:border-box}body{margin:0;background:#f3f5f7;color:#344054;font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;font-size:14px;line-height:1.5}.app{max-width:940px;margin:auto;padding:22px 16px 40px}.top{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}.title{font-size:25px;font-weight:650}.subtitle,.small,.hint,.statusLine,.section p{color:#758195;font-size:13px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.btn{border:1px solid #d8e1e8;border-radius:9px;padding:8px 12px;background:#edf3f7;color:#466681;font:inherit;font-weight:600;cursor:pointer}.btn.primary{background:#557b9a;color:#fff;border-color:#557b9a}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.card,.section{background:#fbfcfd;border:1px solid #e1e7ec;border-radius:14px}.card{padding:15px;min-height:112px}.section{margin-top:11px;padding:17px}.label,.detailKey{font-size:11px;text-transform:uppercase;color:#7b8797;font-weight:600}.value{font-size:18px;font-weight:650;margin-top:6px}.pill{display:flex;align-items:center;gap:7px;font-size:12px;color:#637083;margin-top:8px}.dot{width:8px;height:8px;border-radius:50%;background:#719b7d}.dot.off{background:#b47b72}.sectionHead{display:flex;justify-content:space-between;gap:12px;margin-bottom:12px}.section h2{font-size:17px;margin:0}.details{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.detail,.service{padding:11px 12px;border-radius:10px;background:#f6f8fa;border:1px solid #e7ebef}.detailValue{font-size:13px;font-weight:600;margin-top:3px}.address{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;margin-top:6px;color:#536272}.selectWrap select,.field input{width:100%;padding:10px 11px;border:1px solid #dce3e9;border-radius:9px;background:#fff;color:#344054;font:inherit}.wifiForm{margin-top:13px;border-top:1px solid #e7ebef;padding-top:13px}.field{margin-bottom:10px}.field label{display:block;font-size:12px;font-weight:600;margin-bottom:5px}.check{display:flex;align-items:center;gap:8px;font-size:12px;color:#758195;margin:0 0 12px}a.btn{text-decoration:none}@media(max-width:720px){.grid{grid-template-columns:1fr}.details{grid-template-columns:1fr}}</style></head><body><main class="app"><div class="top"><div><div class="title">HP Smart Tank</div><div class="subtitle">USB printer over Wi-Fi</div></div><div class="actions"><a class="btn" href="/scan">Scanner (disabled)</a><button class="btn" id="refreshBtn" onclick="refreshStatus()">Refresh</button></div></div><div class="grid"><div class="card"><div class="label">Printer</div><div id="printerName" class="value">)HTML");
+  out.appendEscaped(deviceName);
+  out.append(R"HTML(</div><div id="printerState" class="small">)HTML"); out.appendEscaped(printerStateText()); out.append(R"HTML(</div><div id="printerReason" class="small">)HTML"); out.appendEscaped(printerReasonText()); out.append(R"HTML(</div><div id="printerPill" class="pill"><span class="dot )HTML"); out.append(printerAttached ? "" : "off"); out.append(R"HTML("></span><span>)HTML"); out.append(printerAttached ? "USB connected" : "USB not detected"); out.append(R"HTML(</span></div></div><div class="card"><div class="label">Network</div><div id="wifiName" class="value">)HTML"); out.appendEscaped(networkName); out.append(R"HTML(</div><div id="wifiState" class="small">)HTML"); out.appendEscaped(wifiStatusText()); out.append(R"HTML(</div></div><div class="card"><div class="label">RAW printing</div><div id="raw" class="value">)HTML"); out.append(usbPrinterBackend.rawClientConnected() ? "Active" : (usbPrinterBackend.online() ? "Ready" : "Unavailable"));
+  out.append(R"HTML(</div><div class="small">JetDirect / AppSocket · TCP 9100</div></div></div><div class="section"><div class="sectionHead"><div><h2>Connection</h2><p>Essential device and network details.</p></div></div><div class="details"><div class="detail"><div class="detailKey">USB</div><div id="usbDetail" class="detailValue">)HTML"); out.append(printerAttached ? "Connected" : "Not detected"); out.append(R"HTML(</div></div><div class="detail"><div class="detailKey">Printer status</div><div id="usbStatus" class="detailValue">)HTML"); out.appendEscaped(usbStatusText()); out.append(R"HTML(</div></div><div class="detail"><div class="detailKey">IP address</div><div id="ipDetail" class="detailValue">)HTML"); out.appendEscaped(ip.length() ? ip : "Unavailable"); out.append(R"HTML(</div></div><div class="detail"><div class="detailKey">Hostname</div><div id="hostDetail" class="detailValue">)HTML"); out.append(mdnsReady ? "printer.local" : "Unavailable"); out.append(R"HTML(</div></div></div></div><div class="section"><div class="sectionHead"><div><h2>Print addresses</h2><p>RAW remains available; IPP advertises only HP PCL3GUI.</p></div></div><div class="service"><div id="printAddress" class="address">)HTML"); out.append((mdnsReady ? "socket://printer.local:9100" : (ip.length() ? String("socket://") + ip + ":9100" : "Unavailable")).c_str()); out.append(R"HTML(</div></div><div class="service" style="margin-top:8px"><div class="label">IPP · PCL3GUI only</div><div class="address">ipp://printer.local:631/ipp/print</div></div></div><div class="section"><div class="sectionHead"><div><h2>Wi-Fi</h2><p>Change the network used by this print server.</p></div><button class="btn" id="scanBtn" onclick="scanWifi()">Scan networks</button></div><div class="selectWrap"><select id="ssidSelect"><option value="">Select a Wi-Fi network…</option></select></div><div id="scanState" class="statusLine" style="display:none"></div><form class="wifiForm" method="POST" action="/save"><div class="field"><label for="ssid">Wi-Fi network</label><input id="ssid" name="ssid" value=")HTML"); out.appendEscaped(config.ssid); out.append(R"HTML(" maxlength="32" autocomplete="off" placeholder="Select a network or enter a hidden SSID"></div><div class="field"><label for="password">Password</label><input id="password" type="password" name="password" placeholder="Leave blank to keep the saved password"></div><label class="check"><input type="checkbox" name="clearPassword" value="1"> Clear saved password for an open network</label><div class="actions"><button class="btn primary" type="submit">Save &amp; restart</button></div></form></div></main><script>const $=id=>document.getElementById(id);$('ssidSelect').addEventListener('change',()=>{$('ssid').value=$('ssidSelect').value;});async function scanWifi(){const b=$('scanBtn'),select=$('ssidSelect');b.disabled=true;select.innerHTML='<option value="">Scanning…</option>';try{const r=await fetch('/scan.json?ts='+Date.now());const a=await r.json();a.sort((x,y)=>y.rssi-x.rssi);select.innerHTML='<option value="">Select a Wi-Fi network…</option>';a.forEach(x=>{const o=document.createElement('option');o.value=x.ssid;o.textContent=x.ssid+' · '+x.rssi+' dBm · Ch '+x.channel;select.appendChild(o);});}finally{b.disabled=false;}}async function refreshStatus(){try{const r=await fetch('/status.json?ts='+Date.now());const s=await r.json();$('printerName').textContent=s.usbAttached?s.printerName:'No USB printer';$('printerState').textContent=s.printer;$('printerReason').textContent=s.printerReason;$('wifiName').textContent=s.ssid||'Not connected';$('wifiState').textContent=s.wifi;$('raw').textContent=s.rawConnected?'Active':(s.printer==='Ready'?'Ready':'Unavailable');$('usbDetail').textContent=s.usbAttached?'Connected':'Not detected';$('usbStatus').textContent=s.usbStatus;$('ipDetail').textContent=s.ip||'Unavailable';$('hostDetail').textContent=s.mdnsReady?'printer.local':'Unavailable';$('printAddress').textContent=s.mdnsReady?'socket://printer.local:9100':(s.ip?'socket://'+s.ip+':9100':'Unavailable');}catch(e){}}setInterval(refreshStatus,5000);</script></body></html>)HTML");
+  return out.c_str();
 }
 
-void handleRoot() { configServer.send(200, "text/html; charset=utf-8", dashboard()); }
+void handleRoot() { const char *page = dashboard(); const size_t length = strlen(page); configServer.setContentLength(length); configServer.send(200, "text/html; charset=utf-8"); if (length) configServer.sendContent(page, length); }
 void handleSave() { if (!configServer.hasArg("ssid") || configServer.arg("ssid").isEmpty()) { configServer.send(400, "text/plain; charset=utf-8", "Wi-Fi network name is required."); return; } config.ssid = configServer.arg("ssid"); if (configServer.hasArg("clearPassword")) config.password = ""; else if (configServer.hasArg("password") && !configServer.arg("password").isEmpty()) config.password = configServer.arg("password"); if (!saveConfig()) { configServer.send(500, "text/plain; charset=utf-8", "Could not save Wi-Fi settings. The device was not restarted."); return; } configServer.send(200, "text/html; charset=utf-8", "<p>Wi-Fi settings saved. Rebooting…</p>"); delay(300); ESP.restart(); }
 
 void loadBootCount() {
@@ -189,19 +236,21 @@ void validateOtaImage() {
   }
 }
 
-void handleLog() { configServer.send(200, "text/plain; charset=utf-8", RemoteDiagnostics::recentLog()); }
+void handleLog() { size_t length = 0; const char *ring = RemoteDiagnostics::logData(length); configServer.setContentLength(length); configServer.send(200, "text/plain; charset=utf-8"); if (length) configServer.sendContent(ring, length); }
 
 void diagCommand(const String &command) {
   if (command == "log") {
     const String logText = RemoteDiagnostics::recentLog();
     RemoteDiagnostics::publish(logText.length() ? logText : String("log is empty\n"));
   } else if (command == "counters") {
-    RemoteDiagnostics::publishf("jobs-ok=%lu jobs-failed=%lu max-drain=%lu ms boots=%lu free-heap=%lu rssi=%d\n",
+    RemoteDiagnostics::publishf("jobs-ok=%lu jobs-failed=%lu max-drain=%lu ms boots=%lu free-heap=%lu psram-free=%lu psram-total=%lu rssi=%d\n",
                                 (unsigned long)usbPrinterBackend.jobsCompleted(),
                                 (unsigned long)usbPrinterBackend.jobsFailed(),
                                 (unsigned long)usbPrinterBackend.maxDrainMs(),
                                 (unsigned long)bootCount,
                                 (unsigned long)ESP.getFreeHeap(),
+                                (unsigned long)ESP.getFreePsram(),
+                                (unsigned long)ESP.getPsramSize(),
                                 (int)WiFi.RSSI());
   } else if (command == "job") {
     RemoteDiagnostics::publishf("ipp-job=%lu ipp-state=%u last-error=%s\n",
@@ -249,6 +298,9 @@ void setup() {
   startWatchdog();
   RemoteDiagnostics::begin();
   RemoteDiagnostics::setCommandHook(diagCommand);
+  Serial.printf("[MEM] internal-heap-free=%lu psram-total=%u psram-free=%u\n",
+                (unsigned long)ESP.getFreeHeap(), (unsigned)ESP.getPsramSize(),
+                (unsigned)ESP.getFreePsram());
   Serial.println("[MODE] RAW 9100 + IPP 631 PCL3GUI; both print through the classic USB Printer Class interface");
   Serial.println("[MODE] IPP-over-USB printing is disabled/not used; scanner USB backend is disabled");
   loadConfig(); if (!connectWiFi()) startConfigAP(); startRawDiscovery(); startOtaIfPossible();

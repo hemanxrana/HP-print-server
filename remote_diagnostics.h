@@ -15,4 +15,6 @@ void publish(const String &message);
 void publishf(const char *format, ...);
 void setCommandHook(CommandHook hook);
 String recentLog();
+const char *logData(size_t &length);
+bool logInPsram();
 }

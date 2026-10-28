@@ -54,9 +54,9 @@ class ServerCallbacks final : public BLEServerCallbacks {
 
 class RxCallbacks final : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *characteristic) override {
-    const std::string value = characteristic->getValue();
-    const size_t n = min(value.size(), COMMAND_SIZE - 1);
-    memcpy(pendingCommand, value.data(), n);
+    const String value = characteristic->getValue();
+    const size_t n = min((size_t)value.length(), COMMAND_SIZE - 1);
+    memcpy(pendingCommand, value.c_str(), n);
     pendingCommand[n] = '\0';
     commandReady = true;
   }

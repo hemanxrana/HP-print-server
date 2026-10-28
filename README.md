@@ -160,13 +160,10 @@ Diagnostics beyond the serial console:
 - `/log` returns the recent RAM log ring.
 - `/status.json` includes job counters, last error, IPP job state, free heap,
   boot count and USB wedge state.
-- BLE console commands: `help`, `ping`, `status`, `log`, `counters`, `job`.
 
-The ESP32-S3 exposes a BLE UART-style diagnostic service named
-`HP-Print-Diagnostics`. Use a BLE GATT application such as nRF Connect to
-subscribe to the TX characteristic. The RX characteristic accepts `help`,
-`ping`, and `status`. BLE is used instead of Bluetooth Classic SPP because the
-ESP32-S3 does not support Classic Bluetooth.
+The BLE GATT console was removed so the firmware fits the default 1.25 MB app
+partition without changing the partition table. Diagnostics remain available
+over HTTP and the USB serial console.
 
 ## Repository policy
 

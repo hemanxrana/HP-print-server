@@ -191,28 +191,6 @@ void validateOtaImage() {
 
 void handleLog() { configServer.send(200, "text/plain; charset=utf-8", RemoteDiagnostics::recentLog()); }
 
-void diagCommand(const String &command) {
-  if (command == "log") {
-    const String logText = RemoteDiagnostics::recentLog();
-    RemoteDiagnostics::publish(logText.length() ? logText : String("log is empty\n"));
-  } else if (command == "counters") {
-    RemoteDiagnostics::publishf("jobs-ok=%lu jobs-failed=%lu max-drain=%lu ms boots=%lu free-heap=%lu rssi=%d\n",
-                                (unsigned long)usbPrinterBackend.jobsCompleted(),
-                                (unsigned long)usbPrinterBackend.jobsFailed(),
-                                (unsigned long)usbPrinterBackend.maxDrainMs(),
-                                (unsigned long)bootCount,
-                                (unsigned long)ESP.getFreeHeap(),
-                                (int)WiFi.RSSI());
-  } else if (command == "job") {
-    RemoteDiagnostics::publishf("ipp-job=%lu ipp-state=%u last-error=%s\n",
-                                (unsigned long)ippService.lastJobId(),
-                                (unsigned)ippService.lastJobState(),
-                                usbPrinterBackend.lastError().length() ? usbPrinterBackend.lastError().c_str() : "none");
-  } else {
-    RemoteDiagnostics::publish("unknown command; use help\n");
-  }
-}
-
 void onWifiConnected() {
   if (configApActive) {
     WiFi.softAPdisconnect(true);
@@ -248,7 +226,6 @@ void setup() {
   loadBootCount();
   startWatchdog();
   RemoteDiagnostics::begin();
-  RemoteDiagnostics::setCommandHook(diagCommand);
   Serial.println("[MODE] RAW 9100 + IPP 631 PCL3GUI; both print through the classic USB Printer Class interface");
   Serial.println("[MODE] IPP-over-USB printing is disabled/not used; scanner USB backend is disabled");
   loadConfig(); if (!connectWiFi()) startConfigAP(); startRawDiscovery(); startOtaIfPossible();
@@ -262,7 +239,6 @@ void loop() {
   esp_task_wdt_reset();
   serviceWifi();
   configServer.handleClient();
-  RemoteDiagnostics::poll();
   startOtaIfPossible();
   validateOtaImage();
   if (otaReady && usbPrinterBackend.state() != UsbPrinterBackend::PRINTING && !usbPrinterBackend.rawClientConnected()) ArduinoOTA.handle();

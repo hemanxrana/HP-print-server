@@ -17,7 +17,7 @@ static constexpr uint8_t USB_PRINTER_STATUS_REQUEST_TYPE = 0xA1;
 static constexpr int MAX_ALREADY_CONNECTED_DEVICES = 8;
 static constexpr uint32_t STATUS_POLL_INTERVAL_MS = 1000;
 static constexpr uint32_t STATUS_TRANSFER_TIMEOUT_MS = 1000;
-static constexpr size_t BULK_OUT_BUFFER_SIZE = 1024;
+static constexpr size_t BULK_OUT_BUFFER_SIZE = 4096;
 
 struct TransferWait { SemaphoreHandle_t done = nullptr; };
 
@@ -41,6 +41,10 @@ struct Runtime {
   usb_transfer_t *bulkOutTransfer = nullptr;
   TransferWait bulkOutWait;
   volatile bool bulkOutInFlight = false;
+  volatile bool bulkOutWedged = false;
+  volatile bool resetRequested = false;
+  unsigned long rescanAtMs = 0;
+  uint8_t rescanAttempts = 0;
 
   TaskHandle_t clientTask = nullptr;
   TaskHandle_t hostTask = nullptr;
@@ -353,6 +357,7 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
 }
 
 static void publish(const UsbDeviceInfo &d) {
+  g.rescanAttempts = 0;
   if (!manager) return;
   manager->onEnumerated(d);
   Serial.printf("[USB] Printer ready: %s VID=0x%04X PID=0x%04X address=%u\n",
@@ -473,6 +478,23 @@ static void clientTask(void *) {
       if (manager) manager->onDetached();
     }
 
+    if (g.resetRequested) {
+      g.resetRequested = false;
+      Serial.println("[USB] Recovering from unrecoverable Bulk OUT transfer; re-enumerating");
+      closeDevice();
+      if (manager) manager->onDetached();
+      g.bulkOutInFlight = false;
+      g.bulkOutWedged = false;
+      scanExisting();
+      g.rescanAtMs = millis() + 2000;
+      g.rescanAttempts = 15;
+    }
+    if (!g.deviceOpen && g.rescanAttempts && (int32_t)(millis() - g.rescanAtMs) >= 0) {
+      g.rescanAtMs = millis() + 2000;
+      --g.rescanAttempts;
+      scanExisting();
+    }
+
     submitPortStatusIfPending();
 
     if (g.newDevice && !g.deviceOpen) {
@@ -568,6 +590,7 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
     error = String("USB transfer chunk exceeds persistent buffer: ") + String((unsigned)length) +
             "/" + String((unsigned)BULK_OUT_BUFFER_SIZE); return false;
   }
+  if (g.bulkOutWedged) { error = "USB Bulk OUT endpoint wedged; recovering USB link"; return false; }
   if (g.bulkOutInFlight) { error = "previous USB Bulk OUT transfer is still in flight"; return false; }
   if (!ensureBulkOutResources(error)) return false;
   while (xSemaphoreTake(g.bulkOutWait.done, 0) == pdTRUE) {}
@@ -596,7 +619,9 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
     usb_host_endpoint_flush(t->device_handle, t->bEndpointAddress);
     usb_host_endpoint_clear(t->device_handle, t->bEndpointAddress);
     if (xSemaphoreTake(g.bulkOutWait.done, pdMS_TO_TICKS(1500)) != pdTRUE) {
-      error = "USB Bulk OUT callback did not complete after endpoint recovery";
+      g.bulkOutWedged = true;
+      g.resetRequested = true;
+      error = "USB Bulk OUT unrecoverable; re-enumerating USB link";
       return false;
     }
   }
@@ -609,6 +634,10 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
     return false;
   }
   return true;
+}
+
+bool UsbHostManager::bulkOutWedged() const {
+  return g.bulkOutWedged;
 }
 
 void UsbHostManager::onPortStatusTransfer(bool valid, uint8_t value, const String &error) {
@@ -650,6 +679,7 @@ void UsbHostManager::onEnumerationStarted() {
 void UsbHostManager::onEnumerated(const UsbDeviceInfo &info) {
   device_ = info;
   error_.clear();
+  g.bulkOutWedged = false;
   state_ = info.printer.found ? PRINTER_READY : DEVICE_ATTACHED;
 }
 

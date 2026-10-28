@@ -18,6 +18,7 @@ public:
   State state() const { return state_; }
   const UsbDeviceInfo &device() const { return device_; }
   const String &lastError() const { return error_; }
+  bool bulkOutWedged() const;
 
   const UsbPrinterInterfaceInfo *selectedInterface() const;
   const UsbPrinterInterfaceInfo *statusInterface() const;

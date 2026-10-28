@@ -12,11 +12,34 @@ constexpr char BLE_SERVICE_UUID[] = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr char BLE_RX_UUID[] = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr char BLE_TX_UUID[] = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr size_t COMMAND_SIZE = 64;
+constexpr size_t LOG_RING_SIZE = 2560;
 
 BLECharacteristic *txCharacteristic = nullptr;
 volatile bool bleConnected = false;
 volatile bool commandReady = false;
 char pendingCommand[COMMAND_SIZE] = {};
+
+RemoteDiagnostics::CommandHook commandHook = nullptr;
+char logRing[LOG_RING_SIZE] = {};
+size_t logLength = 0;
+
+void appendLog(const String &line) {
+  const size_t capacity = sizeof(logRing) - 1;
+  size_t length = line.length();
+  const char *source = line.c_str();
+  if (length > capacity) {
+    source += (length - capacity);
+    length = capacity;
+  }
+  if (logLength + length > capacity) {
+    const size_t drop = logLength + length - capacity;
+    memmove(logRing, logRing + drop, logLength - drop);
+    logLength -= drop;
+  }
+  memcpy(logRing + logLength, source, length);
+  logLength += length;
+  logRing[logLength] = '\0';
+}
 
 class ServerCallbacks final : public BLEServerCallbacks {
   void onConnect(BLEServer *) override {
@@ -72,6 +95,10 @@ void begin() {
   Serial.printf("[BLE] Diagnostics ready: %s; use a BLE GATT monitor\n", BLE_DEVICE_NAME);
 }
 
+void setCommandHook(CommandHook hook) {
+  commandHook = hook;
+}
+
 void poll() {
   if (!commandReady) return;
   char command[COMMAND_SIZE];
@@ -82,11 +109,13 @@ void poll() {
   normalized.trim();
   normalized.toLowerCase();
   if (normalized == "help") {
-    publish("commands: help, ping, status\n");
+    publish("commands: help, ping, status, log, counters, job\n");
   } else if (normalized == "ping") {
     publish("pong\n");
   } else if (normalized == "status") {
     publish("status is available from the Wi-Fi dashboard\n");
+  } else if (normalized.length() && commandHook) {
+    commandHook(normalized);
   } else if (normalized.length()) {
     publish("unknown command; use help\n");
   }
@@ -97,6 +126,7 @@ bool connected() {
 }
 
 void publish(const String &message) {
+  appendLog(message);
   notifyLine(message);
 }
 
@@ -107,5 +137,9 @@ void publishf(const char *format, ...) {
   vsnprintf(buffer, sizeof(buffer), format, args);
   va_end(args);
   publish(String(buffer));
+}
+
+String recentLog() {
+  return String(logRing);
 }
 } // namespace RemoteDiagnostics

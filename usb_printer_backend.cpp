@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <lwip/sockets.h>
 #include "esp_heap_caps.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -16,9 +17,15 @@ constexpr uint32_t POST_JOB_STATUS_WAIT_MAX_MS = 30000;
 constexpr uint32_t POST_JOB_LOG_INTERVAL_MS = 2000;
 constexpr uint64_t HEALTH_LOG_INTERVAL_BYTES = 512ULL * 1024ULL;
 constexpr uint32_t RAW_CLOSE_GUARD_MS = 250;
+constexpr uint32_t RAW_PROBE_IDLE_TIMEOUT_MS = 30000;
+// Optional job termination for clients that finish a RAW stream without a PJL
+// end-of-job or form feed.  HP PCL3GUI printers may otherwise leave the final
+// page unprinted.  Disabled by default so RAW stays byte-for-byte transparent.
+constexpr bool RAW_APPEND_JOB_TERMINATOR = false;
+constexpr char RAW_JOB_TERMINATOR[] = "\x1b%-12345X@PJL EOJ\r\n\x0c";
 constexpr size_t RAW_RX_CHUNK = 4096;
 constexpr size_t RAW_POLL_BUDGET = 16384;
-constexpr size_t RAW_USB_CHUNK = 1024;
+constexpr size_t RAW_USB_CHUNK = 4096;
 constexpr uint32_t RAW_USB_TIMEOUT_MS = 30000;
 
 WiFiServer rawServer(RAW_PORT);
@@ -114,6 +121,7 @@ bool sendUsbChunk(UsbHostManager &host, const uint8_t *data, size_t length, Stri
   while (offset < length) {
     const size_t part = min(RAW_USB_CHUNK, length - offset);
     size_t accepted = 0;
+    esp_task_wdt_reset();
     if (!host.bulkWrite(data + offset, part, accepted, RAW_USB_TIMEOUT_MS, error)) return false;
     if (accepted != part) {
       error = "USB Bulk OUT short write: " + String((unsigned)accepted) + "/" + String((unsigned)part);
@@ -161,6 +169,13 @@ void finishRawConnection(UsbPrinterBackend *backend, const char *reason) {
     return;
   }
 
+  if (RAW_APPEND_JOB_TERMINATOR && backend) {
+    String terminatorError;
+    if (!backend->sendDirect((const uint8_t *)RAW_JOB_TERMINATOR, strlen(RAW_JOB_TERMINATOR), terminatorError)) {
+      abortRawConnection(backend, String("job terminator failed: ") + terminatorError);
+      return;
+    }
+  }
   if (backend) backend->finishRawJob();
   rawTransportClosing = true;
   rawCloseGuardStarted = false;
@@ -172,13 +187,13 @@ void finishRawConnection(UsbPrinterBackend *backend, const char *reason) {
 }
 
 void serviceRawTransportClose(UsbPrinterBackend *backend) {
+  (void)backend;
   if (!rawTransportClosing) return;
-  if (backend && backend->state() == UsbPrinterBackend::PRINTING) return;
 
   if (!rawCloseGuardStarted) {
     rawCloseGuardStarted = true;
     rawTransportCloseAtMs = millis() + RAW_CLOSE_GUARD_MS;
-    Serial.printf("[RAW] Job #%lu USB drain complete; applying %lu ms socket close guard\n",
+    Serial.printf("[RAW] Job #%lu applying %lu ms socket close guard\n",
                   (unsigned long)rawActiveJobId, (unsigned long)RAW_CLOSE_GUARD_MS);
     return;
   }
@@ -187,16 +202,11 @@ void serviceRawTransportClose(UsbPrinterBackend *backend) {
 
   const uint32_t jobId = rawActiveJobId;
   const uint64_t bytes = rawBytesReceived;
-  const bool backendReady = !backend || backend->state() == UsbPrinterBackend::IDLE;
-  const String finalReason = backend ? backend->statusReason() : String();
 
   if (rawClientAllocated()) rawClient.stop();
 
-  Serial.printf("[RAW] Job #%lu COMPLETE: %llu bytes received and accepted by USB; printer-state=%s%s%s\n",
-                (unsigned long)jobId, (unsigned long long)bytes,
-                backendReady ? "ready" : "not-ready",
-                finalReason.length() ? " reason=" : "",
-                finalReason.length() ? finalReason.c_str() : "");
+  Serial.printf("[RAW] Job #%lu COMPLETE: %llu bytes received and accepted by USB\n",
+                (unsigned long)jobId, (unsigned long long)bytes);
   resetRawTransportState();
 }
 
@@ -253,6 +263,7 @@ void handleRawServer(UsbPrinterBackend *backend) {
     movedThisPoll += (size_t)got;
     rawLastDataMs = millis();
     movedData = true;
+    esp_task_wdt_reset();
     yield();
   }
 
@@ -286,7 +297,7 @@ void handleRawServer(UsbPrinterBackend *backend) {
     return;
   }
 
-  if (!movedData && millis() - rawLastDataMs >= RAW_IDLE_TIMEOUT_MS) {
+  if (!movedData && millis() - rawLastDataMs >= (rawBytesReceived == 0 ? RAW_PROBE_IDLE_TIMEOUT_MS : RAW_IDLE_TIMEOUT_MS)) {
     if (rawBytesReceived == 0) {
       Serial.printf("[RAW] TCP 9100 connection #%lu idle with no print data; closing\n",
                     (unsigned long)rawActiveJobId);
@@ -313,6 +324,17 @@ void startRawServerIfNeeded() {
 
 bool UsbPrinterBackend::rawClientConnected() const {
   return rawClientAllocated() || rawTransportClosing;
+}
+
+void UsbPrinterBackend::restartRawListener() {
+  // Rebind only the listening socket; an accepted client survives this and a
+  // job in progress must not be aborted by a Wi-Fi transition.
+  if (rawClientAllocated() || rawTransportClosing) return;
+  if (rawServerStarted) {
+    rawServer.end();
+    rawServerStarted = false;
+  }
+  startRawServerIfNeeded();
 }
 
 bool UsbPrinterBackend::begin() {
@@ -347,6 +369,8 @@ void UsbPrinterBackend::completeDrainIfReady() {
     drainPending_ = false;
     state_ = OFFLINE;
     reason_ = "usb-printer-reports-paper-empty";
+    jobsFailed_++;
+    lastError_ = reason_;
     StatusLed::set(StatusLed::WAITING_FOR_PRINTER);
     Serial.printf("[PRINT][FINALIZE] stopped: paper empty after %llu USB-confirmed bytes\n",
                   (unsigned long long)jobBytes_);
@@ -357,6 +381,8 @@ void UsbPrinterBackend::completeDrainIfReady() {
     drainPending_ = false;
     state_ = ERROR;
     reason_ = "usb-printer-reports-error-after-job";
+    jobsFailed_++;
+    lastError_ = reason_;
     StatusLed::set(StatusLed::ERROR);
     Serial.printf("[PRINT][FINALIZE] failed: printer error after %llu USB-confirmed bytes\n",
                   (unsigned long long)jobBytes_);
@@ -402,6 +428,8 @@ void UsbPrinterBackend::completeDrainIfReady() {
   state_ = IDLE;
   reason_ = freshStatus ? "usb-printer-ready-after-post-job-guard"
                         : "printer-ready-after-post-job-guard";
+  jobsCompleted_++;
+  if (age > maxDrainMs_) maxDrainMs_ = age;
   StatusLed::set(StatusLed::PRINTER_READY);
   Serial.printf("[PRINT][FINALIZE] transport complete: %llu bytes; waited=%lu ms; status=%s fresh=%s value=0x%02X\n",
                 (unsigned long long)jobBytes_, age,
@@ -509,6 +537,10 @@ void UsbPrinterBackend::finishRawJob() {
 }
 
 void UsbPrinterBackend::abortRawJob(const String &reason) {
+  if (state_ != ERROR) {
+    jobsFailed_++;
+    lastError_ = reason.length() ? reason : "raw-job-aborted";
+  }
   drainPending_ = false;
   drainUntilMs_ = 0;
   jobBytes_ = 0;

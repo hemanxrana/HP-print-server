@@ -112,16 +112,21 @@ The server accepts one active TCP 9100 client at a time.
 
 - TCP receive data is forwarded in bounded chunks so the main loop remains responsive.
 - USB writes are synchronously checked for completion.
-- After TCP closes, a short non-blocking drain period prevents a following job from colliding with the printer's final USB consumption.
+- The socket is closed a short guard period after the job ends; printer drain continues in the background.
+- A stalled TCP client is disconnected after 30 s without progress; a connection that sends no print data is dropped after 30 s.
 - Aborted jobs reset their byte accounting before the next job.
+- Optional compile-time `RAW_APPEND_JOB_TERMINATOR` appends a PJL end-of-job plus form feed for clients that never end the stream (disabled by default).
 
 ## Wi-Fi behavior
 
+- Wi-Fi modem power save is disabled so print traffic is not delayed by radio sleep.
 - Saved Wi-Fi is attempted at boot.
 - If connection fails, the configuration AP is started.
-- The firmware periodically retries the saved Wi-Fi network.
+- The firmware retries the saved Wi-Fi network every 30 seconds.
 - If Wi-Fi later recovers, the temporary configuration AP is stopped.
+- On every station reconnect the RAW 9100 and IPP 631 listeners are re-bound and mDNS is re-announced.
 - The dashboard only shows `printer.local` when mDNS actually started successfully.
+- A 60 s task watchdog reboots the device if the main loop wedges.
 
 ## Arduino ESP32 core
 
@@ -145,6 +150,17 @@ OTA in a real deployment.
 
 OTA is accepted only while the printer is idle. The USB serial monitor remains
 available at 115200 baud.
+
+When the bootloader rollback feature is enabled, the firmware marks the new
+image valid after ten seconds of successful uptime; otherwise the device
+silently falls back to the previous firmware.
+
+Diagnostics beyond the serial console:
+
+- `/log` returns the recent RAM log ring.
+- `/status.json` includes job counters, last error, IPP job state, free heap,
+  boot count and USB wedge state.
+- BLE console commands: `help`, `ping`, `status`, `log`, `counters`, `job`.
 
 The ESP32-S3 exposes a BLE UART-style diagnostic service named
 `HP-Print-Diagnostics`. Use a BLE GATT application such as nRF Connect to

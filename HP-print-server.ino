@@ -8,6 +8,11 @@
 #include "system_diagnostics.h"
 #include "remote_diagnostics.h"
 #include <ArduinoOTA.h>
+#include <esp_ota_ops.h>
+#include "esp_task_wdt.h"
+#if __has_include(<mdns.h>)
+#include <mdns.h>
+#endif
 
 // ESP32-S3 USB-to-Wi-Fi print server.
 // Network side: RAW JetDirect/AppSocket on TCP 9100 plus IPP on TCP 631.
@@ -45,7 +50,7 @@ bool saveConfig() { if (!preferences.begin(CONFIG_NS, false)) return false; cons
 
 bool connectWiFi() {
   if (config.ssid.isEmpty()) { Serial.println("[WiFi] No saved SSID"); return false; }
-  WiFi.mode(WIFI_STA); WiFi.setHostname(RAW_HOSTNAME); WiFi.begin(config.ssid.c_str(), config.password.c_str()); Serial.printf("[WiFi] Connecting to %s\n", config.ssid.c_str());
+  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.setHostname(RAW_HOSTNAME); WiFi.begin(config.ssid.c_str(), config.password.c_str()); Serial.printf("[WiFi] Connecting to %s\n", config.ssid.c_str());
   const unsigned long started = millis(); while (WiFi.status() != WL_CONNECTED && millis() - started < 20000UL) { delay(250); Serial.print('.'); } Serial.println();
   if (WiFi.status() != WL_CONNECTED) { Serial.printf("[WiFi] Connection failed, status=%d\n", (int)WiFi.status()); WiFi.disconnect(false, false); return false; }
   Serial.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str()); return true;
@@ -85,7 +90,7 @@ void startOtaIfPossible() {
 }
 
 bool startConfigAP() {
-  WiFi.mode(WIFI_AP_STA); WiFi.setHostname(RAW_HOSTNAME);
+  WiFi.mode(WIFI_AP_STA); WiFi.setSleep(false); WiFi.setHostname(RAW_HOSTNAME);
   if (!WiFi.softAP(AP_SSID, AP_PASSWORD, 1, false, 4)) { Serial.println("[AP] Failed to start configuration AP"); configApActive = false; return false; }
   configApActive = true; Serial.printf("[AP] SSID: %s\n", AP_SSID); Serial.printf("[AP] Configure at http://%s\n", WiFi.softAPIP().toString().c_str()); return true;
 }
@@ -110,6 +115,12 @@ void startRawDiscovery() {
     MDNS.addServiceTxt("ipp", "tcp", "usb_MFG", "HP");
     MDNS.addServiceTxt("ipp", "tcp", "usb_MDL", "HP Smart Tank 520_540 series");
     MDNS.addServiceTxt("ipp", "tcp", "usb_CMD", "PCL3GUI");
+    MDNS.addServiceTxt("ipp", "tcp", "adminurl", (String("http://") + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + "/").c_str());
+    MDNS.addServiceTxt("ipp", "tcp", "printer-state", "3");
+    MDNS.addServiceTxt("ipp", "tcp", "note", "RAW 9100 + IPP PCL3GUI");
+#if __has_include(<mdns.h>)
+    mdns_service_subtype_add_for_host(nullptr, "_ipp", "_tcp", nullptr, "_universal");
+#endif
     Serial.println("[mDNS] HP Smart Tank -> IPP 631 advertised as PCL3GUI only");
   }
 }
@@ -121,8 +132,18 @@ String wifiStatusText() { if (WiFi.status() == WL_CONNECTED) return String("Conn
 String activeNetworkName() { if (WiFi.status() == WL_CONNECTED) return WiFi.SSID(); if (configApActive) return String(AP_SSID); return "Not connected"; }
 String activeIp() { if (WiFi.status() == WL_CONNECTED) return WiFi.localIP().toString(); if (configApActive) return WiFi.softAPIP().toString(); return ""; }
 
+static int lastWifiStatus = -1;
+static unsigned long lastWifiAttemptMs = 0;
+static uint32_t bootCount = 0;
+static bool otaValidated = false;
+
 void sendJsonScan() { const int n = WiFi.scanNetworks(false, true); String out = "["; bool first = true; for (int i = 0; i < n; ++i) { String ssid = WiFi.SSID(i); if (ssid.isEmpty()) continue; if (!first) out += ","; first = false; out += String("{\"ssid\":\"") + jsonEsc(ssid) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + ",\"channel\":" + String(WiFi.channel(i)) + "}"; } out += "]"; WiFi.scanDelete(); configServer.send(200, "application/json", out); }
-void sendJsonStatus() { const bool printerAttached = usbHost.device().attached; const String printerName = printerAttached && usbHost.device().product.length() ? usbHost.device().product : "USB printer"; String out; out.reserve(1000); out += "{\"printer\":\"" + jsonEsc(printerStateText()); out += "\",\"printerReason\":\"" + jsonEsc(printerReasonText()); out += "\",\"printerName\":\"" + jsonEsc(printerName); out += "\",\"usbStatus\":\"" + jsonEsc(usbStatusText()); out += "\",\"wifi\":\"" + jsonEsc(wifiStatusText()); out += "\",\"ssid\":\"" + jsonEsc(activeNetworkName()); out += "\",\"rawConnected\":" + String(usbPrinterBackend.rawClientConnected() ? "true" : "false"); out += ",\"usbAttached\":" + String(printerAttached ? "true" : "false"); out += ",\"ip\":\"" + jsonEsc(activeIp()); out += "\",\"mdnsReady\":" + String(mdnsReady ? "true" : "false"); out += ",\"hostname\":\"" + String(mdnsReady ? "printer.local" : "") + "\"}"; configServer.send(200, "application/json", out); }
+void sendJsonStatus() { const bool printerAttached = usbHost.device().attached; const String printerName = printerAttached && usbHost.device().product.length() ? usbHost.device().product : "USB printer"; String out; out.reserve(1400); out += "{\"printer\":\"" + jsonEsc(printerStateText()); out += "\",\"printerReason\":\"" + jsonEsc(printerReasonText()); out += "\",\"printerName\":\"" + jsonEsc(printerName); out += "\",\"usbStatus\":\"" + jsonEsc(usbStatusText()); out += "\",\"wifi\":\"" + jsonEsc(wifiStatusText()); out += "\",\"ssid\":\"" + jsonEsc(activeNetworkName()); out += "\",\"rawConnected\":" + String(usbPrinterBackend.rawClientConnected() ? "true" : "false"); out += ",\"usbAttached\":" + String(printerAttached ? "true" : "false");   out += ",\"ip\":\"" + jsonEsc(activeIp()); out += "\",\"mdnsReady\":" + String(mdnsReady ? "true" : "false"); out += ",\"hostname\":\"" + String(mdnsReady ? "printer.local" : "") + "\"";
+  out += ",\"jobsOk\":" + String(usbPrinterBackend.jobsCompleted()) + ",\"jobsFailed\":" + String(usbPrinterBackend.jobsFailed());
+  out += ",\"maxDrainMs\":" + String(usbPrinterBackend.maxDrainMs()) + ",\"lastError\":\"" + jsonEsc(usbPrinterBackend.lastError()) + "\"";
+  out += ",\"ippJob\":" + String(ippService.lastJobId()) + ",\"ippState\":" + String(ippService.lastJobState()) + ",\"ippReason\":\"" + jsonEsc(ippService.lastJobReason()) + "\"";
+  out += ",\"freeHeap\":" + String(ESP.getFreeHeap()) + ",\"boots\":" + String(bootCount) + ",\"usbWedged\":" + String(usbHost.bulkOutWedged() ? "true" : "false");
+  out += "}"; configServer.send(200, "application/json", out); }
 
 String dashboard() {
   const bool printerAttached = usbHost.device().attached;
@@ -139,21 +160,111 @@ String dashboard() {
 void handleRoot() { configServer.send(200, "text/html; charset=utf-8", dashboard()); }
 void handleSave() { if (!configServer.hasArg("ssid") || configServer.arg("ssid").isEmpty()) { configServer.send(400, "text/plain; charset=utf-8", "Wi-Fi network name is required."); return; } config.ssid = configServer.arg("ssid"); if (configServer.hasArg("clearPassword")) config.password = ""; else if (configServer.hasArg("password") && !configServer.arg("password").isEmpty()) config.password = configServer.arg("password"); if (!saveConfig()) { configServer.send(500, "text/plain; charset=utf-8", "Could not save Wi-Fi settings. The device was not restarted."); return; } configServer.send(200, "text/html; charset=utf-8", "<p>Wi-Fi settings saved. Rebooting…</p>"); delay(300); ESP.restart(); }
 
+void loadBootCount() {
+  if (!preferences.begin("hp-diag", false)) return;
+  bootCount = preferences.getUInt("boots", 0) + 1;
+  preferences.putUInt("boots", bootCount);
+  preferences.end();
+}
+
+void startWatchdog() {
+  esp_task_wdt_config_t cfg = {};
+  cfg.timeout_ms = 60000;
+  cfg.idle_core_mask = 0;
+  cfg.trigger_panic = true;
+  if (esp_task_wdt_init(&cfg) != ESP_OK) esp_task_wdt_reconfigure(&cfg);
+  esp_task_wdt_add(nullptr);
+  Serial.println("[WDT] Task watchdog armed (60 s)");
+}
+
+void validateOtaImage() {
+  if (otaValidated || millis() < 10000UL) return;
+  otaValidated = true;
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+  if (running && esp_ota_get_state_partition(running, &state) == ESP_OK && state == ESP_OTA_IMG_PENDING_VERIFY) {
+    if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+      Serial.println("[OTA] Pending image marked valid; rollback cancelled");
+    }
+  }
+}
+
+void handleLog() { configServer.send(200, "text/plain; charset=utf-8", RemoteDiagnostics::recentLog()); }
+
+void diagCommand(const String &command) {
+  if (command == "log") {
+    const String logText = RemoteDiagnostics::recentLog();
+    RemoteDiagnostics::publish(logText.length() ? logText : String("log is empty\n"));
+  } else if (command == "counters") {
+    RemoteDiagnostics::publishf("jobs-ok=%lu jobs-failed=%lu max-drain=%lu ms boots=%lu free-heap=%lu rssi=%d\n",
+                                (unsigned long)usbPrinterBackend.jobsCompleted(),
+                                (unsigned long)usbPrinterBackend.jobsFailed(),
+                                (unsigned long)usbPrinterBackend.maxDrainMs(),
+                                (unsigned long)bootCount,
+                                (unsigned long)ESP.getFreeHeap(),
+                                (int)WiFi.RSSI());
+  } else if (command == "job") {
+    RemoteDiagnostics::publishf("ipp-job=%lu ipp-state=%u last-error=%s\n",
+                                (unsigned long)ippService.lastJobId(),
+                                (unsigned)ippService.lastJobState(),
+                                usbPrinterBackend.lastError().length() ? usbPrinterBackend.lastError().c_str() : "none");
+  } else {
+    RemoteDiagnostics::publish("unknown command; use help\n");
+  }
+}
+
+void onWifiConnected() {
+  if (configApActive) {
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    configApActive = false;
+    Serial.println("[AP] Station link up; configuration AP stopped");
+  }
+  startRawDiscovery();
+  usbPrinterBackend.restartRawListener();
+  ippService.rebind();
+  if (!otaReady) startOtaIfPossible();
+  Serial.println("[WiFi] Station link ready; RAW/IPP listeners re-bound");
+}
+
+void serviceWifi() {
+  const int status = (int)WiFi.status();
+  if (status == WL_CONNECTED && lastWifiStatus != WL_CONNECTED) {
+    onWifiConnected();
+  } else if (status != WL_CONNECTED && lastWifiStatus == WL_CONNECTED) {
+    Serial.println("[WiFi] Station link lost; retrying in background");
+  }
+
+  if (status != WL_CONNECTED && !config.ssid.isEmpty() && millis() - lastWifiAttemptMs >= 30000UL) {
+    lastWifiAttemptMs = millis();
+    Serial.printf("[WiFi] Retrying saved network %s\n", config.ssid.c_str());
+    WiFi.reconnect();
+  }
+  lastWifiStatus = status;
+}
+
 void setup() {
   Serial.begin(115200); delay(500); Serial.println(); SystemDiagnostics::logBoot(); Serial.println("=== ESP32-S3 HP PCL3GUI Print Server ===");
+  loadBootCount();
+  startWatchdog();
   RemoteDiagnostics::begin();
+  RemoteDiagnostics::setCommandHook(diagCommand);
   Serial.println("[MODE] RAW 9100 + IPP 631 PCL3GUI; both print through the classic USB Printer Class interface");
   Serial.println("[MODE] IPP-over-USB printing is disabled/not used; scanner USB backend is disabled");
   loadConfig(); if (!connectWiFi()) startConfigAP(); startRawDiscovery(); startOtaIfPossible();
+  lastWifiStatus = (int)WiFi.status();
   usbPrinterBackend.begin(); ippService.begin();
-  configServer.on("/", HTTP_GET, handleRoot); configServer.on("/scan.json", HTTP_GET, sendJsonScan); configServer.on("/status.json", HTTP_GET, sendJsonStatus); configServer.on("/save", HTTP_POST, handleSave); ensureUsbScannerWebRoutesInstalled(); configServer.begin();
+  configServer.on("/", HTTP_GET, handleRoot); configServer.on("/scan.json", HTTP_GET, sendJsonScan); configServer.on("/status.json", HTTP_GET, sendJsonStatus); configServer.on("/log", HTTP_GET, handleLog); configServer.on("/save", HTTP_POST, handleSave); ensureUsbScannerWebRoutesInstalled(); configServer.begin();
   Serial.println("[HTTP] Configuration server ready"); Serial.printf("[HTTP] Open http://%s\n", mdnsReady ? "printer.local" : (activeIp().length() ? activeIp().c_str() : "device-address")); Serial.println("[RAW] TCP 9100 server enabled"); Serial.println("[IPP] TCP 631 service enabled; document-format-supported=application/vnd.hp-pcl; version=PCL3GUI");
 }
 
 void loop() {
+  esp_task_wdt_reset();
+  serviceWifi();
   configServer.handleClient();
   RemoteDiagnostics::poll();
   startOtaIfPossible();
+  validateOtaImage();
   if (otaReady && usbPrinterBackend.state() != UsbPrinterBackend::PRINTING && !usbPrinterBackend.rawClientConnected()) ArduinoOTA.handle();
   if (!otaInProgress) {
     usbHost.poll(); usbPrinterBackend.poll(); ippService.poll();

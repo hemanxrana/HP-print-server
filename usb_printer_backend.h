@@ -13,6 +13,11 @@ public:
   const String &statusReason() const { return reason_; }
   const UsbDeviceInfo &device() const { return host_.device(); }
   bool rawClientConnected() const;
+  void restartRawListener();
+  uint32_t jobsCompleted() const { return jobsCompleted_; }
+  uint32_t jobsFailed() const { return jobsFailed_; }
+  uint32_t maxDrainMs() const { return maxDrainMs_; }
+  const String &lastError() const { return lastError_; }
 
   bool usbStatusValid() const { return host_.portStatusValid(); }
   uint8_t usbPortStatus() const { return host_.portStatusValue(); }
@@ -36,6 +41,10 @@ private:
   String reason_ = "usb-host-not-initialized";
   uint64_t jobBytes_ = 0;
   uint64_t nextHealthLogAt_ = 512ULL * 1024ULL;
+  uint32_t jobsCompleted_ = 0;
+  uint32_t jobsFailed_ = 0;
+  uint32_t maxDrainMs_ = 0;
+  String lastError_;
   bool drainPending_ = false;
   unsigned long drainUntilMs_ = 0;
   unsigned long drainStartedMs_ = 0;

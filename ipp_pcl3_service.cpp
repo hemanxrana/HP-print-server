@@ -1,9 +1,14 @@
 #include "ipp_pcl3_service.h"
 #include "remote_diagnostics.h"
+#include <stdio.h>
+#include "esp_mac.h"
+#include "esp_task_wdt.h"
 
 namespace {
 constexpr uint16_t IPP_PORT = 631;
-constexpr uint32_t CLIENT_TIMEOUT_MS = 180000;
+// Kept below the 60 s task watchdog so a stalled IPP client is disconnected
+// instead of resetting the whole device.
+constexpr uint32_t CLIENT_TIMEOUT_MS = 30000;
 constexpr size_t HTTP_HEADER_LIMIT = 4096;
 constexpr size_t BODY_BUFFER = 8192;
 // MIME type tokens are case-insensitive.  Use the registered lowercase form
@@ -207,8 +212,33 @@ bool supportedDocumentFormat(const String &format) {
   return format.equalsIgnoreCase(PCL3_MIME);
 }
 
+String printerUuid() {
+  static String cached;
+  if (cached.length()) return cached;
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  uint8_t b[16] = {0x48, 0x50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x12, 0x34};
+  memcpy(b + 2, mac, 6);
+  // Deterministic tail from the MAC so the UUID is stable across reboot/OTA.
+  b[8] = mac[0] ^ 0xA5;
+  b[9] = mac[1] ^ 0x5A;
+  b[10] = mac[2] ^ 0x3C;
+  b[11] = mac[3] ^ 0xC3;
+  b[12] = mac[4] ^ 0x0F;
+  b[13] = mac[5] ^ 0xF0;
+  b[6] = (b[6] & 0x0F) | 0x40;
+  b[8] = (b[8] & 0x3F) | 0x80;
+  char out[48];
+  snprintf(out, sizeof(out),
+           "urn:uuid:%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+           b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+           b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+  cached = out;
+  return cached;
+}
+
 struct IppWriter {
-  uint8_t data[1536]; size_t len = 0; bool ok = true;
+  uint8_t data[2048]; size_t len = 0; bool ok = true;
   void b(uint8_t v){ if(len < sizeof(data)) data[len++] = v; else ok = false; }
   void u16(uint16_t v){ b(v >> 8); b(v); }
   void u32(uint32_t v){ b(v >> 24); b(v >> 16); b(v >> 8); b(v); }
@@ -258,6 +288,7 @@ void sendJobResponse(WiFiClient &client,uint8_t major,uint8_t minor,uint16_t sta
 void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32_t requestId){
   IppWriter w; beginResponse(w,major,minor,0x0000,requestId); w.b(0x04);
   w.str(0x45,"printer-uri-supported","ipp://printer.local:631/ipp/print");
+  w.str(0x45,"printer-uuid",printerUuid().c_str());
   w.str(0x42,"printer-name","HP Smart Tank");
   w.str(0x42,"printer-make-and-model","HP Smart Tank 520_540 series");
   w.integer(0x23,"printer-state",3); w.str(0x44,"printer-state-reasons","none"); w.boolean("printer-is-accepting-jobs",true);
@@ -277,7 +308,15 @@ bool readU16(BodyReader &r,uint16_t &v){
   uint8_t b[2]; if(!r.readExact(b,2)) return false; v=((uint16_t)b[0]<<8)|b[1]; return true;
 }
 
-bool parseAttributes(BodyReader &r,String &format){
+struct RequestAttrs {
+  String documentFormat;
+  bool hasJobId = false;
+  int32_t jobId = 0;
+  bool hasJobUri = false;
+  String jobUri;
+};
+
+bool parseAttributes(BodyReader &r,RequestAttrs &attrs){
   String currentName;
   while(true){
     uint8_t tag=0;
@@ -292,11 +331,21 @@ bool parseAttributes(BodyReader &r,String &format){
     if(nameLen) currentName=name;
     if(!readU16(r,valueLen)) return false;
 
+    const bool keepFormat=currentName=="document-format";
+    const bool keepJobId=currentName=="job-id" && valueLen==4;
+    const bool keepJobUri=currentName=="job-uri";
+    const bool keep=keepFormat||keepJobId||keepJobUri;
     String value;
-    const bool keep=currentName=="document-format";
     if(keep) value.reserve(valueLen);
     for(uint16_t i=0;i<valueLen;++i){ uint8_t b=0; if(!r.readByte(b)) return false; if(keep) value+=(char)b; }
-    if(keep) format=value;
+
+    if(keepFormat) attrs.documentFormat=value;
+    if(keepJobId){
+      attrs.hasJobId=true;
+      const uint8_t *p=(const uint8_t*)value.c_str();
+      attrs.jobId=((int32_t)p[0]<<24)|((int32_t)p[1]<<16)|((int32_t)p[2]<<8)|(int32_t)p[3];
+    }
+    if(keepJobUri){ attrs.hasJobUri=true; attrs.jobUri=value; }
   }
 }
 } // namespace
@@ -325,6 +374,12 @@ void IppPcl3Service::begin(){
   if(started_) return;
   ippServer.begin(); ippServer.setNoDelay(true); started_=true;
   Serial.printf("[IPP] PCL3GUI-only IPP service listening on TCP 631; document buffer=%u bytes\n",(unsigned)BODY_BUFFER);
+}
+
+void IppPcl3Service::rebind(){
+  ippServer.end();
+  started_=false;
+  begin();
 }
 
 void IppPcl3Service::poll(){
@@ -365,12 +420,13 @@ void IppPcl3Service::handleClient(WiFiClient client){
   const uint16_t op=((uint16_t)hdr[2]<<8)|hdr[3];
   const uint32_t requestId=((uint32_t)hdr[4]<<24)|((uint32_t)hdr[5]<<16)|((uint32_t)hdr[6]<<8)|hdr[7];
 
-  String format;
-  if(!parseAttributes(body,format)){
+  RequestAttrs attrs;
+  if(!parseAttributes(body,attrs)){
     lastError_="malformed IPP attributes";
     sendSimple(client,major,minor,0x0400,requestId);
     client.stop(); clientActive_=false; return;
   }
+  const String &format = attrs.documentFormat;
 
   Serial.printf("[IPP] op=0x%04X request-id=%lu format=%s transfer=%s\n",
                 op,(unsigned long)requestId,format.c_str(),body.chunked?"chunked":"fixed");
@@ -381,7 +437,7 @@ void IppPcl3Service::handleClient(WiFiClient client){
     sendSimple(client,major,minor,(format.isEmpty()||supportedDocumentFormat(format))?0x0000:0x040A,requestId);
   } else if(op==0x0002){
     if(!supportedDocumentFormat(format)){
-      lastError_="Print-Job rejected: only application/vnd.hp-PCL is supported";
+      lastError_="Print-Job rejected: only application/vnd.hp-pcl is supported";
       sendSimple(client,major,minor,0x040A,requestId);
     } else if(printer_.rawClientConnected()||!printer_.online()){
       lastError_="Printer busy or unavailable";
@@ -395,6 +451,7 @@ void IppPcl3Service::handleClient(WiFiClient client){
       const uint32_t streamStarted=millis();
 
       while(true){
+        esp_task_wdt_reset();
         const uint32_t readStarted=millis();
         const size_t n=body.readBlock(bodyBuffer,sizeof(bodyBuffer));
         networkReadMs += millis()-readStarted;
@@ -447,7 +504,9 @@ void IppPcl3Service::handleClient(WiFiClient client){
     }
   } else if(op==0x0009 || op==0x000A){
     refreshJobState();
-    if(lastJobId_){
+    if(attrs.hasJobId && lastJobId_ && (uint32_t)attrs.jobId != lastJobId_){
+      sendSimple(client,major,minor,0x0406,requestId);
+    } else if(lastJobId_){
       Serial.printf("[IPP] Job status: id=%lu state=%u reason=%s\n",
                     (unsigned long)lastJobId_,lastJobState_,lastJobReason_.c_str());
       sendJobResponse(client,major,minor,0x0000,requestId,lastJobId_,lastJobState_,lastJobReason_);

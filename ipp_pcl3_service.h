@@ -7,10 +7,14 @@ class IppPcl3Service {
 public:
   explicit IppPcl3Service(UsbPrinterBackend &printer) : printer_(printer) {}
   void begin();
+  void rebind();
   void poll();
   bool active() const { return clientActive_; }
   uint64_t lastJobBytes() const { return lastJobBytes_; }
   const String &lastError() const { return lastError_; }
+  uint32_t lastJobId() const { return lastJobId_; }
+  uint8_t lastJobState() const { return lastJobState_; }
+  const String &lastJobReason() const { return lastJobReason_; }
 
 private:
   void handleClient(WiFiClient client);

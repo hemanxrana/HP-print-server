@@ -6,9 +6,12 @@
 // Bluetooth Classic SPP, so this is intentionally a GATT console rather than
 // BluetoothSerial.
 namespace RemoteDiagnostics {
+using CommandHook = void (*)(const String &command);
 void begin();
 void poll();
 bool connected();
 void publish(const String &message);
 void publishf(const char *format, ...);
+void setCommandHook(CommandHook hook);
+String recentLog();
 }

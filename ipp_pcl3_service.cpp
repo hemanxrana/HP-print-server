@@ -1,11 +1,14 @@
 #include "ipp_pcl3_service.h"
+#include "remote_diagnostics.h"
 
 namespace {
 constexpr uint16_t IPP_PORT = 631;
 constexpr uint32_t CLIENT_TIMEOUT_MS = 180000;
 constexpr size_t HTTP_HEADER_LIMIT = 4096;
 constexpr size_t BODY_BUFFER = 8192;
-constexpr const char *PCL3_MIME = "application/vnd.hp-PCL";
+// MIME type tokens are case-insensitive.  Use the registered lowercase form
+// in responses, while accepting Android clients that vary the casing.
+constexpr const char *PCL3_MIME = "application/vnd.hp-pcl";
 WiFiServer ippServer(IPP_PORT);
 static uint8_t bodyBuffer[BODY_BUFFER];
 
@@ -69,10 +72,15 @@ struct BodyReader {
   size_t chunkRemaining = 0;
   bool done = false;
   bool framingError = false;
+  bool peerClosed = false;
 
   explicit BodyReader(WiFiClient &c) : client(c) {}
 
-  bool rawByte(uint8_t &b) { return readClientByte(client, b, CLIENT_TIMEOUT_MS); }
+  bool rawByte(uint8_t &b) {
+    if (readClientByte(client, b, CLIENT_TIMEOUT_MS)) return true;
+    if (!client.connected() && client.available() == 0) peerClosed = true;
+    return false;
+  }
 
   bool rawLine(String &line) {
     line = "";
@@ -152,7 +160,10 @@ struct BodyReader {
       if (remaining > 0) want = min(want, (size_t)remaining);
       const size_t got = readClientBlock(client, dst, want, CLIENT_TIMEOUT_MS);
       if (!got) {
-        if (remaining < 0 && !client.connected() && client.available() == 0) done = true;
+        if (!client.connected() && client.available() == 0) {
+          peerClosed = true;
+          if (remaining < 0) done = true;
+        }
         return 0;
       }
       if (remaining > 0) {
@@ -170,7 +181,10 @@ struct BodyReader {
 
       const size_t want = min(capacity - total, chunkRemaining);
       const size_t got = readClientBlock(client, dst + total, want, CLIENT_TIMEOUT_MS);
-      if (!got) break;
+      if (!got) {
+        if (!client.connected() && client.available() == 0) peerClosed = true;
+        break;
+      }
 
       total += got;
       chunkRemaining -= got;
@@ -186,6 +200,12 @@ struct BodyReader {
     return total;
   }
 };
+
+bool supportedDocumentFormat(const String &format) {
+  // IPP mimeMediaType values are case-insensitive.  Android commonly sends
+  // application/vnd.hp-pcl while older clients may use application/vnd.hp-PCL.
+  return format.equalsIgnoreCase(PCL3_MIME);
+}
 
 struct IppWriter {
   uint8_t data[1536]; size_t len = 0; bool ok = true;
@@ -358,9 +378,9 @@ void IppPcl3Service::handleClient(WiFiClient client){
   if(op==0x000B){
     sendPrinterAttributes(client,major,minor,requestId);
   } else if(op==0x0004){
-    sendSimple(client,major,minor,(format.isEmpty()||format==PCL3_MIME)?0x0000:0x040A,requestId);
+    sendSimple(client,major,minor,(format.isEmpty()||supportedDocumentFormat(format))?0x0000:0x040A,requestId);
   } else if(op==0x0002){
-    if(format!=PCL3_MIME){
+    if(!supportedDocumentFormat(format)){
       lastError_="Print-Job rejected: only application/vnd.hp-PCL is supported";
       sendSimple(client,major,minor,0x040A,requestId);
     } else if(printer_.rawClientConnected()||!printer_.online()){
@@ -401,13 +421,25 @@ void IppPcl3Service::handleClient(WiFiClient client){
                     (unsigned long long)kibPerSecond,
                     (unsigned)BODY_BUFFER);
 
-      if(ok && body.done && !body.framingError){
+      if(ok && body.done && !body.framingError && lastJobBytes_ > 0){
         printer_.finishRawJob();
         Serial.printf("[IPP] PCL3GUI Print-Job accepted: job=%lu %llu bytes sent to classic USB print interface\n",
                       (unsigned long)jobId,(unsigned long long)lastJobBytes_);
         sendJobResponse(client,major,minor,0x0000,requestId,jobId,lastJobState_,lastJobReason_);
       } else {
-        if(lastError_.isEmpty()) lastError_=body.framingError ? "HTTP chunk framing error" : "Print-Job body ended unexpectedly";
+        if(lastError_.isEmpty()) {
+          if (body.framingError) lastError_="HTTP chunk framing error";
+          else if (body.peerClosed) lastError_="IPP client disconnected before the complete document was received";
+          else if (lastJobBytes_ == 0) lastError_="Print-Job document was empty";
+          else lastError_="Print-Job body ended unexpectedly";
+        }
+        Serial.printf("[IPP] Print-Job failed: bytes=%llu done=%s peer-closed=%s framing-error=%s reason=%s\n",
+                      (unsigned long long)lastJobBytes_, body.done ? "yes" : "no",
+                      body.peerClosed ? "yes" : "no", body.framingError ? "yes" : "no",
+                      lastError_.c_str());
+        RemoteDiagnostics::publishf("[IPP] job=%lu failed bytes=%llu reason=%s\n",
+                                    (unsigned long)jobId,
+                                    (unsigned long long)lastJobBytes_, lastError_.c_str());
         printer_.abortRawJob(lastError_);
         lastJobState_=8; lastJobReason_="aborted-by-system";
         sendSimple(client,major,minor,0x0500,requestId);

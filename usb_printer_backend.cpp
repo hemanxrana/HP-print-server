@@ -1,5 +1,6 @@
 #include "usb_printer_backend.h"
 #include "status_led.h"
+#include "remote_diagnostics.h"
 #include <WiFi.h>
 #include <errno.h>
 #include <lwip/sockets.h>
@@ -143,6 +144,9 @@ void abortRawConnection(UsbPrinterBackend *backend, const String &reason) {
   Serial.printf("[RAW] Job #%lu INCOMPLETE after %llu USB-confirmed bytes: %s\n",
                 (unsigned long)jobId, (unsigned long long)bytes,
                 reason.length() ? reason.c_str() : "unknown transport failure");
+  RemoteDiagnostics::publishf("[RAW] job=%lu incomplete bytes=%llu reason=%s\n",
+                              (unsigned long)jobId, (unsigned long long)bytes,
+                              reason.length() ? reason.c_str() : "unknown");
   resetRawTransportState();
 }
 
@@ -262,8 +266,23 @@ void handleRawServer(UsbPrinterBackend *backend) {
   }
 
   if (peer == RawPeerState::ERROR && !pending) {
-    abortRawConnection(backend,
-                       String("TCP peer ended without clean FIN; errno=") + String(peerError));
+    // Some Android print applications reset the socket after their last write
+    // instead of performing a graceful FIN.  At this point the receive buffer
+    // is empty and every byte counted in rawBytesReceived has already passed
+    // through sendDirect(), so the reset is only a transport close signal.
+    // Treating it as an aborted job loses otherwise-complete Android jobs.
+    if (rawBytesReceived > 0 &&
+        (peerError == ECONNRESET || peerError == ECONNABORTED || peerError == EPIPE)) {
+      Serial.printf("[RAW] Job #%lu peer reset after buffer drained; errno=%d; treating as input complete\n",
+                    (unsigned long)rawActiveJobId, peerError);
+      RemoteDiagnostics::publishf("[RAW] job=%lu Android reset after %llu bytes; completing\n",
+                                  (unsigned long)rawActiveJobId,
+                                  (unsigned long long)rawBytesReceived);
+      finishRawConnection(backend, "android-peer-reset-after-buffer-drained");
+    } else {
+      abortRawConnection(backend,
+                         String("TCP peer ended without clean FIN; errno=") + String(peerError));
+    }
     return;
   }
 

@@ -6,6 +6,8 @@
 #include "usb_printer_backend.h"
 #include "ipp_pcl3_service.h"
 #include "system_diagnostics.h"
+#include "remote_diagnostics.h"
+#include <ArduinoOTA.h>
 
 // ESP32-S3 USB-to-Wi-Fi print server.
 // Network side: RAW JetDirect/AppSocket on TCP 9100 plus IPP on TCP 631.
@@ -31,6 +33,9 @@ Config config;
 static unsigned long lastStatus = 0;
 static bool mdnsReady = false;
 static bool configApActive = false;
+static bool otaReady = false;
+static bool otaInProgress = false;
+static constexpr const char *OTA_PASSWORD = "change-this-ota-password";
 
 String esc(String s) { s.replace("&", "&amp;"); s.replace("<", "&lt;"); s.replace(">", "&gt;"); s.replace("\"", "&quot;"); s.replace("'", "&#39;"); return s; }
 String jsonEsc(String s) { s.replace("\\", "\\\\"); s.replace("\"", "\\\""); s.replace("\r", "\\r"); s.replace("\n", "\\n"); return s; }
@@ -44,6 +49,39 @@ bool connectWiFi() {
   const unsigned long started = millis(); while (WiFi.status() != WL_CONNECTED && millis() - started < 20000UL) { delay(250); Serial.print('.'); } Serial.println();
   if (WiFi.status() != WL_CONNECTED) { Serial.printf("[WiFi] Connection failed, status=%d\n", (int)WiFi.status()); WiFi.disconnect(false, false); return false; }
   Serial.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str()); return true;
+}
+
+void startOtaIfPossible() {
+  if (otaReady || WiFi.status() != WL_CONNECTED) return;
+  ArduinoOTA.setHostname("hp-print-server");
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([] {
+    otaInProgress = true;
+    Serial.println("[OTA] Update started; printing is paused");
+    RemoteDiagnostics::publish("OTA update started\n");
+  });
+  ArduinoOTA.onEnd([] {
+    Serial.println("[OTA] Update complete; rebooting");
+    RemoteDiagnostics::publish("OTA update complete; rebooting\n");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    static unsigned int lastPercent = 101;
+    const unsigned int percent = total ? (progress * 100U) / total : 0;
+    if (percent != lastPercent && (percent % 10U == 0 || percent == 100U)) {
+      lastPercent = percent;
+      Serial.printf("[OTA] Progress %u%%\n", percent);
+      RemoteDiagnostics::publishf("OTA progress %u%%\n", percent);
+    }
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    otaInProgress = false;
+    Serial.printf("[OTA] Error %u\n", (unsigned)error);
+    RemoteDiagnostics::publishf("OTA failed: error %u\n", (unsigned)error);
+  });
+  ArduinoOTA.begin();
+  otaReady = true;
+  Serial.println("[OTA] Wireless upload ready");
+  RemoteDiagnostics::publish("OTA ready; select hp-print-server in Arduino IDE\n");
 }
 
 bool startConfigAP() {
@@ -68,7 +106,7 @@ void startRawDiscovery() {
     MDNS.addServiceTxt("ipp", "tcp", "rp", "ipp/print");
     MDNS.addServiceTxt("ipp", "tcp", "ty", "HP Smart Tank");
     MDNS.addServiceTxt("ipp", "tcp", "product", "(HP Smart Tank)");
-    MDNS.addServiceTxt("ipp", "tcp", "pdl", "application/vnd.hp-PCL");
+    MDNS.addServiceTxt("ipp", "tcp", "pdl", "application/vnd.hp-pcl");
     MDNS.addServiceTxt("ipp", "tcp", "usb_MFG", "HP");
     MDNS.addServiceTxt("ipp", "tcp", "usb_MDL", "HP Smart Tank 520_540 series");
     MDNS.addServiceTxt("ipp", "tcp", "usb_CMD", "PCL3GUI");
@@ -103,20 +141,27 @@ void handleSave() { if (!configServer.hasArg("ssid") || configServer.arg("ssid")
 
 void setup() {
   Serial.begin(115200); delay(500); Serial.println(); SystemDiagnostics::logBoot(); Serial.println("=== ESP32-S3 HP PCL3GUI Print Server ===");
+  RemoteDiagnostics::begin();
   Serial.println("[MODE] RAW 9100 + IPP 631 PCL3GUI; both print through the classic USB Printer Class interface");
   Serial.println("[MODE] IPP-over-USB printing is disabled/not used; scanner USB backend is disabled");
-  loadConfig(); if (!connectWiFi()) startConfigAP(); startRawDiscovery();
+  loadConfig(); if (!connectWiFi()) startConfigAP(); startRawDiscovery(); startOtaIfPossible();
   usbPrinterBackend.begin(); ippService.begin();
   configServer.on("/", HTTP_GET, handleRoot); configServer.on("/scan.json", HTTP_GET, sendJsonScan); configServer.on("/status.json", HTTP_GET, sendJsonStatus); configServer.on("/save", HTTP_POST, handleSave); ensureUsbScannerWebRoutesInstalled(); configServer.begin();
-  Serial.println("[HTTP] Configuration server ready"); Serial.printf("[HTTP] Open http://%s\n", mdnsReady ? "printer.local" : (activeIp().length() ? activeIp().c_str() : "device-address")); Serial.println("[RAW] TCP 9100 server enabled"); Serial.println("[IPP] TCP 631 service enabled; document-format-supported=application/vnd.hp-PCL; version=PCL3GUI");
+  Serial.println("[HTTP] Configuration server ready"); Serial.printf("[HTTP] Open http://%s\n", mdnsReady ? "printer.local" : (activeIp().length() ? activeIp().c_str() : "device-address")); Serial.println("[RAW] TCP 9100 server enabled"); Serial.println("[IPP] TCP 631 service enabled; document-format-supported=application/vnd.hp-pcl; version=PCL3GUI");
 }
 
 void loop() {
-  configServer.handleClient(); usbHost.poll(); usbPrinterBackend.poll(); ippService.poll();
+  configServer.handleClient();
+  RemoteDiagnostics::poll();
+  startOtaIfPossible();
+  if (otaReady && usbPrinterBackend.state() != UsbPrinterBackend::PRINTING && !usbPrinterBackend.rawClientConnected()) ArduinoOTA.handle();
+  if (!otaInProgress) {
+    usbHost.poll(); usbPrinterBackend.poll(); ippService.poll();
+  }
   if (millis() - lastStatus > 1000) {
     lastStatus = millis(); const int wifiState = (int)WiFi.status(); const String ip = activeIp(); const int usbState = (int)usbHost.state(); const String printerState = printerStateText(); const bool rawConnected = usbPrinterBackend.rawClientConnected(); const bool usbStatusValid = usbHost.portStatusValid(); const uint8_t usbPort = usbStatusValid ? usbHost.portStatusValue() : 0;
     static bool initialized = false; static int lastWifiState = -1; static String lastIp; static int lastUsbState = -1; static String lastPrinterState; static bool lastRawConnected = false; static bool lastUsbStatusValid = false; static uint8_t lastUsbPort = 0;
     const bool changed = !initialized || wifiState != lastWifiState || ip != lastIp || usbState != lastUsbState || printerState != lastPrinterState || rawConnected != lastRawConnected || usbStatusValid != lastUsbStatusValid || (usbStatusValid && usbPort != lastUsbPort);
-    if (changed) { Serial.printf("[STATUS] WiFi=%d IP=%s USB=%d printer=%s raw=%s%s\n", wifiState, ip.c_str(), usbState, printerState.c_str(), rawConnected ? "connected" : "idle", usbStatusValid ? (String(" usbport=0x") + String(usbPort, HEX)).c_str() : " usbstatus=unavailable"); lastWifiState = wifiState; lastIp = ip; lastUsbState = usbState; lastPrinterState = printerState; lastRawConnected = rawConnected; lastUsbStatusValid = usbStatusValid; lastUsbPort = usbPort; initialized = true; }
+    if (changed) { Serial.printf("[STATUS] WiFi=%d IP=%s USB=%d printer=%s raw=%s%s\n", wifiState, ip.c_str(), usbState, printerState.c_str(), rawConnected ? "connected" : "idle", usbStatusValid ? (String(" usbport=0x") + String(usbPort, HEX)).c_str() : " usbstatus=unavailable"); RemoteDiagnostics::publishf("[STATUS] WiFi=%d IP=%s USB=%d printer=%s raw=%s\n", wifiState, ip.c_str(), usbState, printerState.c_str(), rawConnected ? "connected" : "idle"); lastWifiState = wifiState; lastIp = ip; lastUsbState = usbState; lastPrinterState = printerState; lastRawConnected = rawConnected; lastUsbStatusValid = usbStatusValid; lastUsbPort = usbPort; initialized = true; }
   }
 }

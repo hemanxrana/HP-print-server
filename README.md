@@ -135,6 +135,23 @@ Project baseline:
 
 Open `HP-print-server.ino`, compile, upload, and test with the real printer.
 
+## Wireless diagnostics and OTA
+
+After the firmware has been flashed once over USB, Arduino IDE can upload later
+firmware versions over Wi-Fi. Keep the board and computer on the same network,
+select `hp-print-server` (or its discovered network port) under **Tools → Port**,
+and upload normally. Change `OTA_PASSWORD` in `HP-print-server.ino` before using
+OTA in a real deployment.
+
+OTA is accepted only while the printer is idle. The USB serial monitor remains
+available at 115200 baud.
+
+The ESP32-S3 exposes a BLE UART-style diagnostic service named
+`HP-Print-Diagnostics`. Use a BLE GATT application such as nRF Connect to
+subscribe to the TX characteristic. The RX characteristic accepts `help`,
+`ping`, and `status`. BLE is used instead of Bluetooth Classic SPP because the
+ESP32-S3 does not support Classic Bluetooth.
+
 ## Repository policy
 
 Only normal source code and the Arduino compile workflow should live in the repository. Temporary source-editing workflows and scratch files are intentionally excluded.

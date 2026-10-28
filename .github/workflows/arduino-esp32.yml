@@ -19,6 +19,7 @@ jobs:
           arduino-cli config init
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@3.3.10
+          arduino-cli lib install "NimBLE-Arduino@2.5.1"
 
       - name: Compile ESP32-S3 N16R8 firmware
         run: |

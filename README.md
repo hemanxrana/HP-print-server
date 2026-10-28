@@ -161,9 +161,14 @@ Diagnostics beyond the serial console:
 - `/status.json` includes job counters, last error, IPP job state, free heap,
   boot count and USB wedge state.
 
-The BLE GATT console was removed so the firmware fits the default 1.25 MB app
-partition without changing the partition table. Diagnostics remain available
-over HTTP and the USB serial console.
+The ESP32-S3 exposes a NimBLE-based BLE UART-style diagnostic service named
+`HP-Print-Diagnostics`. Use a BLE GATT application such as nRF Connect to
+subscribe to the TX characteristic. The RX characteristic accepts `help`,
+`ping`, `status`, `log`, `counters`, and `job`. BLE is used instead of
+Bluetooth Classic SPP because the ESP32-S3 does not support Classic Bluetooth.
+
+Install `NimBLE-Arduino` (tested with 2.5.1) from Library Manager before
+building; the compile workflow installs it automatically.
 
 ## Repository policy
 

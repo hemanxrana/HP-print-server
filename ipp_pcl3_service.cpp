@@ -1,4 +1,5 @@
 #include "ipp_pcl3_service.h"
+#include "logger.h"
 #include "remote_diagnostics.h"
 #include <stdio.h>
 #include "esp_mac.h"
@@ -356,16 +357,16 @@ void IppPcl3Service::refreshJobState(){
   if(state==UsbPrinterBackend::IDLE){
     lastJobState_=9;
     lastJobReason_="job-completed-successfully";
-    Serial.printf("[IPP] Job %lu state -> completed\n",(unsigned long)lastJobId_);
+    Log.printf("[IPP] Job %lu state -> completed\n",(unsigned long)lastJobId_);
   } else if(state==UsbPrinterBackend::OFFLINE){
     lastJobState_=6;
     lastJobReason_="printer-stopped";
-    Serial.printf("[IPP] Job %lu state -> stopped: %s\n",
+    Log.printf("[IPP] Job %lu state -> stopped: %s\n",
                   (unsigned long)lastJobId_,printer_.statusReason().c_str());
   } else if(state==UsbPrinterBackend::ERROR){
     lastJobState_=8;
     lastJobReason_="aborted-by-system";
-    Serial.printf("[IPP] Job %lu state -> aborted: %s\n",
+    Log.printf("[IPP] Job %lu state -> aborted: %s\n",
                   (unsigned long)lastJobId_,printer_.statusReason().c_str());
   }
 }
@@ -373,7 +374,7 @@ void IppPcl3Service::refreshJobState(){
 void IppPcl3Service::begin(){
   if(started_) return;
   ippServer.begin(); ippServer.setNoDelay(true); started_=true;
-  Serial.printf("[IPP] PCL3GUI-only IPP service listening on TCP 631; document buffer=%u bytes\n",(unsigned)BODY_BUFFER);
+  Log.printf("[IPP] PCL3GUI-only IPP service listening on TCP 631; document buffer=%u bytes\n",(unsigned)BODY_BUFFER);
 }
 
 void IppPcl3Service::rebind(){
@@ -428,7 +429,7 @@ void IppPcl3Service::handleClient(WiFiClient client){
   }
   const String &format = attrs.documentFormat;
 
-  Serial.printf("[IPP] op=0x%04X request-id=%lu format=%s transfer=%s\n",
+  Log.printf("[IPP] op=0x%04X request-id=%lu format=%s transfer=%s\n",
                 op,(unsigned long)requestId,format.c_str(),body.chunked?"chunked":"fixed");
 
   if(op==0x000B){
@@ -469,7 +470,7 @@ void IppPcl3Service::handleClient(WiFiClient client){
 
       const uint32_t totalMs=millis()-streamStarted;
       const uint64_t kibPerSecond = totalMs ? ((lastJobBytes_ * 1000ULL) / 1024ULL / totalMs) : 0;
-      Serial.printf("[IPP][PERF] job=%lu bytes=%llu total=%lu ms net-read=%lu ms usb-send=%lu ms avg=%llu KiB/s buffer=%u\n",
+      Log.printf("[IPP][PERF] job=%lu bytes=%llu total=%lu ms net-read=%lu ms usb-send=%lu ms avg=%llu KiB/s buffer=%u\n",
                     (unsigned long)jobId,
                     (unsigned long long)lastJobBytes_,
                     (unsigned long)totalMs,
@@ -480,7 +481,7 @@ void IppPcl3Service::handleClient(WiFiClient client){
 
       if(ok && body.done && !body.framingError && lastJobBytes_ > 0){
         printer_.finishRawJob();
-        Serial.printf("[IPP] PCL3GUI Print-Job accepted: job=%lu %llu bytes sent to classic USB print interface\n",
+        Log.printf("[IPP] PCL3GUI Print-Job accepted: job=%lu %llu bytes sent to classic USB print interface\n",
                       (unsigned long)jobId,(unsigned long long)lastJobBytes_);
         sendJobResponse(client,major,minor,0x0000,requestId,jobId,lastJobState_,lastJobReason_);
       } else {
@@ -490,7 +491,7 @@ void IppPcl3Service::handleClient(WiFiClient client){
           else if (lastJobBytes_ == 0) lastError_="Print-Job document was empty";
           else lastError_="Print-Job body ended unexpectedly";
         }
-        Serial.printf("[IPP] Print-Job failed: bytes=%llu done=%s peer-closed=%s framing-error=%s reason=%s\n",
+        Log.printf("[IPP] Print-Job failed: bytes=%llu done=%s peer-closed=%s framing-error=%s reason=%s\n",
                       (unsigned long long)lastJobBytes_, body.done ? "yes" : "no",
                       body.peerClosed ? "yes" : "no", body.framingError ? "yes" : "no",
                       lastError_.c_str());
@@ -507,7 +508,7 @@ void IppPcl3Service::handleClient(WiFiClient client){
     if(attrs.hasJobId && lastJobId_ && (uint32_t)attrs.jobId != lastJobId_){
       sendSimple(client,major,minor,0x0406,requestId);
     } else if(lastJobId_){
-      Serial.printf("[IPP] Job status: id=%lu state=%u reason=%s\n",
+      Log.printf("[IPP] Job status: id=%lu state=%u reason=%s\n",
                     (unsigned long)lastJobId_,lastJobState_,lastJobReason_.c_str());
       sendJobResponse(client,major,minor,0x0000,requestId,lastJobId_,lastJobState_,lastJobReason_);
     } else {

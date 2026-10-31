@@ -1,4 +1,5 @@
 #include "usb_scanner_backend.h"
+#include "logger.h"
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include "mdns.h"
@@ -158,7 +159,7 @@ static void releaseScannerDevice() {
   g.device = nullptr;
   g.deviceOpen = false;
   g.iface = ScannerInterface{};
-  Serial.println("[SCAN] USB eSCL interface released");
+  Log.println("[SCAN] USB eSCL interface released");
 }
 
 static int scannerScore(const ScannerInterface &s) {
@@ -219,7 +220,7 @@ static bool openScannerDevice(uint8_t address) {
   int bestScore = -10001;
   for (uint8_t i = 0; i < candidateCount; ++i) {
     const int score = scannerScore(candidates[i]);
-    Serial.printf("[SCAN] eSCL candidate IF=%u ALT=%u OUT=0x%02X IN=0x%02X score=%d\n",
+    Log.printf("[SCAN] eSCL candidate IF=%u ALT=%u OUT=0x%02X IN=0x%02X score=%d\n",
                   candidates[i].interfaceNumber,
                   candidates[i].alternateSetting,
                   candidates[i].bulkOut.address,
@@ -241,7 +242,7 @@ static bool openScannerDevice(uint8_t address) {
                                  chosen.interfaceNumber,
                                  chosen.alternateSetting);
   if (err != ESP_OK) {
-    Serial.printf("[SCAN] Could not claim IF=%u ALT=%u: %s\n",
+    Log.printf("[SCAN] Could not claim IF=%u ALT=%u: %s\n",
                   chosen.interfaceNumber, chosen.alternateSetting,
                   esp_err_to_name(err));
     usb_host_device_close(g.client, dev);
@@ -253,7 +254,7 @@ static bool openScannerDevice(uint8_t address) {
   g.interfaceClaimed = true;
   g.iface = chosen;
   g.ready = true;
-  Serial.printf("[SCAN] USB eSCL ready IF=%u ALT=%u OUT=0x%02X IN=0x%02X\n",
+  Log.printf("[SCAN] USB eSCL ready IF=%u ALT=%u OUT=0x%02X IN=0x%02X\n",
                 chosen.interfaceNumber, chosen.alternateSetting,
                 chosen.bulkOut.address, chosen.bulkIn.address);
   return true;
@@ -290,19 +291,19 @@ static void scannerUsbTask(void *) {
 
   const esp_err_t registered = usb_host_client_register(&config, &g.client);
   if (registered != ESP_OK) {
-    Serial.printf("[SCAN] USB client registration failed: %s; printing unaffected\n",
+    Log.printf("[SCAN] USB client registration failed: %s; printing unaffected\n",
                   esp_err_to_name(registered));
     vTaskDelete(nullptr);
     return;
   }
 
-  Serial.println("[SCAN] Independent USB scanner client registered");
+  Log.println("[SCAN] Independent USB scanner client registered");
   scanExistingDevices();
 
   while (true) {
     const esp_err_t eventResult = usb_host_client_handle_events(g.client, pdMS_TO_TICKS(100));
     if (eventResult != ESP_OK && eventResult != ESP_ERR_TIMEOUT) {
-      Serial.printf("[SCAN] USB event error: %s\n", esp_err_to_name(eventResult));
+      Log.printf("[SCAN] USB event error: %s\n", esp_err_to_name(eventResult));
     }
     if (g.deviceGone && !g.ioActive) {
       g.deviceGone = false;
@@ -827,7 +828,7 @@ static void handleScannerHttpClient(WiFiClient client) {
   if (method == "GET" && path == "/eSCL/ScannerCapabilities") {
     free(requestBody);
     sendLocalResponse(client, 200, "OK", "text/xml; charset=utf-8", scannerCapabilitiesXml());
-    Serial.println("[eSCL] ScannerCapabilities served locally on :8080");
+    Log.println("[eSCL] ScannerCapabilities served locally on :8080");
     client.stop();
     g.busy = false;
     return;
@@ -859,7 +860,7 @@ static void handleScannerHttpClient(WiFiClient client) {
   }
 
   const String usbHeader = rewriteRequestHeader(requestHeader);
-  Serial.printf("[SCAN] %s %s -> USB IF=%u ALT=%u\n",
+  Log.printf("[SCAN] %s %s -> USB IF=%u ALT=%u\n",
                 method.c_str(), path.c_str(),
                 g.iface.interfaceNumber, g.iface.alternateSetting);
 
@@ -870,7 +871,7 @@ static void handleScannerHttpClient(WiFiClient client) {
   requestBody = nullptr;
 
   if (!ok) {
-    Serial.printf("[SCAN] USB request failed: %s\n", error.c_str());
+    Log.printf("[SCAN] USB request failed: %s\n", error.c_str());
     if (client.connected())
       sendLocalResponse(client, 502, "Bad Gateway", "text/plain; charset=utf-8", error);
     client.stop();
@@ -879,7 +880,7 @@ static void handleScannerHttpClient(WiFiClient client) {
   }
 
   if (!proxyUsbResponse(client, method, error)) {
-    Serial.printf("[SCAN] USB HTTP response failed: %s\n", error.c_str());
+    Log.printf("[SCAN] USB HTTP response failed: %s\n", error.c_str());
     if (client.connected())
       sendLocalResponse(client, 502, "Bad Gateway", "text/plain; charset=utf-8", error);
   }
@@ -896,7 +897,7 @@ static bool networkAvailable() {
 static void advertiseScannerIfReady() {
   if (!g.ready || g.mdnsAdvertised || WiFi.status() != WL_CONNECTED) return;
   if (!MDNS.addService("uscan", "tcp", UsbScannerBackend::NETWORK_PORT)) {
-    Serial.println("[eSCL] Could not advertise _uscan._tcp");
+    Log.println("[eSCL] Could not advertise _uscan._tcp");
     return;
   }
 
@@ -915,12 +916,12 @@ static void advertiseScannerIfReady() {
   const esp_err_t instanceResult =
       mdns_service_instance_name_set("_uscan", "_tcp", SCANNER_SERVICE_NAME);
   if (instanceResult != ESP_OK) {
-    Serial.printf("[eSCL] Scanner service instance name failed: %s\n",
+    Log.printf("[eSCL] Scanner service instance name failed: %s\n",
                   esp_err_to_name(instanceResult));
   }
 
   g.mdnsAdvertised = true;
-  Serial.printf("[eSCL] AirScan discovery: %s._uscan._tcp port %u rs=eSCL\n",
+  Log.printf("[eSCL] AirScan discovery: %s._uscan._tcp port %u rs=eSCL\n",
                 SCANNER_SERVICE_NAME, UsbScannerBackend::NETWORK_PORT);
 }
 
@@ -932,7 +933,7 @@ static void scannerProxyTask(void *) {
       server.begin();
       server.setNoDelay(true);
       g.serverStarted = true;
-      Serial.printf("[SCAN] eSCL server listening on TCP %u\n",
+      Log.printf("[SCAN] eSCL server listening on TCP %u\n",
                     UsbScannerBackend::NETWORK_PORT);
     }
     if (g.serverStarted) {
@@ -948,11 +949,11 @@ bool UsbScannerBackend::begin() {
   if (started_) return true;
   started_ = true;
   if (xTaskCreate(scannerUsbTask, "usb_escl_client", 8192, nullptr, 3, &g.usbTask) != pdPASS) {
-    Serial.println("[SCAN] Could not start USB scanner client task; printing unaffected");
+    Log.println("[SCAN] Could not start USB scanner client task; printing unaffected");
     return false;
   }
   if (xTaskCreate(scannerProxyTask, "escl_http_proxy", 16384, nullptr, 1, &g.proxyTask) != pdPASS) {
-    Serial.println("[SCAN] Could not start eSCL HTTP task; printing unaffected");
+    Log.println("[SCAN] Could not start eSCL HTTP task; printing unaffected");
     return false;
   }
   return true;
@@ -971,5 +972,5 @@ void ensureUsbScannerBackendStarted() {
   if (attempted) return;
   attempted = true;
   if (!scanner.begin())
-    Serial.println("[SCAN] Scanner service did not start; RAW printing remains available");
+    Log.println("[SCAN] Scanner service did not start; RAW printing remains available");
 }

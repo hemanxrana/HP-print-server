@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include "logger.h"
 #include <WebServer.h>
 #include "usb_host_manager.h"
 
@@ -39,5 +40,5 @@ void ensureUsbScannerWebRoutesInstalled() {
   routesInstalled = true;
   configServer.on("/scan", HTTP_GET, sendScannerPage);
   configServer.on("/scan/status.json", HTTP_GET, sendScannerStatusJson);
-  Serial.println("[SCAN] Scanner routes registered; USB scanner backend DISABLED");
+  Log.println("[SCAN] Scanner routes registered; USB scanner backend DISABLED");
 }

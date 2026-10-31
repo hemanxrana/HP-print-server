@@ -8,13 +8,27 @@
 // default 1.25 MB app partition.
 namespace RemoteDiagnostics {
 using CommandHook = void (*)(const String &command);
+
+// Initialise the in-memory log ring.  BLE is started separately with
+// configure() so the saved dashboard settings can be applied first.
 void begin();
-void poll();
+void configure(bool enabled, const String &deviceName);
+bool enabled();
+bool ready();
 bool connected();
+String deviceName();
+
+void poll();
 void publish(const String &message);
 void publishf(const char *format, ...);
 void setCommandHook(CommandHook hook);
+
+// Raw append used by the Logger tee.  Keeps UART output in the same ring that
+// the web/TCP monitor reads.
+void appendRaw(const char *data, size_t length);
+
 String recentLog();
 const char *logData(size_t &length);
+uint32_t logSequence();
 bool logInPsram();
 }

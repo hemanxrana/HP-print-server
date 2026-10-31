@@ -1,4 +1,5 @@
 #include "usb_host_manager.h"
+#include "logger.h"
 #include "esp_intr_alloc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -160,7 +161,7 @@ static bool ensureBulkOutResources(String &error) {
       g.bulkOutWait.done = nullptr;
       return false;
     }
-    Serial.printf("[USB] Persistent Bulk OUT transfer allocated once (%u bytes)\n",
+    Log.printf("[USB] Persistent Bulk OUT transfer allocated once (%u bytes)\n",
                   (unsigned)BULK_OUT_BUFFER_SIZE);
   }
   return true;
@@ -234,7 +235,7 @@ static bool claimInterfaces(UsbDeviceInfo &d, String &error) {
       d.statusInterface = status;
       d.statusInterfaceSeparate = true;
     } else {
-      Serial.printf("[USB] Status interface IF=%u ALT=%u could not be claimed: %s; using print interface for status\n",
+      Log.printf("[USB] Status interface IF=%u ALT=%u could not be claimed: %s; using print interface for status\n",
                     status.interfaceNumber, status.alternateSetting,
                     esp_err_to_name(e));
     }
@@ -242,12 +243,12 @@ static bool claimInterfaces(UsbDeviceInfo &d, String &error) {
 
   if (!d.statusInterfaceSeparate) d.statusInterface = d.printer;
 
-  Serial.printf("[USB] Selected Printer Class IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X\n",
+  Log.printf("[USB] Selected Printer Class IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X\n",
                 d.printer.interfaceNumber, d.printer.alternateSetting,
                 d.printer.protocol, d.printer.bulkOut.address,
                 d.printer.bulkIn.address);
   if (d.statusInterfaceSeparate) {
-    Serial.printf("[USB] Status IF=%u ALT=%u protocol=0x%02X (separate)\n",
+    Log.printf("[USB] Status IF=%u ALT=%u protocol=0x%02X (separate)\n",
                   d.statusInterface.interfaceNumber,
                   d.statusInterface.alternateSetting,
                   d.statusInterface.protocol);
@@ -311,10 +312,10 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
       if (i->bInterfaceClass == USB_PRINTER_CLASS_CODE &&
           i->bInterfaceSubClass == USB_PRINTER_SUBCLASS_CODE) {
         if (i->bInterfaceProtocol == 0x04) {
-          Serial.printf("[USB] Ignoring IF=%u ALT=%u: protocol 0x04 is IPP-over-USB, not RAW printing\n",
+          Log.printf("[USB] Ignoring IF=%u ALT=%u: protocol 0x04 is IPP-over-USB, not RAW printing\n",
                         i->bInterfaceNumber, i->bAlternateSetting);
         } else if (i->bInterfaceProtocol == 0xFF) {
-          Serial.printf("[USB] Ignoring IF=%u ALT=%u: vendor-specific Printer Class protocol 0xFF is not verified for RAW\n",
+          Log.printf("[USB] Ignoring IF=%u ALT=%u: vendor-specific Printer Class protocol 0xFF is not verified for RAW\n",
                         i->bInterfaceNumber, i->bAlternateSetting);
         } else if (i->bInterfaceProtocol >= 0x01 && i->bInterfaceProtocol <= 0x03 &&
                    out.printerInterfaceCount < UsbDeviceInfo::MAX_PRINTER_INTERFACES) {
@@ -344,7 +345,7 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
 
   for (uint8_t i = 0; i < out.printerInterfaceCount; ++i) {
     const auto &p = out.printerInterfaces[i];
-    Serial.printf("[USB] RAW candidate %u: IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X score=%d\n",
+    Log.printf("[USB] RAW candidate %u: IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X score=%d\n",
                   i, p.interfaceNumber, p.alternateSetting, p.protocol,
                   p.bulkOut.address, p.bulkIn.address, printScore(p));
   }
@@ -360,7 +361,7 @@ static void publish(const UsbDeviceInfo &d) {
   g.rescanAttempts = 0;
   if (!manager) return;
   manager->onEnumerated(d);
-  Serial.printf("[USB] Printer ready: %s VID=0x%04X PID=0x%04X address=%u\n",
+  Log.printf("[USB] Printer ready: %s VID=0x%04X PID=0x%04X address=%u\n",
                 d.product.length() ? d.product.c_str() : "USB Printer",
                 d.vid, d.pid, d.address);
 }
@@ -378,7 +379,7 @@ static void scanExisting() {
       return;
     }
     if (manager) manager->onEnumerationError(error);
-    Serial.printf("[USB] Ignored address %u: %s\n", addresses[i], error.c_str());
+    Log.printf("[USB] Ignored address %u: %s\n", addresses[i], error.c_str());
   }
 }
 
@@ -480,7 +481,7 @@ static void clientTask(void *) {
 
     if (g.resetRequested) {
       g.resetRequested = false;
-      Serial.println("[USB] Recovering from unrecoverable Bulk OUT transfer; re-enumerating");
+      Log.println("[USB] Recovering from unrecoverable Bulk OUT transfer; re-enumerating");
       closeDevice();
       if (manager) manager->onDetached();
       g.bulkOutInFlight = false;
@@ -507,7 +508,7 @@ static void clientTask(void *) {
         publish(d);
       } else {
         if (manager) manager->onEnumerationError(error);
-        Serial.printf("[USB] Ignored address %u: %s\n", address, error.c_str());
+        Log.printf("[USB] Ignored address %u: %s\n", address, error.c_str());
       }
     }
   }
@@ -606,29 +607,40 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
 
   g.bulkOutInFlight = true;
   const esp_err_t e = usb_host_transfer_submit(t);
-  if (e != ESP_OK) {
-    g.bulkOutInFlight = false;
-    error = String("usb_host_transfer_submit failed: ") + esp_err_to_name(e);
-    return false;
-  }
-
-  const TickType_t waitTicks = timeoutMs ? pdMS_TO_TICKS(timeoutMs + 250) : portMAX_DELAY;
-  if (xSemaphoreTake(g.bulkOutWait.done, waitTicks) != pdTRUE) {
-    Serial.println("[USB] Bulk OUT completion wait exceeded transfer timeout; recovering endpoint");
-    usb_host_endpoint_halt(t->device_handle, t->bEndpointAddress);
-    usb_host_endpoint_flush(t->device_handle, t->bEndpointAddress);
-    usb_host_endpoint_clear(t->device_handle, t->bEndpointAddress);
-    if (xSemaphoreTake(g.bulkOutWait.done, pdMS_TO_TICKS(1500)) != pdTRUE) {
-      g.bulkOutWedged = true;
-      g.resetRequested = true;
-      error = "USB Bulk OUT unrecoverable; re-enumerating USB link";
-      return false;
+  bool transferFailed = (e != ESP_OK);
+  if (!transferFailed) {
+    const TickType_t waitTicks = timeoutMs ? pdMS_TO_TICKS(timeoutMs + 250) : portMAX_DELAY;
+    if (xSemaphoreTake(g.bulkOutWait.done, waitTicks) != pdTRUE) {
+      Log.println("[USB] Bulk OUT completion wait exceeded transfer timeout; recovering endpoint");
+      usb_host_endpoint_halt(t->device_handle, t->bEndpointAddress);
+      usb_host_endpoint_flush(t->device_handle, t->bEndpointAddress);
+      usb_host_endpoint_clear(t->device_handle, t->bEndpointAddress);
+      if (xSemaphoreTake(g.bulkOutWait.done, pdMS_TO_TICKS(1500)) != pdTRUE) {
+        g.bulkOutWedged = true;
+        g.resetRequested = true;
+        error = "USB Bulk OUT unrecoverable; re-enumerating USB link";
+        return false;
+      }
+      transferFailed = true;
     }
+  } else {
+    g.bulkOutInFlight = false;
   }
 
   accepted = static_cast<size_t>(t->actual_num_bytes);
   const usb_transfer_status_t status = t->status;
-  if (status != USB_TRANSFER_STATUS_COMPLETED || accepted != length) {
+  if (transferFailed || status != USB_TRANSFER_STATUS_COMPLETED || accepted != length) {
+    Log.printf("[USB] Bulk OUT transfer failed status=%d accepted=%u/%u; recovering endpoint\n",
+               (int)status, (unsigned)accepted, (unsigned)length);
+    usb_host_endpoint_halt(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_flush(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_clear(t->device_handle, t->bEndpointAddress);
+    if (xSemaphoreTake(g.bulkOutWait.done, pdMS_TO_TICKS(500)) != pdTRUE) {
+      g.bulkOutWedged = true;
+    }
+    g.bulkOutInFlight = false;
+    g.bulkOutWedged = true;
+    g.resetRequested = true;
     error = String("USB bulk transfer failed status=") + String((int)status) +
             " accepted=" + String((unsigned)accepted) + "/" + String((unsigned)length);
     return false;
@@ -644,7 +656,7 @@ void UsbHostManager::onPortStatusTransfer(bool valid, uint8_t value, const Strin
   static String lastStatusError;
   if (!valid) {
     if (error.length() && error != lastStatusError) {
-      Serial.printf("[USB] GET_PORT_STATUS error: %s\n", error.c_str());
+      Log.printf("[USB] GET_PORT_STATUS error: %s\n", error.c_str());
       lastStatusError = error;
     }
     if (error.length()) error_ = error;
@@ -664,7 +676,7 @@ void UsbHostManager::onPortStatusTransfer(bool valid, uint8_t value, const Strin
   lastStatusError.clear();
 
   if (!wasValid || previousValue != value) {
-    Serial.printf("[USB] GET_PORT_STATUS IF=%u value=0x%02X error=%d selected=%d paper-empty=%d\n",
+    Log.printf("[USB] GET_PORT_STATUS IF=%u value=0x%02X error=%d selected=%d paper-empty=%d\n",
                   device_.statusInterface.interfaceNumber, value,
                   (int)s.error, (int)s.selected, (int)s.paperEmpty);
   }
@@ -684,7 +696,7 @@ void UsbHostManager::onEnumerated(const UsbDeviceInfo &info) {
 }
 
 void UsbHostManager::onDetached() {
-  if (device_.attached) Serial.println("[USB] Device disconnected");
+  if (device_.attached) Log.println("[USB] Device disconnected");
   device_ = UsbDeviceInfo{};
   error_.clear();
   state_ = started_ ? RUNNING : STOPPED;

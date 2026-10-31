@@ -18,7 +18,8 @@ static constexpr uint8_t USB_PRINTER_STATUS_REQUEST_TYPE = 0xA1;
 static constexpr int MAX_ALREADY_CONNECTED_DEVICES = 8;
 static constexpr uint32_t STATUS_POLL_INTERVAL_MS = 1000;
 static constexpr uint32_t STATUS_TRANSFER_TIMEOUT_MS = 1000;
-static constexpr size_t BULK_OUT_BUFFER_SIZE = 4096;
+// 8KB persistent Bulk OUT buffer (no MPS alignment — host driver splits into packets)
+static constexpr size_t BULK_OUT_BUFFER_SIZE = 8192;
 
 struct TransferWait { SemaphoreHandle_t done = nullptr; };
 
@@ -210,8 +211,8 @@ static bool claimInterfaces(UsbDeviceInfo &d, String &error) {
 
   UsbPrinterInterfaceInfo &print = d.printerInterfaces[printIndex];
   esp_err_t e = usb_host_interface_claim(g.client, g.device,
-                                          print.interfaceNumber,
-                                          print.alternateSetting);
+                                           print.interfaceNumber,
+                                           print.alternateSetting);
   if (e != ESP_OK) {
     error = String("print interface claim failed: ") + esp_err_to_name(e);
     return false;

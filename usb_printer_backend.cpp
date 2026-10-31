@@ -1,7 +1,6 @@
 #include "usb_printer_backend.h"
 #include "logger.h"
 #include "status_led.h"
-#include "remote_diagnostics.h"
 #include <WiFi.h>
 #include <errno.h>
 #include <lwip/sockets.h>
@@ -9,25 +8,65 @@
 #include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "config.h"
+
+// Map config.h names to local names used in this file
+#define RAW_USB_CHUNK BULK_OUT_CHUNK_SIZE
+#define RAW_RX_CHUNK BULK_OUT_CHUNK_SIZE
+#define RAW_POLL_BUDGET USB_BUFFER_SIZE
+constexpr uint32_t RAW_USB_TIMEOUT_MS = 30000;
 
 namespace {
 constexpr uint16_t RAW_PORT = 9100;
-constexpr uint32_t RAW_IDLE_TIMEOUT_MS = 300000;
-constexpr uint32_t POST_JOB_MIN_GUARD_MS = 15000;
-constexpr uint32_t POST_JOB_STATUS_WAIT_MAX_MS = 30000;
 constexpr uint32_t POST_JOB_LOG_INTERVAL_MS = 2000;
 constexpr uint64_t HEALTH_LOG_INTERVAL_BYTES = 512ULL * 1024ULL;
 constexpr uint32_t RAW_CLOSE_GUARD_MS = 250;
 constexpr uint32_t RAW_PROBE_IDLE_TIMEOUT_MS = 30000;
-// Optional job termination for clients that finish a RAW stream without a PJL
-// end-of-job or form feed.  HP PCL3GUI printers may otherwise leave the final
-// page unprinted.  Disabled by default so RAW stays byte-for-byte transparent.
+constexpr uint32_t RAW_IDLE_TIMEOUT_MS = 60000;
 constexpr bool RAW_APPEND_JOB_TERMINATOR = false;
 constexpr char RAW_JOB_TERMINATOR[] = "\x1b%-12345X@PJL EOJ\r\n\x0c";
-constexpr size_t RAW_RX_CHUNK = 4096;
-constexpr size_t RAW_POLL_BUDGET = 16384;
-constexpr size_t RAW_USB_CHUNK = 4096;
-constexpr uint32_t RAW_USB_TIMEOUT_MS = 30000;
+// PJL EOJ detector: looks for "@PJL EOJ" sequence followed by optional CR/LF or form feed
+constexpr const char *PJL_EOJ = "@PJL EOJ";
+constexpr size_t PJL_EOJ_LEN = 8;
+struct PjlDetector {
+  enum State : uint8_t { IDLE, AT_SEEN, AT_P_SEEN, AT_PJ_SEEN, AT_PJL_SEEN, AT_PJL_SPACE_SEEN, AT_PJL_E_SEEN, AT_PJL_EO_SEEN, AT_PJL_EOJ_SEEN };
+  State state = IDLE;
+  size_t matchPos = 0;
+
+  bool feed(uint8_t b) {
+    char c = (char)b;
+    switch (state) {
+      case IDLE:
+        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
+        return false;
+      case AT_SEEN:
+        if (c == 'P') { state = AT_P_SEEN; matchPos = 2; return false; }
+        state = IDLE; return false;
+      case AT_P_SEEN:
+        if (c == 'J') { state = AT_PJ_SEEN; matchPos = 3; return false; }
+        state = IDLE; return false;
+      case AT_PJ_SEEN:
+        if (c == 'L') { state = AT_PJL_SEEN; matchPos = 4; return false; }
+        state = IDLE; return false;
+      case AT_PJL_SEEN:
+        if (c == ' ') { state = AT_PJL_SPACE_SEEN; matchPos = 5; return false; }
+        state = IDLE; return false;
+      case AT_PJL_SPACE_SEEN:
+        if (c == 'E') { state = AT_PJL_E_SEEN; matchPos = 6; return false; }
+        state = IDLE; return false;
+      case AT_PJL_E_SEEN:
+        if (c == 'O') { state = AT_PJL_EO_SEEN; matchPos = 7; return false; }
+        state = IDLE; return false;
+      case AT_PJL_EO_SEEN:
+        if (c == 'J') { state = AT_PJL_EOJ_SEEN; matchPos = 8; return true; }  // EOJ detected!
+        state = IDLE; return false;
+      case AT_PJL_EOJ_SEEN:
+        state = IDLE; return false;
+    }
+    return false;
+  }
+  void reset() { state = IDLE; matchPos = 0; }
+};
 
 WiFiServer rawServer(RAW_PORT);
 WiFiClient rawClient;
@@ -39,7 +78,11 @@ uint32_t rawActiveJobId = 0;
 bool rawTransportClosing = false;
 bool rawCloseGuardStarted = false;
 unsigned long rawTransportCloseAtMs = 0;
-static uint8_t rawChunk[RAW_RX_CHUNK];
+static uint8_t *rawChunk = nullptr;
+static PjlDetector pjlDetector;
+static uint32_t ringWritePos = 0;
+static uint32_t ringReadPos = 0;
+static uint32_t ringDataLen = 0;
 
 enum class RawPeerState : uint8_t {
   OPEN,
@@ -119,16 +162,28 @@ const char *statusReasonText(const UsbPrinterBackend &backend) {
 bool sendUsbChunk(UsbHostManager &host, const uint8_t *data, size_t length, String &error) {
   if (!data || !length) return true;
   size_t offset = 0;
+  int retries = 0;
   while (offset < length) {
-    const size_t part = min(RAW_USB_CHUNK, length - offset);
+    const size_t part = min(static_cast<size_t>(RAW_USB_CHUNK), length - offset);
     size_t accepted = 0;
     esp_task_wdt_reset();
-    if (!host.bulkWrite(data + offset, part, accepted, RAW_USB_TIMEOUT_MS, error)) return false;
+    if (!host.bulkWrite(data + offset, part, accepted, RAW_USB_TIMEOUT_MS, error)) {
+      if (accepted > 0) {
+        offset += accepted;
+        retries = 0;
+        continue;
+      }
+      if (++retries > 3) return false;
+      delay(50);
+      continue;
+    }
     if (accepted != part) {
-      error = "USB Bulk OUT short write: " + String((unsigned)accepted) + "/" + String((unsigned)part);
-      return false;
+      offset += accepted;
+      retries = 0;
+      continue;
     }
     offset += part;
+    retries = 0;
     yield();
   }
   return true;
@@ -153,9 +208,6 @@ void abortRawConnection(UsbPrinterBackend *backend, const String &reason) {
   Log.printf("[RAW] Job #%lu INCOMPLETE after %llu USB-confirmed bytes: %s\n",
                 (unsigned long)jobId, (unsigned long long)bytes,
                 reason.length() ? reason.c_str() : "unknown transport failure");
-  RemoteDiagnostics::publishf("[RAW] job=%lu incomplete bytes=%llu reason=%s\n",
-                              (unsigned long)jobId, (unsigned long long)bytes,
-                              reason.length() ? reason.c_str() : "unknown");
   resetRawTransportState();
 }
 
@@ -234,6 +286,7 @@ void handleRawServer(UsbPrinterBackend *backend) {
       rawLastDataMs = millis();
       rawBytesReceived = 0;
       rawActiveJobId = ++rawJobSequence;
+      pjlDetector.reset();
       Log.printf("[RAW] Job #%lu TCP 9100 client connected; transparent USB pass-through\n",
                     (unsigned long)rawActiveJobId);
     }
@@ -241,17 +294,52 @@ void handleRawServer(UsbPrinterBackend *backend) {
   }
 
   bool movedData = false;
-  size_t movedThisPoll = 0;
+  static uint32_t consecutiveEmptyReads = 0;
 
-  while (rawClient.available() > 0 && movedThisPoll < RAW_POLL_BUDGET) {
+  // Read TCP data and stream directly to USB in chunks
+  while (rawClient.available() > 0 && ringDataLen < USB_BUFFER_SIZE) {
     const size_t available = (size_t)rawClient.available();
-    const size_t budgetLeft = RAW_POLL_BUDGET - movedThisPoll;
-    const size_t want = min(min(available, sizeof(rawChunk)), budgetLeft);
-    const int got = rawClient.read(rawChunk, want);
+    const size_t spaceLeft = USB_BUFFER_SIZE - ringDataLen;
+    if (spaceLeft == 0) break;  // Buffer full
+    const size_t want = min(static_cast<size_t>(available), static_cast<size_t>(RAW_RX_CHUNK));
+    const size_t want2 = min(want, spaceLeft);
+
+    // Handle wraparound: split write if it crosses end of buffer
+    size_t firstPart = want2;
+    if (ringWritePos + want2 > USB_BUFFER_SIZE) {
+      firstPart = USB_BUFFER_SIZE - ringWritePos;
+    }
+    const int got = rawClient.read(rawChunk + ringWritePos, firstPart);
     if (got <= 0) break;
 
+    // Scan for PJL EOJ sequence in received data
+    for (int i = 0; i < got; ++i) {
+      if (pjlDetector.feed(rawChunk[(ringWritePos + i) % USB_BUFFER_SIZE])) {
+        Log.printf("[RAW] Job #%lu PJL EOJ detected at byte %llu\n",
+                      (unsigned long)rawActiveJobId,
+                      (unsigned long long)(rawBytesReceived + i + 1));
+        pjlDetector.reset();
+        finishRawConnection(backend, "pjl-eoj-detected");
+        return;
+      }
+    }
+
+    ringWritePos = (ringWritePos + got) % USB_BUFFER_SIZE;
+    ringDataLen += got;
+    rawBytesReceived += (size_t)got;
+    rawLastDataMs = millis();
+    movedData = true;
+    esp_task_wdt_reset();
+    yield();
+  }
+
+  // Drain ring buffer to USB
+  while (ringDataLen > 0) {
+    const size_t want = min(static_cast<size_t>(ringDataLen), static_cast<size_t>(RAW_USB_CHUNK));
+    const size_t spaceToEnd = USB_BUFFER_SIZE - ringReadPos;
+    const size_t want2 = min(want, spaceToEnd);
     String error;
-    if (!backend->sendDirect(rawChunk, (size_t)got, error)) {
+    if (!backend->sendDirect(rawChunk + ringReadPos, want2, error)) {
       Log.printf("[RAW] Job #%lu USB pass-through failed after %llu bytes: %s\n",
                     (unsigned long)rawActiveJobId,
                     (unsigned long long)rawBytesReceived,
@@ -259,13 +347,40 @@ void handleRawServer(UsbPrinterBackend *backend) {
       abortRawConnection(backend, error);
       return;
     }
-
-    rawBytesReceived += (size_t)got;
-    movedThisPoll += (size_t)got;
-    rawLastDataMs = millis();
-    movedData = true;
+    rawBytesReceived += (size_t)want2;
+    ringReadPos = (ringReadPos + want2) % USB_BUFFER_SIZE;
+    ringDataLen -= want;
     esp_task_wdt_reset();
     yield();
+  }
+
+  // Track consecutive empty reads for retry logic
+  if (!movedData) {
+    consecutiveEmptyReads++;
+  } else {
+    consecutiveEmptyReads = 0;
+  }
+
+  // Give the client time to recover from temporary stalls before aborting.
+  // Use time-based check: abort only if no data received for RAW_IDLE_TIMEOUT_MS.
+  if (rawBytesReceived > 0 &&
+      millis() - rawLastDataMs >= RAW_IDLE_TIMEOUT_MS) {
+    Log.printf("[RAW] Job #%lu TCP client stalled after %llu bytes; no data for %lu ms\n",
+                (unsigned long)rawActiveJobId,
+                (unsigned long long)rawBytesReceived,
+                millis() - rawLastDataMs);
+    abortRawConnection(backend, "TCP client stalled before sending job FIN");
+    return;
+  }
+
+  // No data received at all - use probe timeout
+  if (rawBytesReceived == 0 &&
+      millis() - rawLastDataMs >= RAW_PROBE_IDLE_TIMEOUT_MS) {
+    Log.printf("[RAW] TCP 9100 connection #%lu idle with no print data; closing\n",
+                (unsigned long)rawActiveJobId);
+    if (rawClientAllocated()) rawClient.stop();
+    resetRawTransportState();
+    return;
   }
 
   const bool pending = rawClient.available() > 0;
@@ -287,9 +402,6 @@ void handleRawServer(UsbPrinterBackend *backend) {
         (peerError == ECONNRESET || peerError == ECONNABORTED || peerError == EPIPE)) {
       Log.printf("[RAW] Job #%lu peer reset after buffer drained; errno=%d; treating as input complete\n",
                     (unsigned long)rawActiveJobId, peerError);
-      RemoteDiagnostics::publishf("[RAW] job=%lu Android reset after %llu bytes; completing\n",
-                                  (unsigned long)rawActiveJobId,
-                                  (unsigned long long)rawBytesReceived);
       finishRawConnection(backend, "android-peer-reset-after-buffer-drained");
     } else {
       abortRawConnection(backend,
@@ -298,16 +410,6 @@ void handleRawServer(UsbPrinterBackend *backend) {
     return;
   }
 
-  if (!movedData && millis() - rawLastDataMs >= (rawBytesReceived == 0 ? RAW_PROBE_IDLE_TIMEOUT_MS : RAW_IDLE_TIMEOUT_MS)) {
-    if (rawBytesReceived == 0) {
-      Log.printf("[RAW] TCP 9100 connection #%lu idle with no print data; closing\n",
-                    (unsigned long)rawActiveJobId);
-      if (rawClientAllocated()) rawClient.stop();
-      resetRawTransportState();
-    } else {
-      abortRawConnection(backend, "TCP client stalled before sending job FIN");
-    }
-  }
 }
 
 void startRawServerIfNeeded() {
@@ -354,6 +456,20 @@ bool UsbPrinterBackend::begin() {
   drainPending_ = false;
   drainStartedMs_ = 0;
   drainStatusAtStart_ = 0;
+  
+  // Allocate multi-chunk PSRAM buffer for USB transfers
+  if (!rawChunk) {
+    rawChunk = (uint8_t *)heap_caps_malloc(USB_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    if (!rawChunk) {
+      Log.println("[USB] PSRAM alloc failed for rawChunk, using heap");
+      rawChunk = (uint8_t *)malloc(USB_BUFFER_SIZE);
+    }
+    if (rawChunk) {
+      Log.printf("[USB] Allocated %u byte USB buffer in PSRAM\n", USB_BUFFER_SIZE);
+    } else {
+      Log.println("[USB] Failed to allocate USB buffer!");
+    }
+  }
   return true;
 }
 
@@ -364,6 +480,8 @@ void UsbPrinterBackend::completeDrainIfReady() {
   const unsigned long age = now - drainStartedMs_;
   const bool statusValid = usbStatusValid();
   const bool freshStatus = statusValid && host_.portStatus().updatedAt > drainStatusAtStart_;
+
+  esp_task_wdt_reset();
 
   // Paper-empty and the standard Printer Class error bit are actionable failures.
   if (statusValid && usbPaperEmpty()) {
@@ -402,7 +520,7 @@ void UsbPrinterBackend::completeDrainIfReady() {
   }
 
   // Do not call a temporary de-selected state a failed job. HP devices can move the
-  // tray/paper while the network document has already finished. Keep the IPP job in
+  // tray/paper while the network document has already finished. Keep the job in
   // processing until the printer is selected again or the conservative timeout expires.
   if (statusValid && !usbStatusSelected()) {
     reason_ = "printer-processing-or-not-selected";
@@ -510,17 +628,20 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
     drainPending_ = false;
   }
   state_ = PRINTING;
-  if (!sendUsbChunk(host_, data, length, error)) {
-    abortRawJob(error);
-    return false;
+  for (int retry = 0; retry < 3; retry++) {
+    if (sendUsbChunk(host_, data, length, error)) {
+      jobBytes_ += length;
+      if (jobBytes_ >= nextHealthLogAt_) {
+        logTransportHealth(jobBytes_);
+        while (nextHealthLogAt_ <= jobBytes_) nextHealthLogAt_ += HEALTH_LOG_INTERVAL_BYTES;
+      }
+      reason_ = "raw-job-in-progress";
+      return true;
+    }
+    delay(100);
   }
-  jobBytes_ += length;
-  if (jobBytes_ >= nextHealthLogAt_) {
-    logTransportHealth(jobBytes_);
-    while (nextHealthLogAt_ <= jobBytes_) nextHealthLogAt_ += HEALTH_LOG_INTERVAL_BYTES;
-  }
-  reason_ = "raw-job-in-progress";
-  return true;
+  abortRawJob(error);
+  return false;
 }
 
 void UsbPrinterBackend::finishRawJob() {

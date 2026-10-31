@@ -55,7 +55,7 @@ struct UsbDeviceInfo {
   String serial;
 
   uint8_t printerInterfaceCount = 0;
-  UsbPrinterInterfaceInfo printerInterfaces[MAX_PRINTER_INTERFACES];
+  UsbPrinterInterfaceInfo printerInterfaces[8];
 
   UsbPrinterInterfaceInfo printer;
   UsbPrinterInterfaceInfo statusInterface;

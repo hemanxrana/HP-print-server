@@ -211,10 +211,6 @@ bool supportedDocumentFormat(const String &format) {
   return format.equalsIgnoreCase(PCL3_MIME);
 }
 
-String printerUuid() {
-  return String("urn:uuid:") + IppPcl3Service::printerUuidBare();
-}
-
 struct IppWriter {
   uint8_t data[2048]; size_t len = 0; bool ok = true;
   void b(uint8_t v){ if(len < sizeof(data)) data[len++] = v; else ok = false; }
@@ -367,6 +363,10 @@ String IppPcl3Service::printerUuidBare() {
            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
   cached = out;
   return cached;
+}
+
+String printerUuid() {
+  return String("urn:uuid:") + IppPcl3Service::printerUuidBare();
 }
 
 void IppPcl3Service::refreshJobState(){

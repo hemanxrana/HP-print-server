@@ -1,187 +1,141 @@
-# HP Print Server — ESP32-S3 RAW 9100
+# HP Print Server — ESP32-S3 USB print bridge (RAW 9100 + IPP 631)
 
-Arduino IDE firmware for an **ESP32-S3** wireless print server for USB-connected printers, currently focused on transparent HP RAW/JetDirect-style printing.
+Arduino IDE firmware for an **ESP32-S3** wireless print server that bridges
+network print traffic to a USB-connected HP printer. Data is streamed
+byte-for-byte into the classic USB Printer Class Bulk OUT endpoint; the printer
+is emulated on the network side as an HP Smart Tank that speaks PCL3GUI.
 
 ## Architecture
 
 ```text
-PC / Android / network print client
-          |
-          | TCP 9100 (JetDirect / AppSocket)
-          v
-ESP32-S3 Wi-Fi RAW server
-          |
-          | byte-for-byte USB Bulk OUT
-          v
+print client (Android HP Print Service, Windows, Linux, CUPS)
+        |
+        |  RAW JetDirect/AppSocket  TCP 9100        (byte-for-byte passthrough)
+        |  IPP 1.1 (2.x accepted)   TCP 631         (PCL3GUI-only wrapper)
+        |  mDNS / Bonjour           printer.local   (_ipp._tcp + _pdl-datastream._tcp)
+        v
+ESP32-S3 Wi-Fi servers
+        |
+        | pipelined USB Bulk OUT (2x8KB transfers in flight, 8KB chunks)
+        v
 classic USB Printer Class interface
-          |
-          v
-HP printer
+        |
+        v
+HP printer (PCL3GUI via CMD: in the 1284.4 device-id)
 ```
 
-The print path is intentionally small:
+- No document conversion, no spool, no PJL/UEL/form-feed injection by default.
+- IPP accepts only `application/vnd.hp-pcl` (case-insensitive); any other
+  `document-format` is rejected with IPP status `0x040A` so the client is told
+  clearly and quickly that the printer cannot process it.
+- Emulated printer identity lives in `config.h` as the single source of truth
+  (`PRINTER_INSTANCE_NAME`, `PRINTER_MAKE_MODEL`, `PRINTER_DEVICE_ID`,
+  `PRINTER_DOCUMENT_FORMAT`) and is mirrored into both mDNS TXT records and
+  the IPP `Get-Printer-Attributes` response.
 
-- TCP 9100 only
-- no IPP server
-- no document conversion
-- no print queue or spool
-- no automatic PJL/UEL/form-feed injection
-- no scanner support
-- USB Printer Class interfaces and Bulk endpoints are discovered from descriptors
-- the firmware automatically selects the best RAW-compatible classic Printer Class interface
+## Discovery (mDNS / Bonjour)
 
-## USB protocol policy
+When Wi-Fi is up the device advertises `printer.local` with two services:
 
-For RAW printing, the firmware accepts classic USB Printer Class protocols:
+| service | port | TXT records |
+|---|---|---|
+| `_ipp._tcp` | 631 | `rp=ipp/print`, `txtvers=1`, `qtotal=1`, `device-id` (MFG/MDL/`CMD:PCL3GUI` 1284.4 string), `pdl=application/vnd.hp-PCL`, `product`, `ty`, `Color=T`, `Duplex=F`, `note`, `UUID`, `priority=0`, `air=none`, `adminurl=http://<ip>/` |
+| `_pdl-datastream._tcp` | 9100 | `pdl=application/vnd.hp-PCL` |
 
-- `0x01` — unidirectional
-- `0x02` — bidirectional, preferred
-- `0x03` — IEEE 1284.4-compatible
-
-Printer Class protocol `0x04` is **IPP-over-USB** and is deliberately not used as a transparent RAW transport. Vendor-specific protocol `0xFF` is also ignored unless a future device-specific implementation explicitly verifies it.
-
-The selected interface is automatic; there is no user-facing USB interface selector.
-
-## Important RAW limitation
-
-TCP 9100 is a transport, not a document format. The data sent to port 9100 must already be a print stream understood by the connected printer, such as a supported PCL/PJL stream.
-
-The firmware deliberately forwards bytes unchanged. A successful USB Bulk OUT transfer proves that the ESP32 delivered the bytes to the printer; it does not prove that the printer understood the document or physically completed the page.
+The AirPrint `_universal` subtype is deliberately **not** advertised: a
+`URF`/universal claim would advertise a raster format this bridge cannot
+print. The Android HP Print Service Plugin browses plain `_ipp._tcp` and
+vendor-checks the `device-id` TXT, which is fully covered.
 
 ## Configuration
 
-On first boot, or when saved Wi-Fi cannot be reached, the ESP32 starts a setup access point:
+`config.h` holds all compile-time constants (ports, mDNS hostname, emulated
+printer identity, USB chunk/pipeline sizes, watchdog, IPP timeouts). Runtime
+settings are managed from the web dashboard and stored in NVS.
+
+On first boot, or when saved Wi-Fi cannot be reached, the device starts a
+setup access point:
 
 ```text
 SSID:     HP-Print-Server
 Password: configureme
-```
-
-Open:
-
-```text
 http://192.168.4.1/
-```
-
-After Wi-Fi configuration, the dashboard is available at the assigned IP address and, when mDNS starts successfully:
-
-```text
-http://printer.local/
 ```
 
 The dashboard provides:
 
-- printer connection and readiness
-- human-readable USB printer status
-- Wi-Fi network and IP address
-- RAW 9100 status
-- printer address for AppSocket/JetDirect setup
-- Wi-Fi scanning and configuration
+- printer connection and readiness, human-readable USB status
+- Wi-Fi scan / connect, and DHCP vs static IP configuration
+  (/IP, gateway, subnet persisted and applied before association)
+- RAW 9100 and IPP 631 status, job counters, last error
+- `http://printer.local/` when mDNS started successfully
 
 ## Printing
 
-Connect a print client to:
-
-```text
-<ESP32-IP>:9100
-```
-
-or, when mDNS works on the client:
-
-```text
-printer.local:9100
-```
-
-A Windows Standard TCP/IP printer port can use RAW protocol on port `9100`.
+- **RAW/JetDirect:** connect the client to `<ESP32-IP>:9100`
+  (Windows Standard TCP/IP port, RAW protocol).
+- **IPP / Android HP Print Service:** the printer appears automatically as
+  discoverable via mDNS; jobs must be emitted as
+  `application/vnd.hp-pcl` (PCL3GUI). If a RAW 9100 client holds the stream,
+  an arriving IPP job is rejected with `0x0503 server-error-busy` so the
+  client retries instead of dropping the printer.
 
 ## USB behavior
 
-The USB host implementation:
-
-- enumerates classic USB Printer Class interfaces
-- discovers Bulk OUT/Bulk IN endpoints dynamically
-- prefers protocol `0x02`
-- uses alternate setting `0` only as a tie-breaker, not as a hard-coded requirement
-- optionally uses a separate suitable Printer Class interface for `GET_PORT_STATUS`
-- handles USB disconnect/reconnect
-- suppresses repeated identical status logging
+- USB Printer Class interfaces are discovered from descriptors
+  (protocols 0x01/0x02/0x03 are accepted, 0x02 preferred; 0x04 IPP-over-USB
+  and vendor-specific 0xFF are ignored)
+- automatic selection of the best RAW-compatible interface and, when separate,
+  a suitable status interface for `GET_PORT_STATUS`
+- pipelined bulk-out: up to two 8 KB transfers are always in flight; a job
+  tail is drained exactly once before the post-job guard starts
+- timeout recovery (halt/flush/clear) and, for unrecoverable wedges,
+  automatic USB re-enumeration
+- optional compile-time `RAW_APPEND_JOB_TERMINATOR` appends a PJL
+  end-of-job plus form feed (disabled by default)
 
 ## RAW job handling
 
-The server accepts one active TCP 9100 client at a time.
-
-- TCP receive data is forwarded in bounded chunks so the main loop remains responsive.
-- USB writes are synchronously checked for completion.
-- The socket is closed a short guard period after the job ends; printer drain continues in the background.
-- A stalled TCP client is disconnected after 30 s without progress; a connection that sends no print data is dropped after 30 s.
-- Aborted jobs reset their byte accounting before the next job.
-- Optional compile-time `RAW_APPEND_JOB_TERMINATOR` appends a PJL end-of-job plus form feed for clients that never end the stream (disabled by default).
+- one TCP 9100 client at a time; bounded chunk size keeps the loop responsive
+- stalled clients are disconnected after 30 s without progress
+- post-job guard waits for the printer's port status to settle
 
 ## Wi-Fi behavior
 
-- Wi-Fi modem power save is disabled so print traffic is not delayed by radio sleep.
-- Saved Wi-Fi is attempted at boot.
-- If connection fails, the configuration AP is started.
-- The firmware retries the saved Wi-Fi network every 30 seconds.
-- If Wi-Fi later recovers, the temporary configuration AP is stopped.
-- On every station reconnect the RAW 9100 and IPP 631 listeners are re-bound and mDNS is re-announced.
-- The dashboard only shows `printer.local` when mDNS actually started successfully.
-- A 60 s task watchdog reboots the device if the main loop wedges.
+- Wi-Fi modem power save is disabled so print traffic is not delayed.
+- Retries the saved network every 30 s; configuration AP stops once the
+  station links up; on every reconnect the RAW and IPP listeners are re-bound
+  and mDNS is re-announced.
+- mDNS responder health: if the responder ever fails to start, discovery is
+  retried periodically until it succeeds.
+- 60 s task watchdog reboots the device if the main loop wedges.
 
-## Arduino ESP32 core
+## Building
 
-Project baseline:
+- Arduino IDE / arduino-cli, **arduino-esp32 core 3.3.10**
+- Board: ESP32-S3 N16R8 (16 MB flash, 8 MB octal PSRAM)
+- CI flags: `esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi`
+- Serial monitor: **115200 baud**
 
-- Arduino IDE
-- `esp32` by Espressif Systems
-- Arduino-ESP32 **3.3.10**
-- ESP32-S3 board target (N16R8: 16 MB flash, 8 MB octal PSRAM)
-- Serial Monitor: **115200 baud**
-- Library: **NimBLE-Arduino 2.5.1**
+Changing the partition scheme requires one full flash over USB; OTA (if
+used later) can only update inside the existing layout.
 
-Tools menu settings must match the CI build:
+## Testing with the HP Print Service Plugin
 
-- Flash Size: **16MB (128Mb)**
-- PSRAM: **OPI PSRAM**
-- Partition Scheme: **16M Flash (3MB APP/9.9MB FATFS)** (`app3M_fat9M_16MB`)
+Watch the serial log for these markers:
 
-Changing the partition scheme requires one full flash over USB; OTA can only
-update inside the existing layout.
-
-Open `HP-print-server.ino`, compile, upload, and test with the real printer.
-
-## Wireless diagnostics and OTA
-
-After the firmware has been flashed once over USB, Arduino IDE can upload later
-firmware versions over Wi-Fi. Keep the board and computer on the same network,
-select `hp-print-server` (or its discovered network port) under **Tools → Port**,
-and upload normally. Change `OTA_PASSWORD` in `HP-print-server.ino` before using
-OTA in a real deployment.
-
-OTA is accepted only while the printer is idle. The USB serial monitor remains
-available at 115200 baud.
-
-When the bootloader rollback feature is enabled, the firmware marks the new
-image valid after ten seconds of successful uptime; otherwise the device
-silently falls back to the previous firmware.
-
-Diagnostics beyond the serial console:
-
-- `/log` streams the 64 KB RAM log ring (allocated in PSRAM when available).
-- `/status.json` includes job counters, last error, IPP job state, internal
-  heap, PSRAM totals/free, boot count and USB wedge state.
-- The HTML dashboard is rendered into a 16 KB PSRAM buffer and streamed, so it
-  does not churn the internal heap while printing.
-
-The ESP32-S3 exposes a NimBLE-based BLE UART-style diagnostic service named
-`HP-Print-Diagnostics`. Use a BLE GATT application such as nRF Connect to
-subscribe to the TX characteristic. The RX characteristic accepts `help`,
-`ping`, `status`, `log`, `counters`, and `job`. BLE is used instead of
-Bluetooth Classic SPP because the ESP32-S3 does not support Classic Bluetooth.
-
-Install `NimBLE-Arduino` (tested with 2.5.1) from Library Manager before
-building; the compile workflow installs it automatically.
+1. `[mDNS] ...` — `_ipp._tcp` advertisement and responder heap usage.
+2. `[USB] Persistent Bulk OUT pipeline: 2 transfer buffers` — pipelining armed.
+3. `[IPP] op=0x000B ...` — the plugin's Get-Printer-Attributes (vendor check
+   against `printer-device-id`).
+4. `[IPP] op=0x0002 ... format=...` — **the empirical question**: which
+   `document-format` the plugin actually emits for a PCL3GUI-only printer.
+5. `[IPP][PERF] job=... avg=...KiB/s ... usb-send=...` — throughput split
+   between network read and USB send.
+6. `[USB] Bulk OUT ... failed ...` — anything here during a job needs the
+   status, accepted/total pair from the log line.
 
 ## Repository policy
 
-Only normal source code and the Arduino compile workflow should live in the repository. Temporary source-editing workflows and scratch files are intentionally excluded.
+Only normal source code and the Arduino compile workflow live in the
+repository; scratch files are intentionally excluded.

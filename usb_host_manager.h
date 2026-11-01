@@ -25,6 +25,7 @@ public:
 
   bool bulkWrite(const uint8_t *data, size_t length, size_t &accepted,
                  uint32_t timeoutMs, String &error);
+  bool waitForBulkOut(uint32_t timeoutMs, String &error);
 
   bool portStatusValid() const { return device_.portStatus.valid; }
   uint8_t portStatusValue() const { return device_.portStatus.value; }

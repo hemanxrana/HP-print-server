@@ -17,7 +17,7 @@
 constexpr uint32_t RAW_USB_TIMEOUT_MS = 30000;
 
 namespace {
-constexpr uint16_t RAW_PORT = 9100;
+constexpr uint16_t RAW_PORT = RAW_SOCKET_PORT;
 constexpr uint32_t POST_JOB_LOG_INTERVAL_MS = 2000;
 constexpr uint64_t HEALTH_LOG_INTERVAL_BYTES = 512ULL * 1024ULL;
 constexpr uint32_t RAW_CLOSE_GUARD_MS = 250;
@@ -41,27 +41,38 @@ struct PjlDetector {
         return false;
       case AT_SEEN:
         if (c == 'P') { state = AT_P_SEEN; matchPos = 2; return false; }
+        // Resync: a partial match ending in '@' (e.g. "@P@PJL EOJ") must not
+        // lose the new '@' or the detector would never recover.
+        if (c == '@') { matchPos = 1; return false; }
         state = IDLE; return false;
       case AT_P_SEEN:
         if (c == 'J') { state = AT_PJ_SEEN; matchPos = 3; return false; }
+        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
         state = IDLE; return false;
       case AT_PJ_SEEN:
         if (c == 'L') { state = AT_PJL_SEEN; matchPos = 4; return false; }
+        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
         state = IDLE; return false;
       case AT_PJL_SEEN:
         if (c == ' ') { state = AT_PJL_SPACE_SEEN; matchPos = 5; return false; }
+        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
         state = IDLE; return false;
       case AT_PJL_SPACE_SEEN:
         if (c == 'E') { state = AT_PJL_E_SEEN; matchPos = 6; return false; }
+        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
         state = IDLE; return false;
       case AT_PJL_E_SEEN:
         if (c == 'O') { state = AT_PJL_EO_SEEN; matchPos = 7; return false; }
+        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
         state = IDLE; return false;
       case AT_PJL_EO_SEEN:
         if (c == 'J') { state = AT_PJL_EOJ_SEEN; matchPos = 8; return true; }  // EOJ detected!
+        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
         state = IDLE; return false;
       case AT_PJL_EOJ_SEEN:
-        state = IDLE; return false;
+        if (c == '@') { state = AT_SEEN; matchPos = 1; }  // next EOJ may follow immediately
+        else state = IDLE;
+        return false;
     }
     return false;
   }
@@ -196,6 +207,10 @@ void resetRawTransportState() {
   rawTransportClosing = false;
   rawCloseGuardStarted = false;
   rawTransportCloseAtMs = 0;
+  ringWritePos = 0;
+  ringReadPos = 0;
+  ringDataLen = 0;
+  pjlDetector.reset();
 }
 
 void abortRawConnection(UsbPrinterBackend *backend, const String &reason) {
@@ -263,10 +278,40 @@ void serviceRawTransportClose(UsbPrinterBackend *backend) {
   resetRawTransportState();
 }
 
+// Push everything the ring still holds to the printer.  Called both during
+// normal streaming and while a job is closing, so a FIN or PJL EOJ never
+// strands undelivered bytes in the ring (which used to drop the job tail).
+bool drainRingToUsb(UsbPrinterBackend *backend) {
+  while (ringDataLen > 0) {
+    const size_t want = min(static_cast<size_t>(ringDataLen), static_cast<size_t>(RAW_USB_CHUNK));
+    const size_t spaceToEnd = USB_BUFFER_SIZE - ringReadPos;
+    const size_t want2 = min(want, spaceToEnd);
+    String error;
+    if (!backend->sendDirect(rawChunk + ringReadPos, want2, error)) {
+      Log.printf("[RAW] Job #%lu USB pass-through failed after %llu bytes: %s\n",
+                    (unsigned long)rawActiveJobId,
+                    (unsigned long long)rawBytesReceived,
+                    error.c_str());
+      abortRawConnection(backend, error);
+      return false;
+    }
+    rawBytesReceived += (size_t)want2;
+    ringReadPos = (ringReadPos + want2) % USB_BUFFER_SIZE;
+    ringDataLen -= want2;
+    esp_task_wdt_reset();
+    yield();
+  }
+  return true;
+}
+
 void handleRawServer(UsbPrinterBackend *backend) {
   if (!rawServerStarted) return;
 
   if (rawTransportClosing) {
+    if (ringDataLen > 0) {
+      if (!drainRingToUsb(backend)) return;
+      if (ringDataLen > 0) return;  // still draining the job tail; continue next poll
+    }
     serviceRawTransportClose(backend);
     return;
   }
@@ -326,33 +371,14 @@ void handleRawServer(UsbPrinterBackend *backend) {
 
     ringWritePos = (ringWritePos + got) % USB_BUFFER_SIZE;
     ringDataLen += got;
-    rawBytesReceived += (size_t)got;
     rawLastDataMs = millis();
     movedData = true;
     esp_task_wdt_reset();
     yield();
   }
 
-  // Drain ring buffer to USB
-  while (ringDataLen > 0) {
-    const size_t want = min(static_cast<size_t>(ringDataLen), static_cast<size_t>(RAW_USB_CHUNK));
-    const size_t spaceToEnd = USB_BUFFER_SIZE - ringReadPos;
-    const size_t want2 = min(want, spaceToEnd);
-    String error;
-    if (!backend->sendDirect(rawChunk + ringReadPos, want2, error)) {
-      Log.printf("[RAW] Job #%lu USB pass-through failed after %llu bytes: %s\n",
-                    (unsigned long)rawActiveJobId,
-                    (unsigned long long)rawBytesReceived,
-                    error.c_str());
-      abortRawConnection(backend, error);
-      return;
-    }
-    rawBytesReceived += (size_t)want2;
-    ringReadPos = (ringReadPos + want2) % USB_BUFFER_SIZE;
-    ringDataLen -= want;
-    esp_task_wdt_reset();
-    yield();
-  }
+  // Drain ring buffer to USB (failure inside aborts the job)
+  drainRingToUsb(backend);
 
   // Track consecutive empty reads for retry logic
   if (!movedData) {
@@ -387,7 +413,7 @@ void handleRawServer(UsbPrinterBackend *backend) {
   int peerError = 0;
   const RawPeerState peer = rawPeerState(peerError);
 
-  if (peer == RawPeerState::CLEAN_FIN && !pending) {
+  if (peer == RawPeerState::CLEAN_FIN && !pending && ringDataLen == 0) {
     finishRawConnection(backend, "clean-peer-FIN-and-buffer-drained");
     return;
   }
@@ -398,7 +424,7 @@ void handleRawServer(UsbPrinterBackend *backend) {
     // is empty and every byte counted in rawBytesReceived has already passed
     // through sendDirect(), so the reset is only a transport close signal.
     // Treating it as an aborted job loses otherwise-complete Android jobs.
-    if (rawBytesReceived > 0 &&
+    if (rawBytesReceived > 0 && ringDataLen == 0 &&
         (peerError == ECONNRESET || peerError == ECONNABORTED || peerError == EPIPE)) {
       Log.printf("[RAW] Job #%lu peer reset after buffer drained; errno=%d; treating as input complete\n",
                     (unsigned long)rawActiveJobId, peerError);
@@ -646,9 +672,15 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
 
 void UsbPrinterBackend::finishRawJob() {
   if (state_ != PRINTING || drainPending_) return;
+  String flushError;
+  if (!host_.waitForBulkOut(RAW_USB_TIMEOUT_MS, flushError)) {
+    Log.printf("[PRINT][FINALIZE] bulk-out drain failed after %u job bytes: %s\n",
+               (unsigned)jobBytes_, flushError.c_str());
+    abortRawJob(flushError);
+    return;
+  }
   drainPending_ = true;
   drainStartedMs_ = millis();
-  drainUntilMs_ = drainStartedMs_ + POST_JOB_MIN_GUARD_MS;
   drainNextLogMs_ = drainStartedMs_;
   drainStatusAtStart_ = usbStatusValid() ? host_.portStatus().updatedAt : 0;
   reason_ = "raw-job-draining";
@@ -664,7 +696,6 @@ void UsbPrinterBackend::abortRawJob(const String &reason) {
     lastError_ = reason.length() ? reason : "raw-job-aborted";
   }
   drainPending_ = false;
-  drainUntilMs_ = 0;
   jobBytes_ = 0;
   state_ = ERROR;
   reason_ = reason.length() ? reason : "raw-job-aborted";

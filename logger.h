@@ -2,9 +2,9 @@
 
 #include <Arduino.h>
 
-// Print-compatible logger that mirrors every write to the UART and to the
-// in-memory diagnostic ring.  The ring is what /log, /monitor and the TCP log
-// stream serve, so the network monitor sees the same text as the serial port.
+// Print-compatible logger that writes every message to the UART.
+// It intentionally takes the place of direct Serial calls so all
+// diagnostics flow through a single chokepoint.
 class Logger : public Print {
 public:
   void begin(unsigned long baud);

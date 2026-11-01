@@ -1,5 +1,7 @@
 #include "usb_host_manager.h"
 #include "logger.h"
+#include "config.h"
+#include "esp_task_wdt.h"
 #include "esp_intr_alloc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -8,6 +10,7 @@
 #include "usb/usb_helpers.h"
 #include "usb/usb_types_ch9.h"
 #include <cstring>
+#include <cassert>
 
 namespace {
 static constexpr uint8_t USB_PRINTER_CLASS_CODE = 0x07;
@@ -21,7 +24,15 @@ static constexpr uint32_t STATUS_TRANSFER_TIMEOUT_MS = 1000;
 // 8KB persistent Bulk OUT buffer (no MPS alignment — host driver splits into packets)
 static constexpr size_t BULK_OUT_BUFFER_SIZE = 8192;
 
-struct TransferWait { SemaphoreHandle_t done = nullptr; };
+// Pipelined Bulk OUT: up to USB_BULK_PIPELINE_DEPTH transfers are submitted
+// ahead so the USB bus never idles between 8KB chunks.
+struct BulkOutSlot {
+  usb_transfer_t *transfer = nullptr;
+  SemaphoreHandle_t done = nullptr;
+  volatile bool inFlight = false;
+  usb_transfer_status_t status = USB_TRANSFER_STATUS_NO_DEVICE;
+  size_t accepted = 0;
+};
 
 struct Runtime {
   usb_host_client_handle_t client = nullptr;
@@ -40,9 +51,8 @@ struct Runtime {
   volatile bool statusPending = false;
   volatile usb_transfer_t *statusTransfer = nullptr;
 
-  usb_transfer_t *bulkOutTransfer = nullptr;
-  TransferWait bulkOutWait;
-  volatile bool bulkOutInFlight = false;
+  BulkOutSlot bulkOut[USB_BULK_PIPELINE_DEPTH];
+  uint8_t bulkOutNext = 0;
   volatile bool bulkOutWedged = false;
   volatile bool resetRequested = false;
   unsigned long rescanAtMs = 0;
@@ -135,35 +145,53 @@ static int selectedStatusIndex(const UsbDeviceInfo &d, int printIndex) {
   return best;
 }
 
+static void clearBulkOutInFlight() {
+  for (int i = 0; i < USB_BULK_PIPELINE_DEPTH; ++i) g.bulkOut[i].inFlight = false;
+}
+
 static void freeBulkOutResources() {
-  if (g.bulkOutTransfer && !g.bulkOutInFlight) {
-    usb_host_transfer_free(g.bulkOutTransfer);
-    g.bulkOutTransfer = nullptr;
-  }
-  if (g.bulkOutWait.done && !g.bulkOutInFlight) {
-    vSemaphoreDelete(g.bulkOutWait.done);
-    g.bulkOutWait.done = nullptr;
+  for (int i = 0; i < USB_BULK_PIPELINE_DEPTH; ++i) {
+    BulkOutSlot &s = g.bulkOut[i];
+    if (s.transfer && !s.inFlight) {
+      usb_host_transfer_free(s.transfer);
+      s.transfer = nullptr;
+    }
+    if (s.done && !s.transfer) {
+      vSemaphoreDelete(s.done);
+      s.done = nullptr;
+    }
   }
 }
 
 static bool ensureBulkOutResources(String &error) {
-  if (!g.bulkOutWait.done) {
-    g.bulkOutWait.done = xSemaphoreCreateBinary();
-    if (!g.bulkOutWait.done) {
-      error = "unable to allocate persistent USB completion semaphore";
-      return false;
+  if (g.bulkOutWedged) {
+    error = "USB Bulk OUT endpoint wedged; recovering USB link";
+    return false;
+  }
+  for (int i = 0; i < USB_BULK_PIPELINE_DEPTH; ++i) {
+    BulkOutSlot &s = g.bulkOut[i];
+    if (!s.done) {
+      s.done = xSemaphoreCreateBinary();
+      if (!s.done) {
+        error = "unable to allocate persistent USB completion semaphore";
+        return false;
+      }
+    }
+    if (!s.transfer) {
+      const esp_err_t e = usb_host_transfer_alloc(BULK_OUT_BUFFER_SIZE, 0, &s.transfer);
+      if (e != ESP_OK || !s.transfer) {
+        error = String("persistent usb_host_transfer_alloc failed: ") + esp_err_to_name(e);
+        vSemaphoreDelete(s.done);
+        s.done = nullptr;
+        return false;
+      }
     }
   }
-  if (!g.bulkOutTransfer) {
-    const esp_err_t e = usb_host_transfer_alloc(BULK_OUT_BUFFER_SIZE, 0, &g.bulkOutTransfer);
-    if (e != ESP_OK || !g.bulkOutTransfer) {
-      error = String("persistent usb_host_transfer_alloc failed: ") + esp_err_to_name(e);
-      vSemaphoreDelete(g.bulkOutWait.done);
-      g.bulkOutWait.done = nullptr;
-      return false;
-    }
-    Log.printf("[USB] Persistent Bulk OUT transfer allocated once (%u bytes)\n",
-                  (unsigned)BULK_OUT_BUFFER_SIZE);
+  static bool announced = false;
+  if (!announced) {
+    Log.printf("[USB] Persistent Bulk OUT pipeline: %u transfer buffers of %u bytes\n",
+                  (unsigned)USB_BULK_PIPELINE_DEPTH, (unsigned)BULK_OUT_BUFFER_SIZE);
+    announced = true;
   }
   return true;
 }
@@ -399,9 +427,12 @@ static void clientEvent(const usb_host_client_event_msg_t *event, void *) {
 
 static void bulkTransferCallback(usb_transfer_t *t) {
   if (!t) return;
-  if (t == g.bulkOutTransfer) g.bulkOutInFlight = false;
-  TransferWait *w = static_cast<TransferWait *>(t->context);
-  if (w && w->done) xSemaphoreGive(w->done);
+  BulkOutSlot *slot = static_cast<BulkOutSlot *>(t->context);
+  if (!slot) return;
+  slot->inFlight = false;
+  slot->status = t->status;
+  slot->accepted = static_cast<size_t>(t->actual_num_bytes);
+  if (slot->done) xSemaphoreGive(slot->done);
 }
 
 static void statusTransferCallback(usb_transfer_t *t) {
@@ -485,7 +516,7 @@ static void clientTask(void *) {
       Log.println("[USB] Recovering from unrecoverable Bulk OUT transfer; re-enumerating");
       closeDevice();
       if (manager) manager->onDetached();
-      g.bulkOutInFlight = false;
+      clearBulkOutInFlight();
       g.bulkOutWedged = false;
       scanExisting();
       g.rescanAtMs = millis() + 2000;
@@ -581,6 +612,40 @@ const UsbPrinterInterfaceInfo *UsbHostManager::statusInterface() const {
   return device_.statusInterface.found ? &device_.statusInterface : nullptr;
 }
 
+namespace {
+static bool waitSlotDone(BulkOutSlot &s, usb_transfer_t *t, uint32_t timeoutMs,
+                         const char *what, String &error) {
+  const TickType_t waitTicks = timeoutMs ? pdMS_TO_TICKS(timeoutMs + 250) : portMAX_DELAY;
+  if (xSemaphoreTake(s.done, waitTicks) != pdTRUE) {
+    Log.printf("[USB] Bulk OUT %s wait exceeded transfer timeout; recovering endpoint\n", what);
+    usb_host_endpoint_halt(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_flush(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_clear(t->device_handle, t->bEndpointAddress);
+    if (xSemaphoreTake(s.done, pdMS_TO_TICKS(1500)) != pdTRUE) {
+      g.bulkOutWedged = true;
+      g.resetRequested = true;
+      error = String("USB Bulk OUT ") + what + " unrecoverable; re-enumerating USB link";
+      return false;
+    }
+    error = String("USB Bulk OUT ") + what + " timed out; endpoint recovered";
+    return false;
+  }
+  if (s.status != USB_TRANSFER_STATUS_COMPLETED || s.accepted != t->num_bytes) {
+    Log.printf("[USB] Bulk OUT %s failed status=%d accepted=%u/%u; recovering endpoint\n",
+               what, (int)s.status, (unsigned)s.accepted, (unsigned)t->num_bytes);
+    usb_host_endpoint_halt(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_flush(t->device_handle, t->bEndpointAddress);
+    usb_host_endpoint_clear(t->device_handle, t->bEndpointAddress);
+    g.bulkOutWedged = true;
+    g.resetRequested = true;
+    error = String("USB bulk transfer failed status=") + String((int)s.status) +
+            " accepted=" + String((unsigned)s.accepted) + "/" + String((unsigned)t->num_bytes);
+    return false;
+  }
+  return true;
+}
+} // namespace
+
 bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accepted,
                                uint32_t timeoutMs, String &error) {
   accepted = 0;
@@ -593,60 +658,67 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
             "/" + String((unsigned)BULK_OUT_BUFFER_SIZE); return false;
   }
   if (g.bulkOutWedged) { error = "USB Bulk OUT endpoint wedged; recovering USB link"; return false; }
-  if (g.bulkOutInFlight) { error = "previous USB Bulk OUT transfer is still in flight"; return false; }
   if (!ensureBulkOutResources(error)) return false;
-  while (xSemaphoreTake(g.bulkOutWait.done, 0) == pdTRUE) {}
 
-  usb_transfer_t *t = g.bulkOutTransfer;
+  const int mine = g.bulkOutNext;
+  const int previous = (mine + USB_BULK_PIPELINE_DEPTH - 1) % USB_BULK_PIPELINE_DEPTH;
+  BulkOutSlot &prev = g.bulkOut[previous];
+
+  // Reap the previous in-flight transfer here, AFTER submitting the next one,
+  // so two 8KB chunks are always in flight back-to-back on the bus.
+  if (prev.inFlight && !waitSlotDone(prev, prev.transfer, timeoutMs, "pipelined", error)) {
+    prev.inFlight = false;
+    if (g.bulkOutWedged) { g.bulkOutNext = mine; return false; }
+  }
+
+  BulkOutSlot &slot = g.bulkOut[mine];
+  while (xSemaphoreTake(slot.done, 0) == pdTRUE) {}
+  slot.status = USB_TRANSFER_STATUS_NO_DEVICE;
+  slot.accepted = 0;
+
+  usb_transfer_t *t = slot.transfer;
+  assert(t && !slot.inFlight);
   memcpy(t->data_buffer, data, length);
   t->num_bytes = length;
   t->device_handle = g.device;
   t->bEndpointAddress = device_.printer.bulkOut.address;
   t->callback = bulkTransferCallback;
-  t->context = &g.bulkOutWait;
+  t->context = &slot;
   t->timeout_ms = timeoutMs;
 
-  g.bulkOutInFlight = true;
   const esp_err_t e = usb_host_transfer_submit(t);
-  bool transferFailed = (e != ESP_OK);
-  if (!transferFailed) {
-    const TickType_t waitTicks = timeoutMs ? pdMS_TO_TICKS(timeoutMs + 250) : portMAX_DELAY;
-    if (xSemaphoreTake(g.bulkOutWait.done, waitTicks) != pdTRUE) {
-      Log.println("[USB] Bulk OUT completion wait exceeded transfer timeout; recovering endpoint");
-      usb_host_endpoint_halt(t->device_handle, t->bEndpointAddress);
-      usb_host_endpoint_flush(t->device_handle, t->bEndpointAddress);
-      usb_host_endpoint_clear(t->device_handle, t->bEndpointAddress);
-      if (xSemaphoreTake(g.bulkOutWait.done, pdMS_TO_TICKS(1500)) != pdTRUE) {
-        g.bulkOutWedged = true;
-        g.resetRequested = true;
-        error = "USB Bulk OUT unrecoverable; re-enumerating USB link";
-        return false;
-      }
-      transferFailed = true;
-    }
-  } else {
-    g.bulkOutInFlight = false;
-  }
-
-  accepted = static_cast<size_t>(t->actual_num_bytes);
-  const usb_transfer_status_t status = t->status;
-  if (transferFailed || status != USB_TRANSFER_STATUS_COMPLETED || accepted != length) {
-    Log.printf("[USB] Bulk OUT transfer failed status=%d accepted=%u/%u; recovering endpoint\n",
-               (int)status, (unsigned)accepted, (unsigned)length);
+  if (e != ESP_OK) {
+    error = String("USB bulk transfer submit failed: ") + esp_err_to_name(e);
     usb_host_endpoint_halt(t->device_handle, t->bEndpointAddress);
     usb_host_endpoint_flush(t->device_handle, t->bEndpointAddress);
     usb_host_endpoint_clear(t->device_handle, t->bEndpointAddress);
-    if (xSemaphoreTake(g.bulkOutWait.done, pdMS_TO_TICKS(500)) != pdTRUE) {
-      g.bulkOutWedged = true;
-    }
-    g.bulkOutInFlight = false;
-    g.bulkOutWedged = true;
-    g.resetRequested = true;
-    error = String("USB bulk transfer failed status=") + String((int)status) +
-            " accepted=" + String((unsigned)accepted) + "/" + String((unsigned)length);
     return false;
   }
+  slot.inFlight = true;
+  g.bulkOutNext = (uint8_t)((mine + 1) % USB_BULK_PIPELINE_DEPTH);
+
+  // The submission is the acceptance point: bytes handed to the USB host
+  // driver are transmitted even if this call detects a failed predecessor.
+  accepted = length;
   return true;
+}
+
+bool UsbHostManager::waitForBulkOut(uint32_t timeoutMs, String &error) {
+  if (g.bulkOutWedged) { error = "USB Bulk OUT endpoint wedged; recovering USB link"; return false; }
+  if (!ensureBulkOutResources(error)) return false;
+  // Cap each slot wait so the sequential drain of all pipelined transfers
+  // (including the recovery grace window) stays well below the watchdog.
+  const uint32_t slotTimeout = timeoutMs / USB_BULK_PIPELINE_DEPTH;
+  bool ok = true;
+  for (int i = 0; i < USB_BULK_PIPELINE_DEPTH && ok; ++i) {
+    esp_task_wdt_reset();
+    BulkOutSlot &s = g.bulkOut[i];
+    if (!s.inFlight) continue;
+    if (waitSlotDone(s, s.transfer, slotTimeout, "drain", error)) continue;
+    s.inFlight = false;
+    ok = false;
+  }
+  return ok;
 }
 
 bool UsbHostManager::bulkOutWedged() const {
@@ -692,6 +764,7 @@ void UsbHostManager::onEnumerationStarted() {
 void UsbHostManager::onEnumerated(const UsbDeviceInfo &info) {
   device_ = info;
   error_.clear();
+  clearBulkOutInFlight();
   g.bulkOutWedged = false;
   state_ = info.printer.found ? PRINTER_READY : DEVICE_ATTACHED;
 }

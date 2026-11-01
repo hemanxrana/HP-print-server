@@ -28,8 +28,5 @@ private:
   uint32_t lastJobId_ = 0;
   uint8_t lastJobState_ = 0; // IPP job-state enum: 5 processing, 8 aborted, 9 completed
   String lastJobReason_;
+  static String printerUuidBare();
 };
-
-// Stable MAC-derived printer UUID without the urn:uuid: prefix, suitable for
-// mDNS TXT. The IPP attribute form is "urn:uuid:" + printerUuidBare().
-static String printerUuidBare();

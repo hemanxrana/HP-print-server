@@ -6,6 +6,8 @@
 #include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
 
+String printerUuid();
+
 namespace {
 constexpr uint32_t CLIENT_TIMEOUT_MS = IPP_CLIENT_TIMEOUT_MS;  // kept below the 60 s watchdog
 constexpr size_t HTTP_HEADER_LIMIT = 4096;

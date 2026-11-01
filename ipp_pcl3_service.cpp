@@ -211,31 +211,6 @@ bool supportedDocumentFormat(const String &format) {
   return format.equalsIgnoreCase(PCL3_MIME);
 }
 
-String IppPcl3Service::printerUuidBare() {
-  static String cached;
-  if (cached.length()) return cached;
-  uint8_t mac[6] = {0};
-  esp_read_mac(mac, ESP_MAC_WIFI_STA);
-  uint8_t b[16] = {0x48, 0x50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x12, 0x34};
-  memcpy(b + 2, mac, 6);
-  // Deterministic tail from the MAC so the UUID is stable across reboot/OTA.
-  b[8] = mac[0] ^ 0xA5;
-  b[9] = mac[1] ^ 0x5A;
-  b[10] = mac[2] ^ 0x3C;
-  b[11] = mac[3] ^ 0xC3;
-  b[12] = mac[4] ^ 0x0F;
-  b[13] = mac[5] ^ 0xF0;
-  b[6] = (b[6] & 0x0F) | 0x40;
-  b[8] = (b[8] & 0x3F) | 0x80;
-  char out[40];
-  snprintf(out, sizeof(out),
-           "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-           b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-           b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
-  cached = out;
-  return cached;
-}
-
 String printerUuid() {
   return String("urn:uuid:") + printerUuidBare();
 }
@@ -367,6 +342,32 @@ bool parseAttributes(BodyReader &r,RequestAttrs &attrs){
   }
 }
 } // namespace
+
+
+String IppPcl3Service::printerUuidBare() {
+  static String cached;
+  if (cached.length()) return cached;
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  uint8_t b[16] = {0x48, 0x50, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x12, 0x34};
+  memcpy(b + 2, mac, 6);
+  // Deterministic tail from the MAC so the UUID is stable across reboot/OTA.
+  b[8] = mac[0] ^ 0xA5;
+  b[9] = mac[1] ^ 0x5A;
+  b[10] = mac[2] ^ 0x3C;
+  b[11] = mac[3] ^ 0xC3;
+  b[12] = mac[4] ^ 0x0F;
+  b[13] = mac[5] ^ 0xF0;
+  b[6] = (b[6] & 0x0F) | 0x40;
+  b[8] = (b[8] & 0x3F) | 0x80;
+  char out[40];
+  snprintf(out, sizeof(out),
+           "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+           b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+           b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+  cached = out;
+  return cached;
+}
 
 void IppPcl3Service::refreshJobState(){
   if(lastJobId_==0 || lastJobState_!=5) return;
@@ -550,3 +551,4 @@ void IppPcl3Service::handleClient(WiFiClient client){
 
   client.stop(); clientActive_=false;
 }
+

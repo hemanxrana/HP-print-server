@@ -116,7 +116,7 @@ void startRawDiscovery() {
     MDNS.addServiceTxt("ipp", "tcp", "note", "ESP32-S3 PCL3GUI USB bridge");
     // Stable printer identity: same MAC-derived UUID the IPP endpoint reports,
     // so clients remember us across IP changes.
-    MDNS.addServiceTxt("ipp", "tcp", "UUID", printerUuidBare().c_str());
+    MDNS.addServiceTxt("ipp", "tcp", "UUID", IppPcl3Service::printerUuidBare().c_str());
     MDNS.addServiceTxt("ipp", "tcp", "priority", "0");
     MDNS.addServiceTxt("ipp", "tcp", "air", "none");
     String adminUrl = String("http://") + activeIp() + "/";

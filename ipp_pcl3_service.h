@@ -32,4 +32,4 @@ private:
 
 // Stable MAC-derived printer UUID without the urn:uuid: prefix, suitable for
 // mDNS TXT. The IPP attribute form is "urn:uuid:" + printerUuidBare().
-String printerUuidBare();
+static String printerUuidBare();

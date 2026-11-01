@@ -211,7 +211,7 @@ bool supportedDocumentFormat(const String &format) {
   return format.equalsIgnoreCase(PCL3_MIME);
 }
 
-String printerUuidBare() {
+String IppPcl3Service::printerUuidBare() {
   static String cached;
   if (cached.length()) return cached;
   uint8_t mac[6] = {0};

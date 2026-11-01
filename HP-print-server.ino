@@ -55,12 +55,12 @@ bool parseIPv4(const String &text, IPAddress &ip) {
 }
 
 void applyStaticIp() {
-  if (!config.staticMode) { WiFi.config(0U, 0U, 0U); return; }
+  if (!config.staticMode) { WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0)); return; }
   IPAddress sip, sgw, ssn;
   if (!parseIPv4(config.staticIp, sip) || !parseIPv4(config.staticGw, sgw) || !parseIPv4(config.staticSn, ssn)) {
     Log.println("[WiFi] Saved static-IP settings are invalid; falling back to DHCP");
     config.staticMode = false;
-    WiFi.config(0U, 0U, 0U);
+    WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
     return;
   }
   WiFi.config(sip, sgw, ssn);

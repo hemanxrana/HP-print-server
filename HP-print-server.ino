@@ -86,7 +86,7 @@ bool saveConfig() {
   const size_t snWritten = preferences.putString(NVS_KEY_SN, config.staticSn);
   const bool modeSaved = preferences.putBool(NVS_KEY_STATIC_MODE, config.staticMode);
   preferences.end();
-  return (config.ssid.isEmpty() || ssidWritten > 0) && (config.password.isEmpty() || passWritten > 0) && modeSaved && ipWritten > 0 && gwWritten > 0 && snWritten > 0;
+  return (config.ssid.isEmpty() || ssidWritten > 0) && (config.password.isEmpty() || passWritten > 0) && modeSaved && (config.staticIp.isEmpty() || ipWritten > 0) && (config.staticGw.isEmpty() || gwWritten > 0) && (config.staticSn.isEmpty() || snWritten > 0);
 }
 
 bool startConfigAP() {

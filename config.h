@@ -19,8 +19,6 @@
 #define RAW_SOCKET_PORT    9100    // JetDirect/AppSocket protocol port
 #define IPP_PORT           631     // IPP PCL3GUI-only print service port
 #define WEB_SERVER_PORT    80      // Web management interface port
-#define MDNS_HOSTNAME      "printer"  // Accessible via printer.local
-#define MDNS_RETRY_INTERVAL_MS  3600000UL  // re-init responder when down (only retried while unhealthy)
 
 // --- Emulated HP identity (mirrored to IPP + mDNS so clients vendor-check us) ---
 #define PRINTER_INSTANCE_NAME  "HP Smart Tank"

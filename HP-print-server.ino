@@ -90,7 +90,7 @@ bool saveConfig() {
 }
 
 bool startConfigAP() {
-  WiFi.mode(WIFI_AP_STA); WiFi.setSleep(false); WiFi.setHostname(MDNS_HOSTNAME);
+  WiFi.mode(WIFI_AP_STA); WiFi.setSleep(false); WiFi.setHostname("printer");
   if (!WiFi.softAP(AP_SSID, AP_PASSWORD, 1, false, 4)) { Log.println("[AP] Failed to start configuration AP"); configApActive = false; return false; }
   configApActive = true; Log.printf("[AP] SSID: %s\n", AP_SSID); Log.printf("[AP] Configure at http://%s\n", WiFi.softAPIP().toString().c_str()); return true;
 }
@@ -98,7 +98,7 @@ bool startConfigAP() {
 void startRawDiscovery() {
   const uint32_t heapBefore = ESP.getFreeHeap();
   MDNS.end(); mdnsReady = false;
-  if (!MDNS.begin(MDNS_HOSTNAME)) { Log.println("[mDNS] Failed to start printer.local discovery responder"); return; }
+  if (!MDNS.begin("printer")) { Log.println("[mDNS] Failed to start printer.local discovery responder"); return; }
   mdnsReady = true;
   MDNS.setInstanceName(PRINTER_INSTANCE_NAME);
   bool ippOk = MDNS.addService("ipp", "tcp", IPP_PORT);
@@ -300,7 +300,7 @@ void serviceWifi() {
   // a reconnect, OOM, ...), retry periodically instead of staying permanently
   // undiscoverable. Healthy state is never churned.
   static unsigned long mdnsRetryDueMs = 0;
-  if (!mdnsReady && millis() - mdnsRetryDueMs >= MDNS_RETRY_INTERVAL_MS) {
+  if (!mdnsReady && millis() - mdnsRetryDueMs >= 3600000UL) {
     mdnsRetryDueMs = millis();
     Log.printf("[mDNS] responder down; retrying discovery (free heap %u)\n", (unsigned)ESP.getFreeHeap());
     startRawDiscovery();
@@ -358,7 +358,7 @@ void setup() {
   if (!config.ssid.isEmpty()) {
     WiFi.mode(WIFI_STA); 
     WiFi.setSleep(false); 
-    WiFi.setHostname(MDNS_HOSTNAME);
+    WiFi.setHostname("printer");
     applyStaticIp();
     Log.printf("[WiFi] Connecting to %s (%s)\n", config.ssid.c_str(), config.staticMode ? (String("static ") + config.staticIp).c_str() : String("DHCP").c_str());
     const unsigned long started = millis(); 

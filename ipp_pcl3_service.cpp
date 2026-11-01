@@ -212,7 +212,7 @@ bool supportedDocumentFormat(const String &format) {
 }
 
 String printerUuid() {
-  return String("urn:uuid:") + printerUuidBare();
+  return String("urn:uuid:") + IppPcl3Service::printerUuidBare();
 }
 
 struct IppWriter {

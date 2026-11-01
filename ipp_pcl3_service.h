@@ -6,6 +6,7 @@
 class IppPcl3Service {
 public:
   explicit IppPcl3Service(UsbPrinterBackend &printer) : printer_(printer) {}
+  static String printerUuidBare();
   void begin();
   void rebind();
   void poll();
@@ -28,5 +29,4 @@ private:
   uint32_t lastJobId_ = 0;
   uint8_t lastJobState_ = 0; // IPP job-state enum: 5 processing, 8 aborted, 9 completed
   String lastJobReason_;
-  static String printerUuidBare();
 };

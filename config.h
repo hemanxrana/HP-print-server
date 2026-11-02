@@ -46,9 +46,5 @@
 #define NVS_NAMESPACE       "hp-print"
 #define NVS_KEY_SSID        "ssid"
 #define NVS_KEY_PASS        "pass"
-#define NVS_KEY_STATIC_MODE "useStatic"
-#define NVS_KEY_IP          "staticIp"
-#define NVS_KEY_GW          "staticGw"
-#define NVS_KEY_SN          "staticSn"
 
 #endif // CONFIG_H

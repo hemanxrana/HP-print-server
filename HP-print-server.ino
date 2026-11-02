@@ -9,6 +9,7 @@
 #include "system_diagnostics.h"
 #include <esp_heap_caps.h>
 #include "esp_task_wdt.h"
+#include <nvs_flash.h>
 #include "config.h"
 
 // ESP32-S3 USB-to-Wi-Fi print server.
@@ -24,10 +25,6 @@ IppPcl3Service ippService(usbPrinterBackend);
 struct Config {
   String ssid;
   String password;
-  bool staticMode = false;
-  String staticIp;
-  String staticGw;
-  String staticSn;
 };
 Config config;
 static unsigned long lastStatus = 0;
@@ -39,54 +36,25 @@ String jsonEsc(String s) { s.replace("\\", "\\\\"); s.replace("\"", "\\\""); s.r
 void defaults() {
   config.ssid = "";
   config.password = "";
-  config.staticMode = false;
-  config.staticIp = "";
-  config.staticGw = "";
-  config.staticSn = "";
 }
 
-bool parseIPv4(const String &text, IPAddress &ip) {
-  unsigned int a, b, c, d;
-  char tail = 0;
-  if (sscanf(text.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4) return false;
-  if (a > 255 || b > 255 || c > 255 || d > 255) return false;
-  ip = IPAddress(a, b, c, d);
-  return true;
-}
-
-void applyStaticIp() {
-  if (!config.staticMode) { WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0)); return; }
-  IPAddress sip, sgw, ssn;
-  if (!parseIPv4(config.staticIp, sip) || !parseIPv4(config.staticGw, sgw) || !parseIPv4(config.staticSn, ssn)) {
-    Log.println("[WiFi] Saved static-IP settings are invalid; falling back to DHCP");
-    config.staticMode = false;
-    WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
-    return;
-  }
-  WiFi.config(sip, sgw, ssn);
-  Log.printf("[WiFi] Static IP: %s / %s / %s\n", config.staticIp.c_str(), config.staticGw.c_str(), config.staticSn.c_str());
-}
 void loadConfig() {
   defaults();
-  if (!preferences.begin(NVS_NAMESPACE, true)) { Log.println("[CFG] Preferences read failed; using defaults"); return; }
+  if (!preferences.begin(NVS_NAMESPACE, false)) { Log.println("[CFG] NVS open failed; using defaults"); return; }
   config.ssid = preferences.getString(NVS_KEY_SSID, config.ssid);
   config.password = preferences.getString(NVS_KEY_PASS, config.password);
-  config.staticMode = preferences.getBool(NVS_KEY_STATIC_MODE, config.staticMode);
-  config.staticIp = preferences.getString(NVS_KEY_IP, config.staticIp);
-  config.staticGw = preferences.getString(NVS_KEY_GW, config.staticGw);
-  config.staticSn = preferences.getString(NVS_KEY_SN, config.staticSn);
   preferences.end();
 }
 bool saveConfig() {
-  if (!preferences.begin(NVS_NAMESPACE, false)) return false;
+  if (!preferences.begin(NVS_NAMESPACE, false)) {
+    Log.printf("[CFG] NVS open for write FAILED; save aborted (freeHeap=%u)\n", (unsigned)ESP.getFreeHeap());
+    return false;
+  }
   const size_t ssidWritten = preferences.putString(NVS_KEY_SSID, config.ssid);
   const size_t passWritten = preferences.putString(NVS_KEY_PASS, config.password);
-  const size_t ipWritten = preferences.putString(NVS_KEY_IP, config.staticIp);
-  const size_t gwWritten = preferences.putString(NVS_KEY_GW, config.staticGw);
-  const size_t snWritten = preferences.putString(NVS_KEY_SN, config.staticSn);
-  const bool modeSaved = preferences.putBool(NVS_KEY_STATIC_MODE, config.staticMode);
   preferences.end();
-  return (config.ssid.isEmpty() || ssidWritten > 0) && (config.password.isEmpty() || passWritten > 0) && modeSaved && (config.staticIp.isEmpty() || ipWritten > 0) && (config.staticGw.isEmpty() || gwWritten > 0) && (config.staticSn.isEmpty() || snWritten > 0);
+  Log.printf("[CFG] NVS save: ssid=%u pass=%u\n", (unsigned)ssidWritten, (unsigned)passWritten);
+  return (config.ssid.isEmpty() || ssidWritten > 0) && (config.password.isEmpty() || passWritten > 0);
 }
 
 bool startConfigAP() {
@@ -162,9 +130,7 @@ void sendJsonStatus() {
   out += ",\"hostname\":\"" + String(mdnsReady ? "printer.local" : "") + "\"";
   out += ",\"jobsOk\":" + String(usbPrinterBackend.jobsCompleted()) + ",\"jobsFailed\":" + String(usbPrinterBackend.jobsFailed());
   out += ",\"maxDrainMs\":" + String(usbPrinterBackend.maxDrainMs()) + ",\"lastError\":\"" + jsonEsc(usbPrinterBackend.lastError()) + "\"";
-  out += ",\"freeHeap\":" + String(ESP.getFreeHeap()) + ",\"boots\":" + String(bootCount) + ",\"usbWedged\":" + String(usbHost.bulkOutWedged() ? "true" : "false");
-  out += ",\"netMode\":\"" + String(config.staticMode ? "static" : "dhcp") + "\"";
-  out += ",\"staticIp\":\"" + jsonEsc(config.staticIp) + "\",\"staticGw\":\"" + jsonEsc(config.staticGw) + "\",\"staticSn\":\"" + jsonEsc(config.staticSn) + "\"";
+  out += ",\"freeHeap\":" + String(ESP.getFreeHeap()) + ",\"heapTotal\":" + String(ESP.getHeapSize()) + ",\"boots\":" + String(bootCount) + ",\"usbWedged\":" + String(usbHost.bulkOutWedged() ? "true" : "false");
   out += ",\"psramTotal\":" + String((unsigned)ESP.getPsramSize()) + ",\"psramFree\":" + String((unsigned)ESP.getFreePsram()) + "}";
   configServer.send(200, "application/json", out);
 }
@@ -176,7 +142,7 @@ struct HtmlBuffer {
 
   bool ensure() {
     if (data) return true;
-    constexpr size_t cap = 16384;
+    constexpr size_t cap = 24576;
     data = (char *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
     if (!data) data = (char *)heap_caps_malloc(cap, MALLOC_CAP_8BIT);
     if (!data) return false;
@@ -219,16 +185,142 @@ const char *dashboard() {
   HtmlBuffer &out = dashboardBuffer;
   if (!out.ensure()) return "";
   out.clear();
-  out.append(R"HTML(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0f6b7a"><title>HP Print Server</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f2f4f8;color:#1f2937;line-height:1.5}#app{max-width:860px;margin:0 auto;padding:18px}header{display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid #e5e7eb;margin-bottom:20px}h1{font-size:18px;font-weight:700;color:#111827;display:flex;align-items:center;gap:7px}h1 .dot{width:7px;height:7px;background:#10b981;border-radius:50%;display:inline-block}.sub{font-size:12px;color:#6b7280;margin-top:2px}.tabs{display:flex;gap:4px;overflow-x:auto;scrollbar-width:none;margin-bottom:18px}.tabs a{flex-shrink:0;padding:8px 14px;border-radius:8px;text-decoration:none;color:#6b7280;font-weight:600;font-size:13px;border:1px solid #e5e7eb;background:#fff}.tabs a.active{background:#0f6b7a;color:#fff;border-color:#0f6b7a}.tabs a:hover:not(.active){background:#f3f4f6}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:18px}.card{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:15px}.card h3{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#9ca3af;margin-bottom:8px;font-weight:700}.big{font-size:18px;font-weight:700;color:#111827}.ok{color:#10b981}.warn{color:#f59e0b}.muted{color:#6b7280;font-size:12.5px}section{margin-bottom:22px}section h2{font-size:14px;font-weight:700;margin-bottom:11px;color:#111827}.form{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:15px}.field{margin-bottom:11px}.field label{display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:5px}.field input,.field select{width:100%;padding:9px 11px;border:1px solid #d1d5db;border-radius:8px;background:#fff;color:#111827;font-size:13px}.field input,.field select{width:100%;padding:9px 11px;border:1px solid #d1d5db;border-radius:8px;background:#fff;color:#111827;font-size:13px}.check{display:flex;align-items:center;gap:8px;margin-bottom:12px}.check input{width:auto}.btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 16px;border-radius:8px;border:1px solid transparent;text-decoration:none;font-size:13px;font-weight:600;cursor:pointer}.btn.primary{background:#0f6b7a;color:#fff}.btn.primary:hover{background:#0d5a67}.btn.secondary{background:#fff;color:#374151;border-color:#d1d5db}.btn.secondary:hover{background:#f3f4f6}.btn.small{padding:6px 12px;font-size:12px}.msg{padding:9px 12px;border-radius:8px;margin-bottom:11px}.msg.muted{background:#f3f4f6;color:#374151;border:1px solid #e5e7eb}#refresh{font-size:11.5px;color:#6b7280}@media(max-width:640px){#app{padding:12px}}</style></head><body><div id="app"><header><h1><span class="dot"></span> HP Print Server</h1><span id="refresh">&ndash;</span></header><nav class="tabs"><a class="active" href="#dash">Dashboard</a><a href="#net">Network</a></nav><div class="cards"><div class="card"><h3>USB Printer</h3><div class="big" id="cP">--</div><div class="muted" id="cPR">--</div></div><div class="card"><h3>Wi-Fi</h3><div class="big" id="cN">--</div><div class="muted" id="cNI">--</div></div><div class="card"><h3>USB</h3><div class="big" id="cU">--</div><div class="muted" id="cUD">--</div></div></div>
-
-<section id="dash"><h2>Status</h2><div class="form"><div class="field"><label>USB Printer</label><div class="muted" id="sPrinter">--</div></div><div class="field"><label>State</label><div class="muted" id="sState">--</div></div><div class="field"><label>RAW Client</label><div class="muted" id="sRaw">--</div></div><div class="field"><label>Wi-Fi</label><div class="muted" id="sWifi">--</div></div><div class="field"><label>IP Address</label><div class="muted" id="sIp">--</div></div><div class="field"><label>mDNS</label><div class="muted" id="sMdns">--</div></div><div class="field"><label>Free Heap</label><div class="muted" id="sHeap">--</div></div><div class="field"><label>PSRAM</label><div class="muted" id="sPsram">--</div></div></div></section>
-
-<section id="net"><h2>Wi-Fi</h2><div class="form"><div class="field"><label>Network name</label><select id="ssidSel"><option value="">Select a network&hellip;</option></select></div><div class="field"><label>Password</label><input type="password" id="passIn" placeholder="Password (leave empty to keep saved)"></div><div class="field"><button class="btn secondary small" id="scanBtn" type="button" onclick="scanWifi()">Scan networks</button>&nbsp;<button class="btn primary" type="button" onclick="saveWifi()">Connect &amp; Reboot</button></div><div class="msg muted" id="wifiMsg">Saved Wi-Fi re-connects automatically at boot.</div></div><h2>IP Address</h2><div class="form"><div class="field"><label>Address mode</label><select id="ipMode" onchange="ipModeUi()"><option value="dhcp">DHCP (automatic)</option><option value="static">Static IP</option></select></div><div class="field"><label>IP address</label><input type="text" id="ipId" placeholder="192.168.1.111" maxlength="15"></div><div class="field"><label>Gateway</label><input type="text" id="gwId" placeholder="192.168.1.1" maxlength="15"></div><div class="field"><label>Subnet mask</label><input type="text" id="snId" placeholder="255.255.255.0" maxlength="15"></div><div class="field"><button class="btn primary" type="button" onclick="saveNet()">Save IP &amp; Reboot</button></div><div class="msg muted" id="netMsg">DHCP is the default; choose Static to pin the address you print to.</div></div></section>
-
-<script>const $=id=>document.getElementById(id);function esc(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML}async function scanWifi(){const b=$('scanBtn'),m=$('wifiMsg');b.disabled=true;m.textContent='Scanning...';try{const r=await fetch('/scan.json?ts='+Date.now());const a=await r.json();const sel=$('ssidSel');sel.innerHTML='<option value="">Select a network&hellip;</option>';a.sort((x,y)=>y.rssi-x.rssi);a.forEach(x=>{const o=document.createElement('option');o.value=esc(x.ssid);o.textContent=esc(x.ssid)+' ('+x.rssi+' dBm)';sel.appendChild(o);});m.textContent='Found '+a.length+'.';}catch(e){m.textContent='Scan failed.';}finally{b.disabled=false;}}let netPrefilled=false;function ipModeUi(){const st=document.getElementById('ipMode').value==='static';['ipId','gwId','snId'].forEach(i=>document.getElementById(i).disabled=!st);}
-async function saveWifi(){const m=document.getElementById('wifiMsg');const sel=document.getElementById('ssidSel');if(!sel.value){m.textContent='Select a network first.';return;}m.textContent='Saving Wi-Fi…';const f=new URLSearchParams();f.append('ssid',sel.value);f.append('password',document.getElementById('passIn').value);try{const r=await fetch('/save?ts='+Date.now(),{method:'POST',body:f});m.textContent=await r.text();}catch(e){m.textContent='Save failed.';}}
-async function saveNet(){const m=document.getElementById('netMsg');m.textContent='Saving IP settings…';const f=new URLSearchParams();f.append('ipMode',document.getElementById('ipMode').value);f.append('staticIp',document.getElementById('ipId').value);f.append('staticGw',document.getElementById('gwId').value);f.append('staticSn',document.getElementById('snId').value);try{const r=await fetch('/net/save?ts='+Date.now(),{method:'POST',body:f});m.textContent=await r.text();}catch(e){m.textContent='Save failed.';}}
-async function refresh(){try{const r=await fetch('/status.json?ts='+Date.now());const s=await r.json();if(!netPrefilled){document.getElementById('ipMode').value=s.netMode||'dhcp';document.getElementById('ipId').value=s.staticIp||'';document.getElementById('gwId').value=s.staticGw||'';document.getElementById('snId').value=s.staticSn||'';ipModeUi();netPrefilled=true;}$('cP').textContent=s.usbAttached?s.printerName:'No USB Printer';$('cPR').textContent=s.printerReason;$('cP').className='big '+(s.usbAttached?'ok':'muted');$('cN').textContent=s.wifi;$('cNI').textContent=s.ip||'&ndash;';$('cU').textContent=s.usbStatus;$('cUD').textContent=s.usbWedged?'Wedged':'OK';$('cUD').className='muted '+(s.usbWedged?'warn':'');$('sPrinter').textContent=s.usbAttached?s.printerName:'Not attached';$('sState').textContent=s.printer;$('sRaw').textContent=s.rawConnected?'Connected':'Idle';$('sWifi').textContent=s.wifi;$('sIp').textContent=s.ip||'&ndash;';$('sMdns').textContent=s.mdnsReady?'printer.local':'&ndash;';$('sHeap').textContent=(s.freeHeap/1024).toFixed(0)+' KB';$('sPsram').textContent=(s.psramFree/1024).toFixed(0)+' / '+(s.psramTotal/1024).toFixed(0)+' KB';$('refresh').textContent='Updated '+new Date().toLocaleTimeString();}catch(e){}}setInterval(refresh,5000);refresh();</script></div></body></html>)HTML");
+  out.append(R"HTML(<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0f6b7a"><title>HP Print Server</title>
+<style>
+:root{--bg:#eef1f6;--card:#fff;--line:#e3e8ef;--ink:#0f172a;--muted:#64748b;--soft:#f1f5f9;--accent:#0f6b7a;--hover:#0d5a67;--ok:#10b981;--okink:#047857;--okbg:#ecfdf5;--warn:#f59e0b;--warnink:#92400e;--radius:14px;--shadow:0 1px 2px rgba(15,23,42,.05),0 10px 30px rgba(15,23,42,.06)}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:linear-gradient(180deg,#e8edf4,#f2f5f9 260px);color:var(--ink);line-height:1.55;-webkit-font-smoothing:antialiased}
+#app{max-width:1000px;margin:0 auto;padding:20px 18px 44px}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:16px 0 15px;border-bottom:1px solid var(--line);margin-bottom:16px}
+.brand{display:flex;align-items:center;gap:11px}
+.logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,#0f6b7a,#0891b2);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:14px;box-shadow:0 4px 10px rgba(15,107,122,.35)}
+h1{font-size:17px;font-weight:750;letter-spacing:-.01em}
+.sub{font-size:12px;color:var(--muted)}
+.hmeta{text-align:right}
+#netState{font-size:12px;font-weight:650;color:#334155}
+#updated{font-size:11.5px;color:var(--muted)}
+nav.tabs{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;margin:0 0 18px}
+nav.tabs a{padding:8px 16px;border-radius:999px;text-decoration:none;color:var(--muted);font-weight:650;font-size:12.5px;background:#fff;border:1px solid var(--line)}
+nav.tabs a.active{background:var(--accent);border-color:var(--accent);color:#fff}
+section{margin-bottom:20px}
+h2.sec{font-size:12px;font-weight:750;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:0 0 10px 2px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px}
+.card,.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
+.card{padding:16px}
+.lbl{font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:8px}
+.big{font-size:17px;font-weight:700;word-break:break-word}
+.note{font-size:12px;color:var(--muted);margin-top:6px}
+.off{color:var(--muted)}.warn{color:var(--warnink)}.ok{color:var(--okink)}
+.panel{padding:16px 18px}
+.row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 2px;border-bottom:1px solid var(--soft)}
+.row:last-child{border-bottom:none}
+.k{font-size:12.5px;color:var(--muted);font-weight:600;flex-shrink:0}
+.v{font-size:13px;font-weight:600;text-align:right;word-break:break-all}
+.vcode{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;background:var(--soft);border:1px solid var(--line);color:#334155;padding:3px 9px;border-radius:7px}
+.dot{width:8px;height:8px;border-radius:50%;background:#cbd5e1;display:inline-block;margin-right:7px}
+.dot.on{background:var(--ok);box-shadow:0 0 0 3px var(--okbg)}
+.dot.warn{background:var(--warn);box-shadow:0 0 0 3px #fef3c7}
+.bar{height:6px;background:var(--soft);border-radius:999px;overflow:hidden;margin-top:7px}
+.bar i{display:block;height:100%;border-radius:999px;width:0;background:linear-gradient(90deg,#0f6b7a,#0891b2);transition:width .5s ease}
+.bar.low i{background:linear-gradient(90deg,#f59e0b,#fbbf24)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:720px){.grid2{grid-template-columns:1fr}.hmeta{text-align:left}}
+.hint{font-size:12px;color:var(--muted);margin-top:10px}
+.hint b{color:#334155}
+.field{display:flex;flex-direction:column;gap:6px;margin-bottom:12px}
+.field label{font-size:12px;font-weight:650;color:#334155}
+.field input,.field select{width:100%;padding:10px 12px;border:1px solid #d3d9e2;border-radius:10px;background:#fff;color:var(--ink);font-size:13.5px;outline:none;transition:border .15s,box-shadow .15s}
+.field input:focus,.field select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(15,107,122,.12)}
+.btn{display:inline-flex;align-items:center;padding:10px 16px;border-radius:10px;border:1px solid transparent;font-size:13px;font-weight:650;cursor:pointer;transition:background .15s}
+.btn.primary{background:var(--accent);color:#fff}
+.btn.primary:hover{background:var(--hover)}
+.btn.secondary{background:#fff;color:#334155;border-color:#d3d9e2}
+.btn.secondary:hover{background:var(--soft)}
+.btn.small{padding:8px 14px;font-size:12px}
+.btnrow{display:flex;gap:9px;flex-wrap:wrap;margin-top:2px}
+.msg{padding:9px 13px;border-radius:10px;font-size:12.5px;background:var(--soft);color:#334155;border:1px solid var(--line);margin-top:12px}
+</style></head><body>
+<div id="app">
+<header>
+<div class="brand"><div class="logo">HP</div><div><h1>HP Print Server</h1><div class="sub">Smart Tank 520 emulation &middot; RAW 9100 &middot; IPP 631</div></div></div>
+<div class="hmeta"><div id="netState"><span class="dot" id="netDot"></span><span id="netLabel">starting&hellip;</span></div><div id="updated" style="margin-top:2px">&ndash;</div></div>
+</header>
+<nav class="tabs"><a class="active" href="#overview">Overview</a><a href="#system">System</a><a href="#wifi">Wi-Fi</a></nav>
+<section id="overview"><h2 class="sec">Overview</h2><div class="cards">
+<div class="card"><div class="lbl">USB Printer</div><div class="big" id="ovPrinter">--</div><div class="note" id="ovPrinterSub">--</div></div>
+<div class="card"><div class="lbl">Network</div><div class="big" id="ovNet">--</div><div class="note" id="ovNetSub">--</div></div>
+<div class="card"><div class="lbl">USB Link</div><div class="big" id="ovUsb">--</div><div class="note" id="ovUsbSub">--</div></div>
+<div class="card"><div class="lbl">Jobs</div><div class="big" id="ovJobs">--</div><div class="note" id="ovJobsSub">--</div></div>
+</div></section>
+<section id="system"><h2 class="sec">System</h2><div class="grid2">
+<div class="panel">
+<div class="row"><span class="k">Printer state</span><span class="v" id="sysState">--</span></div>
+<div class="row"><span class="k">IPP service</span><span class="v" id="sysIpp">--</span></div>
+<div class="row"><span class="k">RAW socket</span><span class="v" id="sysRaw">--</span></div>
+<div class="row"><span class="k">mDNS</span><span class="v" id="sysMdns">--</span></div>
+<div class="row"><span class="k">Hostname</span><span class="v" id="sysHost">--</span></div>
+<div class="row"><span class="k">IPP last error</span><span class="v" id="sysIppErr" style="font-size:11.5px;font-weight:500">--</span></div>
+<div class="row"><span class="k">USB error log</span><span class="v" id="sysUsbErr" style="font-size:11.5px;font-weight:500">--</span></div>
+</div>
+<div class="panel">
+<div class="row"><span class="k">Free heap</span><span class="v" id="sysHeap">--</span></div><div class="bar" id="heapBarWrap"><i id="heapBar"></i></div>
+<div class="row" style="margin-top:14px"><span class="k">Free PSRAM</span><span class="v" id="sysPsram">--</span></div><div class="bar" id="psramBarWrap"><i id="psramBar"></i></div>
+<h2 class="sec" style="margin:18px 0 6px">How to print</h2>
+<div class="row"><span class="k">IPP printer URL</span><span class="vcode" id="chipIpp">--</span></div>
+<div class="row"><span class="k">RAW (JetDirect)</span><span class="vcode" id="chipRaw">--</span></div>
+<div class="hint">Add the printer in Windows as an <b>IPP device</b> using the URL above, or create a <b>Standard TCP/IP port</b> for the RAW address. Use an HP Smart Tank 520_540 driver &mdash; PCL3GUI output only.</div>
+</div>
+</div></section>
+<section id="wifi"><h2 class="sec">Wi-Fi settings</h2><div class="panel">
+<div class="field"><label>Network name</label><select id="ssidSel"><option value="">Select a network&hellip;</option></select></div>
+<div class="field"><label>Password</label><input type="password" id="passIn" placeholder="Leave empty to keep the saved one" autocomplete="new-password"></div>
+<div class="btnrow"><button class="btn secondary small" id="scanBtn" type="button" onclick="scanWifi()">Scan networks</button><button class="btn primary" type="button" onclick="saveWifi()">Connect &amp; reboot</button></div>
+<div class="msg" id="wifiMsg">Saved Wi-Fi re-connects automatically at boot.</div>
+</div></section>
+<script>
+const $=id=>document.getElementById(id);
+function esc(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML}
+async function scanWifi(){const b=$('scanBtn'),m=$('wifiMsg');b.disabled=true;b.textContent='Scanning\u2026';try{const r=await fetch('/scan.json?ts='+Date.now());const a=await r.json();const sel=$('ssidSel');sel.innerHTML='<option value="">Select a network&hellip;</option>';a.sort((x,y)=>y.rssi-x.rssi);a.forEach(x=>{const o=document.createElement('option');o.value=esc(x.ssid);o.textContent=esc(x.ssid)+' ('+x.rssi+' dBm)';sel.appendChild(o);});m.textContent='Found '+a.length+' network'+(a.length===1?'':'s')+'.';}catch(e){m.textContent='Scan failed.';}finally{b.disabled=false;b.textContent='Scan networks';}}
+async function saveWifi(){const m=$('wifiMsg');const sel=$('ssidSel');if(!sel.value){m.textContent='Select a network first.';return;}m.textContent='Saving Wi-Fi settings\u2026';const f=new URLSearchParams();f.append('ssid',sel.value);f.append('password',$('passIn').value);try{const r=await fetch('/save?ts='+Date.now(),{method:'POST',body:f});m.textContent=await r.text();}catch(e){m.textContent='Save failed.';}}
+function bar(id,wrapId,frac,base){const w=$(wrapId);const p=Math.max(0,Math.min(100,frac*100));$(id).style.width=p+'%';w.className='bar'+(base>0&&frac<0.15?' low':'');}
+function dots(el,text,on,warn){el.innerHTML='<span class="dot '+(warn?'warn':(on?'on':'off'))+'"></span>'+text;}
+async function refresh(){try{const r=await fetch('/status.json?ts='+Date.now());const s=await r.json();
+const attached=s.usbAttached;
+$('ovPrinter').textContent=attached?s.printerName:'Not attached';
+$('ovPrinter').className='big'+(attached?'':' off');
+const ps=$('ovPrinterSub');ps.textContent=(s.printer||'--')+(s.printerReason?' \u00b7 '+s.printerReason:'');ps.className='note'+(attached?'':' off');
+$('ovNet').textContent=s.ssid||s.wifi||'--';
+$('ovNet').className='big'+(s.ssid?'':' off');
+$('ovNetSub').textContent=(s.ip?s.ip+' \u00b7 ':'')+s.wifi;
+$('ovUsb').textContent=s.usbWedged?'Wedged':(attached?s.usbStatus:'Waiting\u2026');
+$('ovUsb').className='big'+(s.usbWedged?' warn':(attached?'':' off'));
+$('ovUsbSub').textContent=s.rawConnected?'RAW client connected':'Listening on port 9100';
+$('ovJobs').textContent=s.jobsOk+' done';
+$('ovJobs').className='big'+(s.jobsOk?'':' off');
+$('ovJobsSub').textContent=s.jobsFailed+' failed'+(s.lastError?' \u00b7 '+s.lastError:' \u00b7 no job errors');
+dots($('sysIpp'),s.ippActive?'Running':'Idle',s.ippActive,false);
+$('sysRaw').innerHTML='<span class="dot '+(s.rawConnected?'on':'off')+'"></span>'+(s.rawConnected?'Connected':'Idle');
+$('sysMdns').innerHTML='<span class="dot '+(s.mdnsReady?'on':'off')+'"></span>'+(s.mdnsReady?'printer.local':'Not started');
+$('sysState').textContent=s.printer+(s.printerReason?' \u00b7 '+s.printerReason:'');
+$('sysHost').textContent=s.hostname||'\u2014';
+$('sysIppErr').textContent=s.ippLastError||'none';
+$('sysUsbErr').textContent=s.lastError||'none';
+const kb=n=>(n/1024).toFixed(0)+' KB';
+const heapT=s.heapTotal||0,psT=s.psramTotal||0;
+$('sysHeap').textContent=kb(s.freeHeap)+(heapT?' of '+kb(heapT):'');
+bar('heapBar','heapBarWrap',heapT?s.freeHeap/heapT:0,heapT);
+$('sysPsram').textContent=kb(s.psramFree)+(psT?' of '+kb(psT):'');
+bar('psramBar','psramBarWrap',psT?s.psramFree/psT:0,psT);
+$('chipIpp').textContent='http://'+(s.ip||'printer-ip')+':631/ipp/print';
+$('chipRaw').textContent=(s.ip||'printer-ip')+':9100';
+$('netDot').className='dot '+(s.ip?'on':'warn');
+$('netLabel').textContent=s.ip?'Online \u00b7 '+s.ip:s.wifi;
+$('updated').textContent='Updated '+new Date().toLocaleTimeString();
+}catch(e){}}
+setInterval(refresh,5000);refresh();
+</script></div></body></html>)HTML");
+  const size_t built = strlen(out.c_str());
+  Log.printf("[UI] dashboard built: %u of %u bytes\n", (unsigned)built, (unsigned)out.capacity);
   return out.c_str();
 }
 
@@ -254,31 +346,6 @@ void handleSave() {
   }
   configServer.send(200, "text/html; charset=utf-8", "<p>Wi-Fi settings saved. Rebooting…</p>");
   delay(300);
-  ESP.restart();
-}
-
-void handleSaveNet() {
-  const bool wantsStatic = configServer.arg("ipMode") == String("static");
-  if (wantsStatic) {
-    const String ip = configServer.arg("staticIp");
-    const String gw = configServer.arg("staticGw");
-    const String sn = configServer.arg("staticSn");
-    IPAddress a, b, c;
-    if (!parseIPv4(ip, a) || !parseIPv4(gw, b) || !parseIPv4(sn, c)) {
-      configServer.send(400, "text/plain; charset=utf-8", "Static IP, gateway and subnet must all be valid IPv4 addresses.");
-      return;
-    }
-    config.staticIp = ip;
-    config.staticGw = gw;
-    config.staticSn = sn;
-  }
-  config.staticMode = wantsStatic;
-  if (!saveConfig()) {
-    configServer.send(500, "text/plain; charset=utf-8", "Could not save network settings.");
-    return;
-  }
-  configServer.send(200, "text/html; charset=utf-8", "<p>Network settings saved. Rebooting to apply…</p>");
-  delay(200);
   ESP.restart();
 }
 
@@ -317,7 +384,6 @@ void serviceWifi() {
   if (status != WL_CONNECTED && !config.ssid.isEmpty() && millis() - lastWifiAttemptMs >= 30000UL) {
     lastWifiAttemptMs = millis();
     Log.printf("[WiFi] Retrying saved network %s\n", config.ssid.c_str());
-    applyStaticIp();
     WiFi.reconnect();
   }
   lastWifiStatus = status;
@@ -353,14 +419,21 @@ void setup() {
                 (unsigned long)ESP.getFreeHeap(), (unsigned)ESP.getPsramSize(),
                 (unsigned)ESP.getFreePsram());
   Log.println("[MODE] RAW 9100 (JetDirect/AppSocket) + PCL3GUI-only IPP 631");
+  const esp_err_t nvsErr = nvs_flash_init();
+  if (nvsErr == ESP_ERR_NVS_NO_FREE_PAGES || nvsErr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    Log.printf("[CFG] NVS partition stale (err=%d); resetting it\n", (int)nvsErr);
+    nvs_flash_erase();
+    nvs_flash_init();
+  } else if (nvsErr != ESP_OK) {
+    Log.printf("[CFG] NVS init error: %s\n", esp_err_to_name(nvsErr));
+  }
   loadConfig(); 
   bool wifiOk = false;
   if (!config.ssid.isEmpty()) {
     WiFi.mode(WIFI_STA); 
     WiFi.setSleep(false); 
     WiFi.setHostname("printer");
-    applyStaticIp();
-    Log.printf("[WiFi] Connecting to %s (%s)\n", config.ssid.c_str(), config.staticMode ? (String("static ") + config.staticIp).c_str() : String("DHCP").c_str());
+    Log.printf("[WiFi] Connecting to %s (DHCP)\n", config.ssid.c_str());
     const unsigned long started = millis(); 
     while (WiFi.status() != WL_CONNECTED && millis() - started < 20000UL) { delay(250); Log.print('.'); } 
     Log.println();
@@ -378,7 +451,6 @@ void setup() {
   configServer.on("/scan.json", HTTP_GET, sendJsonScan);
   configServer.on("/status.json", HTTP_GET, sendJsonStatus);
   configServer.on("/save", HTTP_POST, handleSave);
-  configServer.on("/net/save", HTTP_POST, handleSaveNet);
   configServer.begin();
   Log.println("[HTTP] Configuration server ready");
   Log.printf("[HTTP] Open http://%s\n", mdnsReady ? "printer.local" : (activeIp().length() ? activeIp().c_str() : "device-address"));

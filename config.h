@@ -22,10 +22,16 @@
 
 // --- Emulated HP identity (mirrored to IPP + mDNS so clients vendor-check us) ---
 #define PRINTER_INSTANCE_NAME  "HP Smart Tank"
-#define PRINTER_MAKE_MODEL     "HP Smart Tank 520_540 series"
+#define PRINTER_MAKE_MODEL     "HP Smart Tank 520"
+// Model string matters: print apps like NetPrinter match it against a device
+// database (entry "Smart Tank 2xx/5xx"), so keep suffixes off the model name.
 #define PRINTER_DEVICE_ID      "MFG:HP;MDL:Smart Tank 520;CMD:PCL3GUI;CLS:PRINTER;STATUS;"
-#define PRINTER_DOCUMENT_FORMAT "application/vnd.hp-pcl"
+#define PRINTER_DOCUMENT_FORMAT  "application/vnd.hp-PCL"
 #define PRINTER_DOCUMENT_VERSION "PCL3GUI"
+// Capability lists advertised via Bonjour TXT records and IPP attributes.
+// RAW queues display PCL3GUI explicitly so HP print apps show the dialect.
+#define PRINTER_FORMAT_LIST_RAW  "application/vnd.hp-PCL,application/octet-stream,PCL3GUI"
+#define PRINTER_FORMAT_LIST_IPP  "application/vnd.hp-PCL,application/octet-stream"
 
 // --- USB Bulk Out Settings ---
 #define BULK_OUT_CHUNK_SIZE       (8 * 1024)    // 8KB chunks, no MPS alignment

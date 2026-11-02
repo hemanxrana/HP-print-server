@@ -76,7 +76,9 @@ void startRawDiscovery() {
     MDNS.addServiceTxt("ipp", "tcp", "txtvers", "1");
     MDNS.addServiceTxt("ipp", "tcp", "qtotal", "1");
     MDNS.addServiceTxt("ipp", "tcp", "device-id", PRINTER_DEVICE_ID);
-    MDNS.addServiceTxt("ipp", "tcp", "pdl", "application/vnd.hp-PCL");
+    MDNS.addServiceTxt("ipp", "tcp", "pdl", PRINTER_FORMAT_LIST_IPP);
+    // "am" lists the advertised print modes; HP print apps display the dialect for the queue.
+    MDNS.addServiceTxt("ipp", "tcp", "am", PRINTER_DOCUMENT_VERSION);
     MDNS.addServiceTxt("ipp", "tcp", "product", "(" PRINTER_MAKE_MODEL ")");
     MDNS.addServiceTxt("ipp", "tcp", "ty", PRINTER_MAKE_MODEL);
     MDNS.addServiceTxt("ipp", "tcp", "Color", "T");
@@ -92,7 +94,7 @@ void startRawDiscovery() {
     Log.println("[mDNS] _ipp._tcp (PCL3GUI-only) + printer.local advertised");
   }
   if (rawOk) {
-    MDNS.addServiceTxt("pdl-datastream", "tcp", "pdl", PRINTER_DOCUMENT_FORMAT);
+    MDNS.addServiceTxt("pdl-datastream", "tcp", "pdl", PRINTER_FORMAT_LIST_RAW);
     Log.println("[mDNS] printer.local -> RAW 9100 advertised");
   }
   const uint32_t heapAfter = ESP.getFreeHeap();
@@ -268,7 +270,7 @@ h2.sec{font-size:12px;font-weight:750;text-transform:uppercase;letter-spacing:.0
 <h2 class="sec" style="margin:18px 0 6px">How to print</h2>
 <div class="row"><span class="k">IPP printer URL</span><span class="vcode" id="chipIpp">--</span></div>
 <div class="row"><span class="k">RAW (JetDirect)</span><span class="vcode" id="chipRaw">--</span></div>
-<div class="hint">Add the printer in Windows as an <b>IPP device</b> using the URL above, or create a <b>Standard TCP/IP port</b> for the RAW address. Use an HP Smart Tank 520_540 driver &mdash; PCL3GUI output only.</div>
+<div class="hint">Add the printer in Windows as an <b>IPP device</b> using the URL above, or create a <b>Standard TCP/IP port</b> for the RAW address. Use an HP Smart Tank 520 driver &mdash; PCL3GUI output only.</div>
 </div>
 </div></section>
 <section id="wifi"><h2 class="sec">Wi-Fi settings</h2><div class="panel">
@@ -383,8 +385,9 @@ void serviceWifi() {
 
   if (status != WL_CONNECTED && !config.ssid.isEmpty() && millis() - lastWifiAttemptMs >= 30000UL) {
     lastWifiAttemptMs = millis();
-    Log.printf("[WiFi] Retrying saved network %s\n", config.ssid.c_str());
-    WiFi.reconnect();
+    Log.printf("[WiFi] Retrying saved network %s (status=%d)\n", config.ssid.c_str(), status);
+    WiFi.disconnect(false, false);
+    WiFi.begin(config.ssid.c_str(), config.password.c_str());
   }
   lastWifiStatus = status;
 }
@@ -411,6 +414,19 @@ void startWatchdog() {
   Log.printf("[WDT] Task watchdog armed (%lu s)\n", (unsigned long)(WDT_TIMEOUT_SEC));
 }
 
+static const char *wifiReasonText(uint8_t reason) {
+  switch (reason) {
+    case 2: return "AUTH_EXPIRE";
+    case 15: return "AUTH_EXPIRE (glitch: both wrong password and this produce this code)";
+    case 201: return "NO_AP_FOUND (SSID not heard: hidden network missed, 5 GHz-only router, or name typo)";
+    case 202: return "AUTH_FAIL (check password)";
+    case 203: return "ASSOC_FAIL (AP refused the association; router-side problem or it is busy)";
+    case 204: return "HANDSHAKE_TIMEOUT (typical for a wrong password)";
+    case 200: return "BEACON_TIMEOUT (weak signal)";
+    default: return "OTHER";
+  }
+}
+
 void setup() {
   Log.begin(115200); delay(500); Log.println(); SystemDiagnostics::logBoot(); Log.println("=== ESP32-S3 HP Print Server ===");
   loadBootCount();
@@ -430,12 +446,20 @@ void setup() {
   loadConfig(); 
   bool wifiOk = false;
   if (!config.ssid.isEmpty()) {
-    WiFi.mode(WIFI_STA); 
-    WiFi.setSleep(false); 
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    // The core's internal auto-reconnect retries association at full speed and
+    // floods the log on ASSOC_FAIL; our serviceWifi() retry loop handles it with
+    // a 30 s backoff instead.
+    WiFi.setAutoReconnect(false);
     WiFi.setHostname("printer");
+    WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
+      Log.printf("[WiFi] STA disconnected: reason=%d (%s)\n", info.wifi_sta_disconnected.reason, wifiReasonText(info.wifi_sta_disconnected.reason));
+    }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
     Log.printf("[WiFi] Connecting to %s (DHCP)\n", config.ssid.c_str());
-    const unsigned long started = millis(); 
-    while (WiFi.status() != WL_CONNECTED && millis() - started < 20000UL) { delay(250); Log.print('.'); } 
+    WiFi.begin(config.ssid.c_str(), config.password.c_str());
+    const unsigned long started = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - started < 20000UL) { delay(250); Log.print('.'); }
     Log.println();
     if (WiFi.status() == WL_CONNECTED) { wifiOk = true; Log.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str()); }
   }

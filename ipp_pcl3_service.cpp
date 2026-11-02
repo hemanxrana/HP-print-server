@@ -209,8 +209,10 @@ struct BodyReader {
 
 bool supportedDocumentFormat(const String &format) {
   // IPP mimeMediaType values are case-insensitive.  Android commonly sends
-  // application/vnd.hp-pcl while older clients may use application/vnd.hp-PCL.
-  return format.equalsIgnoreCase(PCL3_MIME);
+  // application/vnd.hp-pcl while older clients may use application/vnd.hp-PCL;
+  // octet-stream means "raw" and is piped straight to the printer as well.
+  if (format.equalsIgnoreCase(PCL3_MIME)) return true;
+  return format.equalsIgnoreCase("application/octet-stream");
 }
 
 struct IppWriter {
@@ -282,6 +284,7 @@ void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32
   w.str(0x44,"ipp-versions-supported","1.1"); w.str(0x44,nullptr,"2.0");
   w.integer(0x23,"operations-supported",0x0002); w.integer(0x23,nullptr,0x0004); w.integer(0x23,nullptr,0x0009); w.integer(0x23,nullptr,0x000A); w.integer(0x23,nullptr,0x000B);
   w.str(0x49,"document-format-supported",PCL3_MIME);
+  w.str(0x49,nullptr,"application/octet-stream");
   w.str(0x49,"document-format-default",PCL3_MIME);
   w.str(0x41,"document-format-version-supported",PRINTER_DOCUMENT_VERSION);
   w.boolean("color-supported",true);

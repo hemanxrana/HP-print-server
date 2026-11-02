@@ -111,6 +111,7 @@ String activeIp() { if (WiFi.status() == WL_CONNECTED) return WiFi.localIP().toS
 
 static int lastWifiStatus = -1;
 static unsigned long lastWifiAttemptMs = 0;
+static unsigned long lastDisconnectMs = 0;
 
 void sendJsonScan() { const int n = WiFi.scanNetworks(false, true); String out = "["; bool first = true; for (int i = 0; i < n; ++i) { String ssid = WiFi.SSID(i); if (ssid.isEmpty()) continue; if (!first) out += ","; first = false; out += String("{\"ssid\":\"") + jsonEsc(ssid) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + ",\"channel\":" + String(WiFi.channel(i)) + "}"; } out += "]"; WiFi.scanDelete(); configServer.send(200, "application/json", out); }
 
@@ -384,10 +385,20 @@ void serviceWifi() {
   }
 
   if (status != WL_CONNECTED && !config.ssid.isEmpty() && millis() - lastWifiAttemptMs >= 30000UL) {
-    lastWifiAttemptMs = millis();
-    Log.printf("[WiFi] Retrying saved network %s (status=%d)\n", config.ssid.c_str(), status);
-    WiFi.disconnect(false, false);
-    WiFi.begin(config.ssid.c_str(), config.password.c_str());
+    const unsigned long now = millis();
+    const unsigned long timeSinceDisconnect = now - lastDisconnectMs;
+    // If WiFi disconnected recently (less than 10s ago), wait longer before retrying
+    if (timeSinceDisconnect < 10000UL) {
+      lastWifiAttemptMs = now + 10000UL - timeSinceDisconnect; // Adjust retry timer
+      Log.printf("[WiFi] Waiting for %lus after disconnect before retrying; next attempt at %lums\n",
+                 10000UL - timeSinceDisconnect,
+                 lastWifiAttemptMs);
+    } else {
+      lastWifiAttemptMs = now;
+      Log.printf("[WiFi] Retrying saved network %s (status=%d)\n", config.ssid.c_str(), status);
+      WiFi.disconnect(false, false);
+      WiFi.begin(config.ssid.c_str(), config.password.c_str());
+    }
   }
   lastWifiStatus = status;
 }
@@ -465,6 +476,7 @@ void setup() {
   }
   if (!wifiOk) { startConfigAP(); }
   lastWifiStatus = (int)WiFi.status();
+  lastWifiAttemptMs = 0; // Initialize retry timer
   if (WiFi.status() == WL_CONNECTED) {
     startRawDiscovery();
     usbPrinterBackend.restartRawListener();

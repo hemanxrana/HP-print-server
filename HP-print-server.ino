@@ -6,6 +6,7 @@
 #include <ESPmDNS.h>
 #include "usb_printer_backend.h"
 #include "ipp_pcl3_service.h"
+#include "ipp_icon.h"
 #include "system_diagnostics.h"
 #include <esp_heap_caps.h>
 #include "esp_task_wdt.h"
@@ -438,6 +439,11 @@ static const char *wifiReasonText(uint8_t reason) {
   }
 }
 
+void handleIcon() {
+  configServer.sendHeader("Cache-Control", "max-age=86400");
+  configServer.send_P(200, "image/png", (PGM_P)PRINTER_ICON_PNG, PRINTER_ICON_PNG_LEN);
+}
+
 void setup() {
   Log.begin(115200); delay(500); Log.println(); SystemDiagnostics::logBoot(); Log.println("=== ESP32-S3 HP Print Server ===");
   loadBootCount();
@@ -486,6 +492,9 @@ void setup() {
   configServer.on("/", HTTP_GET, handleRoot);
   configServer.on("/scan.json", HTTP_GET, sendJsonScan);
   configServer.on("/status.json", HTTP_GET, sendJsonStatus);
+  configServer.on("/icon-48.png", HTTP_GET, handleIcon);
+  configServer.on("/icon-128.png", HTTP_GET, handleIcon);
+  configServer.on("/icon-512.png", HTTP_GET, handleIcon);
   configServer.on("/save", HTTP_POST, handleSave);
   configServer.begin();
   Log.println("[HTTP] Configuration server ready");

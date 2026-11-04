@@ -57,6 +57,8 @@
 // --- IPP Streaming Settings ---
 #define IPP_BODY_BUFFER_SIZE      USB_BUFFER_SIZE   // document streaming buffer
 #define IPP_CLIENT_TIMEOUT_MS     30000             // < WDT (60 s) so a stalled client disconnects
+#define IPP_RESPONSE_MAX          8192              // single IPP response buffer (one client at a time)
+#define IPP_JOB_DEADLINE_MS       600000UL          // hard cap on one document body
 
 // --- Watchdog ---
 #define WDT_TIMEOUT_SEC   60      // Watchdog timeout seconds

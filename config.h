@@ -34,12 +34,25 @@
 #define PRINTER_FORMAT_LIST_IPP  "application/vnd.hp-PCL,application/octet-stream"
 
 // --- USB Bulk Out Settings ---
-#define BULK_OUT_CHUNK_SIZE       (8 * 1024)    // 8KB chunks, no MPS alignment
-#define PSRAM_RING_BUFFER_SIZE    (32 * 1024)   // 32KB ring buffer in PSRAM
+// ESP32-S3 has USB 2.0 Full Speed only (12 Mbps), so ~1 MB/s is the bus ceiling.
+// 16KB transfers amortise per-transfer overhead without wasting internal DMA RAM.
+#define BULK_OUT_CHUNK_SIZE       (16 * 1024)   // transfer size, no MPS alignment
+#define PSRAM_RING_BUFFER_SIZE    (64 * 1024)   // RAW 9100 staging ring in PSRAM
 #define USB_BUFFER_SIZE           PSRAM_RING_BUFFER_SIZE   // Full PSRAM ring buffer
-#define USB_BULK_PIPELINE_DEPTH   2             // outstanding bulk-out transfers
-#define POST_JOB_MIN_GUARD_MS   5000
+#define USB_BULK_PIPELINE_DEPTH   3             // outstanding bulk-out transfers
+// Post-job settle: the printer reports "selected" while its own buffer drains,
+// so a short guard is enough. The long outer bound still covers slow prints.
+#define POST_JOB_MIN_GUARD_MS   1500
 #define POST_JOB_STATUS_WAIT_MAX_MS 10000
+
+// --- USB Streaming Writer ---
+// A dedicated task feeds usb_host_transfer_submit() so printer backpressure
+// cannot stall the Arduino loop (HTTP/mDNS/status).
+#define USB_STREAM_BUFFER_SIZE    (64 * 1024)   // PSRAM staging ring
+#define USB_STREAM_TASK_STACK     6144          // bytes (ESP-IDF semantics)
+#define USB_STREAM_TASK_PRIORITY  5
+#define USB_STREAM_TASK_CORE      0
+#define USB_STREAM_PUSH_TIMEOUT_MS 30000        // matches RAW_USB_TIMEOUT_MS
 
 // --- IPP Streaming Settings ---
 #define IPP_BODY_BUFFER_SIZE      USB_BUFFER_SIZE   // document streaming buffer

@@ -19,13 +19,16 @@ static constexpr uint8_t USB_ENDPOINT_XFER_BULK_CODE = 0x02;
 static constexpr uint8_t USB_PRINTER_GET_PORT_STATUS = 0x01;
 static constexpr uint8_t USB_PRINTER_STATUS_REQUEST_TYPE = 0xA1;
 static constexpr int MAX_ALREADY_CONNECTED_DEVICES = 8;
-static constexpr uint32_t STATUS_POLL_INTERVAL_MS = 1000;
+// 250 ms keeps post-job "fresh status" waits short without hammering the
+// printer control endpoint (4 GET_PORT_STATUS/s while attached).
+static constexpr uint32_t STATUS_POLL_INTERVAL_MS = 250;
 static constexpr uint32_t STATUS_TRANSFER_TIMEOUT_MS = 1000;
-// 8KB persistent Bulk OUT buffer (no MPS alignment — host driver splits into packets)
-static constexpr size_t BULK_OUT_BUFFER_SIZE = 8192;
+// Persistent Bulk OUT buffer size comes from config.h so the chunk size and the
+// transfer buffer can never drift apart (a mismatch rejects every chunk).
+static constexpr size_t BULK_OUT_BUFFER_SIZE = BULK_OUT_CHUNK_SIZE;
 
 // Pipelined Bulk OUT: up to USB_BULK_PIPELINE_DEPTH transfers are submitted
-// ahead so the USB bus never idles between 8KB chunks.
+// ahead so the USB bus never idles between chunks.
 struct BulkOutSlot {
   usb_transfer_t *transfer = nullptr;
   SemaphoreHandle_t done = nullptr;
@@ -665,7 +668,7 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
   BulkOutSlot &prev = g.bulkOut[previous];
 
   // Reap the previous in-flight transfer here, AFTER submitting the next one,
-  // so two 8KB chunks are always in flight back-to-back on the bus.
+  // so multiple chunks are always in flight back-to-back on the bus.
   if (prev.inFlight && !waitSlotDone(prev, prev.transfer, timeoutMs, "pipelined", error)) {
     prev.inFlight = false;
     if (g.bulkOutWedged) { g.bulkOutNext = mine; return false; }
@@ -700,6 +703,32 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
   // The submission is the acceptance point: bytes handed to the USB host
   // driver are transmitted even if this call detects a failed predecessor.
   accepted = length;
+  return true;
+}
+
+bool UsbHostManager::bulkWriteAll(const uint8_t *data, size_t length,
+                                  uint32_t timeoutMs, String &error) {
+  if (!data || !length) return true;
+  size_t offset = 0;
+  int retries = 0;
+  while (offset < length) {
+    const size_t part = min(static_cast<size_t>(BULK_OUT_BUFFER_SIZE), length - offset);
+    size_t accepted = 0;
+    esp_task_wdt_reset();
+    if (!bulkWrite(data + offset, part, accepted, timeoutMs, error)) {
+      if (accepted > 0) {
+        offset += accepted;
+        retries = 0;
+        continue;
+      }
+      if (++retries > 3) return false;
+      delay(50);
+      continue;
+    }
+    offset += accepted;
+    retries = 0;
+    yield();
+  }
   return true;
 }
 

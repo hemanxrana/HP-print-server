@@ -25,6 +25,10 @@ public:
 
   bool bulkWrite(const uint8_t *data, size_t length, size_t &accepted,
                  uint32_t timeoutMs, String &error);
+  // Queue-and-wait helper: retries transient failures and splits the payload
+  // into BULK_OUT_CHUNK_SIZE transfers. Returns true only when every byte was
+  // accepted by the USB host driver.
+  bool bulkWriteAll(const uint8_t *data, size_t length, uint32_t timeoutMs, String &error);
   bool waitForBulkOut(uint32_t timeoutMs, String &error);
 
   bool portStatusValid() const { return device_.portStatus.valid; }

@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include "usb_host_manager.h"
+#include "usb_stream.h"
 
 class UsbPrinterBackend {
 public:
@@ -37,9 +38,11 @@ private:
   void completeDrainIfReady();
 
   UsbHostManager &host_;
+  UsbStream stream_;
   PrinterState state_ = OFFLINE;
   String reason_ = "usb-host-not-initialized";
   uint64_t jobBytes_ = 0;
+  unsigned long jobStartedMs_ = 0;
   uint64_t nextHealthLogAt_ = 512ULL * 1024ULL;
   uint32_t jobsCompleted_ = 0;
   uint32_t jobsFailed_ = 0;

@@ -153,9 +153,11 @@ bool statusSaysReady(const UsbPrinterBackend &backend) {
          !backend.usbStatusError();
 }
 
-void logTransportHealth(uint64_t bytes) {
-  Log.printf("[PRINT][HEALTH] bytes=%llu free-heap=%lu min-free-heap=%lu largest-block=%u loop-stack-watermark=%u words\n",
-                (unsigned long long)bytes,
+void logTransportHealth(uint64_t bytes, uint32_t elapsedMs) {
+  const double kb = bytes / 1024.0;
+  const double rate = elapsedMs ? (kb * 1000.0 / elapsedMs) : 0.0;
+  Log.printf("[PRINT][RATE] bytes=%llu elapsed=%lu ms avg=%.1f KB/s free-heap=%lu min-free-heap=%lu largest-block=%u loop-stack-watermark=%u words\n",
+                (unsigned long long)bytes, (unsigned long)elapsedMs, rate,
                 (unsigned long)ESP.getFreeHeap(),
                 (unsigned long)ESP.getMinFreeHeap(),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
@@ -172,32 +174,7 @@ const char *statusReasonText(const UsbPrinterBackend &backend) {
 
 bool sendUsbChunk(UsbHostManager &host, const uint8_t *data, size_t length, String &error) {
   if (!data || !length) return true;
-  size_t offset = 0;
-  int retries = 0;
-  while (offset < length) {
-    const size_t part = min(static_cast<size_t>(RAW_USB_CHUNK), length - offset);
-    size_t accepted = 0;
-    esp_task_wdt_reset();
-    if (!host.bulkWrite(data + offset, part, accepted, RAW_USB_TIMEOUT_MS, error)) {
-      if (accepted > 0) {
-        offset += accepted;
-        retries = 0;
-        continue;
-      }
-      if (++retries > 3) return false;
-      delay(50);
-      continue;
-    }
-    if (accepted != part) {
-      offset += accepted;
-      retries = 0;
-      continue;
-    }
-    offset += part;
-    retries = 0;
-    yield();
-  }
-  return true;
+  return host.bulkWriteAll(data, length, RAW_USB_TIMEOUT_MS, error);
 }
 
 void resetRawTransportState() {
@@ -357,22 +334,34 @@ void handleRawServer(UsbPrinterBackend *backend) {
     const int got = rawClient.read(rawChunk + ringWritePos, firstPart);
     if (got <= 0) break;
 
-    // Scan for PJL EOJ sequence in received data
-    for (int i = 0; i < got; ++i) {
-      if (pjlDetector.feed(rawChunk[(ringWritePos + i) % USB_BUFFER_SIZE])) {
-        Log.printf("[RAW] Job #%lu PJL EOJ detected at byte %llu\n",
-                      (unsigned long)rawActiveJobId,
-                      (unsigned long long)(rawBytesReceived + i + 1));
-        pjlDetector.reset();
-        finishRawConnection(backend, "pjl-eoj-detected");
-        return;
-      }
-    }
-
+    // Publish the bytes we just read before looking for PJL EOJ: the EOJ chunk
+    // is the last part of the job, so dropping it would truncate the page.
+    const uint32_t chunkStart = ringWritePos;
     ringWritePos = (ringWritePos + got) % USB_BUFFER_SIZE;
     ringDataLen += got;
     rawLastDataMs = millis();
     movedData = true;
+
+    // Scan for PJL EOJ sequence in received data. The read above is clamped to
+    // firstPart, so the bytes are contiguous in the ring: index them directly
+    // instead of paying a modulo per byte.
+    bool eojDetected = false;
+    for (int i = 0; i < got; ++i) {
+      if (pjlDetector.feed(rawChunk[chunkStart + i])) { eojDetected = true; break; }
+    }
+
+    if (eojDetected) {
+      Log.printf("[RAW] Job #%lu PJL EOJ detected at byte %llu\n",
+                    (unsigned long)rawActiveJobId,
+                    (unsigned long long)rawBytesReceived);
+      pjlDetector.reset();
+      // Flush what we received (including the EOJ chunk) before finalising,
+      // otherwise the last USB transfers stay queued in the stream ring.
+      if (!drainRingToUsb(backend)) return;
+      finishRawConnection(backend, "pjl-eoj-detected");
+      return;
+    }
+
     esp_task_wdt_reset();
     yield();
   }
@@ -495,6 +484,9 @@ bool UsbPrinterBackend::begin() {
     } else {
       Log.println("[USB] Failed to allocate USB buffer!");
     }
+  }
+  if (!stream_.begin(host_)) {
+    Log.println("[USB] Dedicated stream writer unavailable; USB writes stay on the loop task");
   }
   return true;
 }
@@ -650,15 +642,24 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
 
   if (state_ == IDLE) {
     jobBytes_ = 0;
+    jobStartedMs_ = millis();
     nextHealthLogAt_ = HEALTH_LOG_INTERVAL_BYTES;
     drainPending_ = false;
+    stream_.reset();
   }
   state_ = PRINTING;
   for (int retry = 0; retry < 3; retry++) {
-    if (sendUsbChunk(host_, data, length, error)) {
+    bool queued;
+    if (stream_.ready()) {
+      queued = stream_.push(data, length, USB_STREAM_PUSH_TIMEOUT_MS);
+      if (!queued && !stream_.failed(error)) error = "USB stream rejected print data";
+    } else {
+      queued = sendUsbChunk(host_, data, length, error);
+    }
+    if (queued) {
       jobBytes_ += length;
       if (jobBytes_ >= nextHealthLogAt_) {
-        logTransportHealth(jobBytes_);
+        logTransportHealth(jobBytes_, (uint32_t)(millis() - jobStartedMs_));
         while (nextHealthLogAt_ <= jobBytes_) nextHealthLogAt_ += HEALTH_LOG_INTERVAL_BYTES;
       }
       reason_ = "raw-job-in-progress";
@@ -673,12 +674,20 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
 void UsbPrinterBackend::finishRawJob() {
   if (state_ != PRINTING || drainPending_) return;
   String flushError;
-  if (!host_.waitForBulkOut(RAW_USB_TIMEOUT_MS, flushError)) {
+  const bool flushed = stream_.ready()
+                           ? stream_.flush(RAW_USB_TIMEOUT_MS, flushError)
+                           : host_.waitForBulkOut(RAW_USB_TIMEOUT_MS, flushError);
+  if (!flushed) {
     Log.printf("[PRINT][FINALIZE] bulk-out drain failed after %u job bytes: %s\n",
                (unsigned)jobBytes_, flushError.c_str());
     abortRawJob(flushError);
     return;
   }
+  const uint32_t handoffMs = (uint32_t)(millis() - jobStartedMs_);
+  const double kb = jobBytes_ / 1024.0;
+  Log.printf("[PRINT][RATE] USB hand-off: %llu bytes in %lu ms (%.1f KB/s)\n",
+             (unsigned long long)jobBytes_, (unsigned long)handoffMs,
+             handoffMs ? (kb * 1000.0 / handoffMs) : 0.0);
   drainPending_ = true;
   drainStartedMs_ = millis();
   drainNextLogMs_ = drainStartedMs_;

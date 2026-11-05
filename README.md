@@ -60,6 +60,13 @@ The AirPrint `_universal` subtype is deliberately **not** advertised: a
 print. The Android HP Print Service Plugin browses plain `_ipp._tcp` and
 vendor-checks the `device-id` TXT, which is fully covered.
 
+NetPrinter (and some other Android apps) display only the single PDL they
+auto-select for a discovered printer, not the full `pdl` list. Its
+preference order puts PCLm above PCL 3 GUI, so while
+`PRINTER_PCLM_PASSTHROUGH` is enabled the discovery card shows `PCLm` even
+though both formats are advertised. The format is only a hint: edit the
+saved printer and choose `PCL 3 GUI` when you need the native path.
+
 ## Configuration
 
 `config.h` holds all compile-time constants (ports, mDNS hostname, emulated

@@ -258,6 +258,11 @@ bool supportedDocumentFormat(const String &format) {
   // application/vnd.hp-pcl while older clients may use application/vnd.hp-PCL;
   // octet-stream means "raw" and is piped straight to the printer as well.
   if (format.equalsIgnoreCase(PCL3_MIME)) return true;
+#if PRINTER_PCLM_PASSTHROUGH
+  // PCLm is a host-rasterised PDF subset; we forward it unchanged and let the
+  // downstream printer decide whether it can interpret it.
+  if (format.equalsIgnoreCase(PRINTER_PCLM_MIME)) return true;
+#endif
   return format.equalsIgnoreCase("application/octet-stream");
 }
 
@@ -455,6 +460,9 @@ void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32
   w.str(0x48,"natural-language-configured","en");
   w.str(0x48,"generated-natural-language-supported","en");
   w.str(0x49,"document-format-supported",PCL3_MIME);
+#if PRINTER_PCLM_PASSTHROUGH
+  w.str(0x49,nullptr,PRINTER_PCLM_MIME);
+#endif
   w.str(0x49,nullptr,"application/octet-stream");
   w.str(0x49,"document-format-default",PCL3_MIME);
 
@@ -536,7 +544,42 @@ void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32
   }
 
   // --- job template ------------------------------------------------------
-  if (f.want("document-format-version-supported",true)) w.str(0x41,"document-format-version-supported",PRINTER_DOCUMENT_VERSION);
+  // HP reports one text value per personality (7 on the 6830), not a single
+  // comma-joined string.  List only the formats we accept.
+  if (f.want("document-format-version-supported",true)) {
+    w.str(0x41,"document-format-version-supported","PCL3GUI");
+    w.str(0x41,nullptr,"PCL3");
+    w.str(0x41,nullptr,"PJL");
+    w.str(0x41,nullptr,"Automatic");
+#if PRINTER_PCLM_PASSTHROUGH
+    w.str(0x41,nullptr,"PCLM");
+#endif
+  }
+
+#if PRINTER_PCLM_PASSTHROUGH
+  // PCLm generation parameters, mirrored from a real HP device.  These tell
+  // the host rasteriser which subset the downstream printer can consume:
+  // RLE-compressed strips of 32 rows, 300/600 dpi source, rotated back side.
+  if (f.want("pclm-compression-method-preferred",true)) {
+    w.str(0x44,"pclm-compression-method-preferred","rle");
+  }
+  if (f.want("pclm-source-resolution-supported",true)) {
+    w.resolution("pclm-source-resolution-supported",300);
+    w.resolution(nullptr,600);
+  }
+  if (f.want("pclm-source-resolution-default",true)) {
+    w.resolution("pclm-source-resolution-default",600);
+  }
+  if (f.want("pclm-strip-height-supported",true)) {
+    w.integer(0x21,"pclm-strip-height-supported",32);
+  }
+  if (f.want("pclm-strip-height-preferred",true)) {
+    w.integer(0x21,"pclm-strip-height-preferred",32);
+  }
+  if (f.want("pclm-raster-back-side",true)) {
+    w.str(0x44,"pclm-raster-back-side","rotated");
+  }
+#endif
 
   if (f.want("printer-resolution-supported",true)) {
     w.resolution("printer-resolution-supported",300);

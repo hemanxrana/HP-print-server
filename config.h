@@ -25,13 +25,32 @@
 #define PRINTER_MAKE_MODEL     "HP Smart Tank 520"
 // Model string matters: print apps like NetPrinter match it against a device
 // database (entry "Smart Tank 2xx/5xx"), so keep suffixes off the model name.
+
+// PCLm passthrough is a temporary experiment: the HP plugin can rasterise
+// PCLm on the host, and HP's own firmware accepts it, but we do not know yet
+// whether the Smart Tank accepts PCLm over its USB transport.  We only forward
+// the IPP body verbatim, exactly like PCL3GUI.  Set to 0 to go back to PCL only.
+#define PRINTER_PCLM_PASSTHROUGH 1
+#define PRINTER_PCLM_MIME        "application/PCLm"  // casing from a real HP dump
+// MIME types are case-insensitive; the printer-device-id CMD token is the
+// HP-specific capability hint a print app is most likely to key on.
+#if PRINTER_PCLM_PASSTHROUGH
+#define PRINTER_DEVICE_ID      "MFG:HP;MDL:Smart Tank 520;CMD:PCL3GUI,PCLM;CLS:PRINTER;STATUS;"
+#define PRINTER_DOCUMENT_VERSION "PCL3GUI,PCL3,PJL,Automatic,PCLM"
+#define PRINTER_FORMAT_LIST_IPP  "application/vnd.hp-PCL,application/PCLm,application/octet-stream"
+#else
 #define PRINTER_DEVICE_ID      "MFG:HP;MDL:Smart Tank 520;CMD:PCL3GUI;CLS:PRINTER;STATUS;"
+#define PRINTER_DOCUMENT_VERSION "PCL3GUI,PCL3,PJL,Automatic"
+#define PRINTER_FORMAT_LIST_IPP  "application/vnd.hp-PCL,application/octet-stream"
+#endif
 #define PRINTER_DOCUMENT_FORMAT  "application/vnd.hp-PCL"
-#define PRINTER_DOCUMENT_VERSION "PCL3GUI"
 // Capability lists advertised via Bonjour TXT records and IPP attributes.
 // RAW queues display PCL3GUI explicitly so HP print apps show the dialect.
+#if PRINTER_PCLM_PASSTHROUGH
+#define PRINTER_FORMAT_LIST_RAW  "application/vnd.hp-PCL,application/PCLm,application/octet-stream,PCL3GUI"
+#else
 #define PRINTER_FORMAT_LIST_RAW  "application/vnd.hp-PCL,application/octet-stream,PCL3GUI"
-#define PRINTER_FORMAT_LIST_IPP  "application/vnd.hp-PCL,application/octet-stream"
+#endif
 
 // --- USB Bulk Out Settings ---
 // ESP32-S3 has USB 2.0 Full Speed only (12 Mbps), so ~1 MB/s is the bus ceiling.

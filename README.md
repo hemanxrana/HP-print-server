@@ -25,9 +25,14 @@ HP printer (PCL3GUI via CMD: in the 1284.4 device-id)
 ```
 
 - No document conversion, no spool, no PJL/UEL/form-feed injection by default.
-- IPP accepts only `application/vnd.hp-pcl` (case-insensitive); any other
-  `document-format` is rejected with IPP status `0x040A` so the client is told
-  clearly and quickly that the printer cannot process it.
+- IPP accepts `application/vnd.hp-pcl` (case-insensitive) and, while
+  `PRINTER_PCLM_PASSTHROUGH` is enabled, `application/PCLm`; both are forwarded
+  to USB unchanged. Any other `document-format` is rejected with IPP status
+  `0x040A` so the client is told clearly and quickly.
+- PCLm support is a **temporary experiment**: the host rasterises PCLm and HP
+  firmware consumes it, but whether this printer accepts PCLm over USB is
+  unproven. Set `PRINTER_PCLM_PASSTHROUGH 0` in `config.h` to withdraw the
+  claim without touching the service logic.
 - Emulated printer identity lives in `config.h` as the single source of truth
   (`PRINTER_INSTANCE_NAME`, `PRINTER_MAKE_MODEL`, `PRINTER_DEVICE_ID`,
   `PRINTER_DOCUMENT_FORMAT`) and is mirrored into both mDNS TXT records and
@@ -39,8 +44,8 @@ When Wi-Fi is up the device advertises `printer.local` with two services:
 
 | service | port | TXT records |
 |---|---|---|
-| `_ipp._tcp` | 631 | `rp=ipp/print`, `txtvers=1`, `qtotal=1`, `device-id` (MFG/MDL/`CMD:PCL3GUI` 1284.4 string), `pdl=application/vnd.hp-PCL`, `product`, `ty`, `Color=T`, `Duplex=F`, `note`, `UUID`, `priority=0`, `air=none`, `adminurl=http://<ip>/` |
-| `_pdl-datastream._tcp` | 9100 | `pdl=application/vnd.hp-PCL` |
+| `_ipp._tcp` | 631 | `rp=ipp/print`, `txtvers=1`, `qtotal=1`, `device-id` (MFG/MDL/`CMD:PCL3GUI[,PCLM]` 1284.4 string), `pdl=application/vnd.hp-PCL[,application/PCLm]`, `product`, `ty`, `Color=T`, `Duplex=F`, `note`, `UUID`, `priority=0`, `air=none`, `adminurl=http://<ip>/` |
+| `_pdl-datastream._tcp` | 9100 | `pdl=application/vnd.hp-PCL[,application/PCLm]` |
 
 The AirPrint `_universal` subtype is deliberately **not** advertised: a
 `URF`/universal claim would advertise a raster format this bridge cannot

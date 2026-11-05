@@ -37,6 +37,14 @@ HP printer (PCL3GUI via CMD: in the 1284.4 device-id)
   (`PRINTER_INSTANCE_NAME`, `PRINTER_MAKE_MODEL`, `PRINTER_DEVICE_ID`,
   `PRINTER_DOCUMENT_FORMAT`) and is mirrored into both mDNS TXT records and
   the IPP `Get-Printer-Attributes` response.
+- The physical printer is a Smart Tank 520/540 class device, so the IPP
+  capability set mirrors it: colour and monochrome, **borderless** up to
+  A4/Letter (`media-*-margin-supported` includes 0), and **manual**
+  two-sided printing (`sides-supported` plus `manual-duplex-supported`).
+  There is no duplexer, so two-sided means the client's driver prints the
+  second side after the user flips the sheet; the bridge only forwards PCL.
+  Set `PRINTER_BORDERLESS` or `PRINTER_DUPLEX` to 0 in `config.h` to hide
+  either claim.
 
 ## Discovery (mDNS / Bonjour)
 
@@ -44,7 +52,7 @@ When Wi-Fi is up the device advertises `printer.local` with two services:
 
 | service | port | TXT records |
 |---|---|---|
-| `_ipp._tcp` | 631 | `rp=ipp/print`, `txtvers=1`, `qtotal=1`, `device-id` (MFG/MDL/`CMD:PCL3GUI[,PCLM]` 1284.4 string), `pdl=application/vnd.hp-PCL[,application/PCLm]`, `product`, `ty`, `Color=T`, `Duplex=F`, `note`, `UUID`, `priority=0`, `air=none`, `adminurl=http://<ip>/` |
+| `_ipp._tcp` | 631 | `rp=ipp/print`, `txtvers=1`, `qtotal=1`, `device-id` (MFG/MDL/`CMD:PCL3GUI[,PCLM]` 1284.4 string), `pdl=application/vnd.hp-PCL[,application/PCLm]`, `product`, `ty`, `Color=T`, `Duplex=T[,F]`, `note`, `UUID`, `priority=0`, `air=none`, `adminurl=http://<ip>/` |
 | `_pdl-datastream._tcp` | 9100 | `pdl=application/vnd.hp-PCL[,application/PCLm]` |
 
 The AirPrint `_universal` subtype is deliberately **not** advertised: a

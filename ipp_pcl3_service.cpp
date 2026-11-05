@@ -332,19 +332,21 @@ struct RequestAttrs {
   bool hasLastDocument = false;
   bool lastDocument = true;
   String jobName;
-  static constexpr uint8_t MAX_REQUESTED = 24;
+  // The HP plugin asks for ~68 attributes in one Get-Printer-Attributes
+  // request.  The old 24-entry cap silently dropped everything after the
+  // first block, which hid sides, margins, print-scaling and colour.
+  static constexpr uint8_t MAX_REQUESTED = 96;
   String requested[MAX_REQUESTED];
   uint8_t requestedCount = 0;
 };
 
 struct AttrFilter {
+  const RequestAttrs *req = nullptr;
   bool all = true;
   bool description = false;
   bool jobTemplate = false;
-  String names[24];
-  uint8_t count = 0;
 
-  explicit AttrFilter(const RequestAttrs &r) {
+  explicit AttrFilter(const RequestAttrs &r) : req(&r) {
     if (r.requestedCount == 0) return;
     all = false;
     for (uint8_t i = 0; i < r.requestedCount; ++i) {
@@ -355,13 +357,15 @@ struct AttrFilter {
       // document-description only carries document-format-* here, which are
       // also printer-description attributes; treat it as the same group.
       if (v.equalsIgnoreCase("document-description")) { description = true; continue; }
-      if (count < 24) names[count++] = v;
     }
   }
 
   bool want(const char *name, bool tmpl = false) const {
     if (all) return true;
-    for (uint8_t i = 0; i < count; ++i) if (names[i].equalsIgnoreCase(name)) return true;
+    if (req) {
+      for (uint8_t i = 0; i < req->requestedCount; ++i)
+        if (req->requested[i].equalsIgnoreCase(name)) return true;
+    }
     return tmpl ? jobTemplate : description;
   }
 };
@@ -406,6 +410,28 @@ void sendJobResponse(WiFiClient &client,uint8_t major,uint8_t minor,uint16_t sta
 }
 
 // --- media collections ---------------------------------------------------
+struct MediaDef {
+  const char *name;
+  int32_t x;
+  int32_t y;
+  bool borderless;
+  bool ready;
+  const char *type;
+};
+
+// Sizes from the Smart Tank 520/540 data sheet.  Borderless is supported up
+// to A4/Letter and on 10x15 cm photo paper.
+static const MediaDef MEDIA_DEFS[] = {
+  {"iso_a4_210x297mm",         21000, 29700, true,  true,  "stationery"},
+  {"na_letter_8.5x11in",       21590, 27940, true,  true,  "stationery"},
+  {"om_small-photo_100x150mm", 10000, 15000, true,  false, "photographic"},
+  {"iso_a6_105x148mm",         10500, 14800, false, false, "stationery"},
+  {"jis_b5_182x257mm",         18200, 25700, false, false, "stationery"},
+  {"na_legal_8.5x14in",        21590, 35560, false, false, "stationery"},
+  {"iso_dl_110x220mm",         11000, 22000, false, false, "stationery"},
+};
+static const size_t MEDIA_COUNT = sizeof(MEDIA_DEFS) / sizeof(MEDIA_DEFS[0]);
+
 void writeMediaSize(IppWriter &w,const char *attrName,int32_t x,int32_t y){
   w.begCollection(attrName);
   w.memberName("x-dimension"); w.integer(0x21,nullptr,x);
@@ -413,23 +439,23 @@ void writeMediaSize(IppWriter &w,const char *attrName,int32_t x,int32_t y){
   w.endCollection();
 }
 
-void writeMediaCol(IppWriter &w,const char *attrName,const char *sizeName,
-                   int32_t x,int32_t y,bool withMargins){
+// margin is in hundredths of a millimetre; a negative value omits the margin
+// members entirely (used by media-col-ready, like HP does).
+void writeMediaCol(IppWriter &w,const char *attrName,const MediaDef &media,int32_t margin){
   w.begCollection(attrName);
   w.memberName("media-size");
   w.begCollection(nullptr);
-  w.memberName("x-dimension"); w.integer(0x21,nullptr,x);
-  w.memberName("y-dimension"); w.integer(0x21,nullptr,y);
+  w.memberName("x-dimension"); w.integer(0x21,nullptr,media.x);
+  w.memberName("y-dimension"); w.integer(0x21,nullptr,media.y);
   w.endCollection();
-  w.memberName("media-size-name"); w.str(0x44,nullptr,sizeName);
-  w.memberName("media-type"); w.str(0x44,nullptr,"stationery");
+  w.memberName("media-size-name"); w.str(0x44,nullptr,media.name);
+  w.memberName("media-type"); w.str(0x44,nullptr,media.type);
   w.memberName("media-source"); w.str(0x44,nullptr,"main");
-  if(withMargins){
-    // Hundredths of a millimetre; 423 = 4.23 mm non-printable edge on A4.
-    w.memberName("media-left-margin");   w.integer(0x21,nullptr,423);
-    w.memberName("media-right-margin");  w.integer(0x21,nullptr,423);
-    w.memberName("media-top-margin");    w.integer(0x21,nullptr,423);
-    w.memberName("media-bottom-margin"); w.integer(0x21,nullptr,423);
+  if(margin>=0){
+    w.memberName("media-left-margin");   w.integer(0x21,nullptr,margin);
+    w.memberName("media-right-margin");  w.integer(0x21,nullptr,margin);
+    w.memberName("media-top-margin");    w.integer(0x21,nullptr,margin);
+    w.memberName("media-bottom-margin"); w.integer(0x21,nullptr,margin);
   }
   w.endCollection();
 }
@@ -479,6 +505,8 @@ void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32
   if (f.want("printer-device-id")) w.str(0x41,"printer-device-id",PRINTER_DEVICE_ID);
   if (f.want("printer-kind")) {
     w.str(0x44,"printer-kind","document");
+    w.str(0x44,nullptr,"envelope");
+    w.str(0x44,nullptr,"photo");
   }
   if (f.want("printer-icons")) {
     const String icons = httpBaseUri();
@@ -541,6 +569,14 @@ void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32
     w.str(0x44,nullptr,"document-format");
     w.str(0x44,nullptr,"document-name");
     w.str(0x44,nullptr,"ipp-attribute-fidelity");
+    w.str(0x44,nullptr,"sides");
+    w.str(0x44,nullptr,"media");
+    w.str(0x44,nullptr,"media-col");
+    w.str(0x44,nullptr,"print-quality");
+    w.str(0x44,nullptr,"printer-resolution");
+    w.str(0x44,nullptr,"orientation-requested");
+    w.str(0x44,nullptr,"print-color-mode");
+    w.str(0x44,nullptr,"print-scaling");
   }
 
   // --- job template ------------------------------------------------------
@@ -595,34 +631,91 @@ void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32
   if (f.want("print-quality-default",true)) w.integer(0x23,"print-quality-default",4);
 
   if (f.want("media-supported",true)) {
-    w.str(0x44,"media-supported","iso_a4_210x297mm");
-    w.str(0x44,nullptr,"na_letter_8.5x11in");
+    for(size_t i=0;i<MEDIA_COUNT;++i)
+      w.str(0x44,i?"media-supported":nullptr,MEDIA_DEFS[i].name);
   }
   if (f.want("media-default",true)) w.str(0x44,"media-default","iso_a4_210x297mm");
   if (f.want("media-ready",true)) {
-    w.str(0x44,"media-ready","iso_a4_210x297mm");
-    w.str(0x44,nullptr,"na_letter_8.5x11in");
+    bool first=true;
+    for(size_t i=0;i<MEDIA_COUNT;++i){
+      if(!MEDIA_DEFS[i].ready) continue;
+      w.str(0x44,first?"media-ready":nullptr,MEDIA_DEFS[i].name);
+      first=false;
+    }
   }
   if (f.want("media-size-supported",true)) {
-    writeMediaSize(w,"media-size-supported",21000,29700);
-    writeMediaSize(w,nullptr,21590,27940);
+    for(size_t i=0;i<MEDIA_COUNT;++i)
+      writeMediaSize(w,i?"media-size-supported":nullptr,MEDIA_DEFS[i].x,MEDIA_DEFS[i].y);
   }
   if (f.want("media-col-default",true)) {
-    writeMediaCol(w,"media-col-default","iso_a4_210x297mm",21000,29700,true);
+    writeMediaCol(w,"media-col-default",MEDIA_DEFS[0],PRINTER_PAPER_MARGIN);
   }
   if (f.want("media-col-ready",true)) {
-    writeMediaCol(w,"media-col-ready","iso_a4_210x297mm",21000,29700,false);
-    writeMediaCol(w,nullptr,"na_letter_8.5x11in",21590,27940,false);
+    bool first=true;
+    for(size_t i=0;i<MEDIA_COUNT;++i){
+      if(!MEDIA_DEFS[i].ready) continue;
+      writeMediaCol(w,first?"media-col-ready":nullptr,MEDIA_DEFS[i],-1);
+      first=false;
+    }
   }
   if (f.want("media-col-database",true)) {
-    writeMediaCol(w,"media-col-database","iso_a4_210x297mm",21000,29700,true);
-    writeMediaCol(w,nullptr,"na_letter_8.5x11in",21590,27940,true);
+    bool first=true;
+    for(size_t i=0;i<MEDIA_COUNT;++i){
+      writeMediaCol(w,first?"media-col-database":nullptr,MEDIA_DEFS[i],PRINTER_PAPER_MARGIN);
+      first=false;
+#if PRINTER_BORDERLESS
+      // Borderless is a supported margin value, so list a zero-margin entry
+      // alongside the normal one for media that can print edge to edge.
+      if(MEDIA_DEFS[i].borderless) writeMediaCol(w,nullptr,MEDIA_DEFS[i],0);
+#endif
+    }
   }
   if (f.want("media-source-supported",true)) w.str(0x44,"media-source-supported","main");
-  if (f.want("media-type-supported",true)) w.str(0x44,"media-type-supported","stationery");
+  if (f.want("media-type-supported",true)) {
+    w.str(0x44,"media-type-supported","stationery");
+    w.str(0x44,nullptr,"photographic");
+  }
+  // The HP plugin asks for these four attributes to decide whether the print
+  // dialog may offer borderless output; a zero value is what enables it.
+  {
+    const char *margins[4]={"media-left-margin-supported","media-right-margin-supported",
+                            "media-top-margin-supported","media-bottom-margin-supported"};
+    for(uint8_t i=0;i<4;++i){
+      if(!f.want(margins[i],true)) continue;
+      w.integer(0x21,margins[i],PRINTER_PAPER_MARGIN);
+#if PRINTER_BORDERLESS
+      w.integer(0x21,nullptr,0);
+#endif
+    }
+  }
 
-  if (f.want("sides-supported",true)) w.str(0x44,"sides-supported","one-sided");
+  if (f.want("print-scaling-supported",true)) {
+    w.str(0x44,"print-scaling-supported","auto");
+    w.str(0x44,nullptr,"auto-fit");
+    w.str(0x44,nullptr,"fill");
+    w.str(0x44,nullptr,"fit");
+    w.str(0x44,nullptr,"none");
+  }
+  if (f.want("print-scaling-default",true)) w.str(0x44,"print-scaling-default","auto");
+
+  if (f.want("output-bin-supported",true)) w.str(0x44,"output-bin-supported","face-up");
+  if (f.want("output-bin-default",true)) w.str(0x44,"output-bin-default","face-up");
+
+  if (f.want("sides-supported",true)) {
+    w.str(0x44,"sides-supported","one-sided");
+#if PRINTER_DUPLEX
+    // The 520/540 has no duplexer: HP calls this "manual two-sided".  The
+    // client's driver has to print the second side after the user flips the
+    // sheet; the bridge only forwards PCL.  manual-duplex-supported tells an
+    // HP-aware client which kind of duplex this is.
+    w.str(0x44,nullptr,"two-sided-long-edge");
+    w.str(0x44,nullptr,"two-sided-short-edge");
+#endif
+  }
   if (f.want("sides-default",true)) w.str(0x44,"sides-default","one-sided");
+#if PRINTER_DUPLEX
+  if (f.want("manual-duplex-supported")) w.boolean("manual-duplex-supported",true);
+#endif
 
   if (f.want("copies-supported",true)) w.range("copies-supported",1,1);
   if (f.want("copies-default",true)) w.integer(0x21,"copies-default",1);
@@ -643,8 +736,20 @@ void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32
     w.str(0x44,"print-color-mode-supported","auto");
     w.str(0x44,nullptr,"color");
     w.str(0x44,nullptr,"monochrome");
+    // HP advertises process-monochrome as well; it tells a driver that a
+    // monochrome job still needs the colour pipeline, which is true here
+    // because the client rasterises and we forward the result unchanged.
+    w.str(0x44,nullptr,"process-monochrome");
   }
-  if (f.want("print-color-mode-default",true)) w.str(0x44,"print-color-mode-default","color");
+  // HP's default is auto, not color: the document decides unless the user
+  // explicitly picks monochrome (or a colour document forces colour).
+  if (f.want("print-color-mode-default",true)) w.str(0x44,"print-color-mode-default","auto");
+  if (f.want("output-mode-supported",true)) {
+    w.str(0x44,"output-mode-supported","auto");
+    w.str(0x44,nullptr,"color");
+    w.str(0x44,nullptr,"monochrome");
+  }
+  if (f.want("output-mode-default",true)) w.str(0x44,"output-mode-default","auto");
 
   w.b(0x03);
   if (!w.ok) {

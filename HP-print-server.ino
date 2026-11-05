@@ -83,7 +83,13 @@ void startRawDiscovery() {
     MDNS.addServiceTxt("ipp", "tcp", "product", "(" PRINTER_MAKE_MODEL ")");
     MDNS.addServiceTxt("ipp", "tcp", "ty", PRINTER_MAKE_MODEL);
     MDNS.addServiceTxt("ipp", "tcp", "Color", "T");
+#if PRINTER_DUPLEX
+    // Manual two-sided only; "Duplex" advertises the capability, and the IPP
+    // sides list is what actually makes the client offer it.
+    MDNS.addServiceTxt("ipp", "tcp", "Duplex", "T");
+#else
     MDNS.addServiceTxt("ipp", "tcp", "Duplex", "F");
+#endif
     MDNS.addServiceTxt("ipp", "tcp", "note", "ESP32-S3 PCL3GUI USB bridge");
     // Stable printer identity: same MAC-derived UUID the IPP endpoint reports,
     // so clients remember us across IP changes.

@@ -26,6 +26,18 @@
 // Model string matters: print apps like NetPrinter match it against a device
 // database (entry "Smart Tank 2xx/5xx"), so keep suffixes off the model name.
 
+// --- Physical capability claims (HP Smart Tank 520/540) ------------------
+// The attached printer is a Smart Tank 520/540 class device: colour inkjet,
+// borderless up to A4/Letter, and *manual* two-sided only (no duplexer).
+// This bridge forwards the client's PCL, so the client's driver renders the
+// colour/monochrome choice and, for manual duplex, drives the paper flip;
+// these switches only stop the IPP service from hiding those options.
+#define PRINTER_BORDERLESS      1   // advertise 0 margins / borderless media
+#define PRINTER_DUPLEX          1   // advertise two-sided (manual on this HW)
+// Non-borderless printable margin in hundredths of a millimetre (3.0 mm,
+// from the Smart Tank 520 data sheet).
+#define PRINTER_PAPER_MARGIN    300
+
 // PCLm passthrough is a temporary experiment: the HP plugin can rasterise
 // PCLm on the host, and HP's own firmware accepts it, but we do not know yet
 // whether the Smart Tank accepts PCLm over its USB transport.  We only forward
@@ -76,7 +88,10 @@
 // --- IPP Streaming Settings ---
 #define IPP_BODY_BUFFER_SIZE      USB_BUFFER_SIZE   // document streaming buffer
 #define IPP_CLIENT_TIMEOUT_MS     30000             // < WDT (60 s) so a stalled client disconnects
-#define IPP_RESPONSE_MAX          8192              // single IPP response buffer (one client at a time)
+// A full Get-Printer-Attributes response (all media collections + the HP
+// plugin's ~68 requested names) exceeds 8 KB.  16 KB leaves headroom without
+// eating into the 300 KB internal-heap budget.
+#define IPP_RESPONSE_MAX          16384             // single IPP response buffer (one client at a time)
 #define IPP_JOB_DEADLINE_MS       600000UL          // hard cap on one document body
 
 // --- Watchdog ---

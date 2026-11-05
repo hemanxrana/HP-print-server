@@ -661,6 +661,7 @@ bool readU16(BodyReader &r,uint16_t &v){
 
 bool parseAttributes(BodyReader &r,RequestAttrs &attrs){
   String currentName;
+  uint8_t collectionDepth = 0;
   while(true){
     uint8_t tag=0;
     if(!r.readByte(tag)) return false;
@@ -671,18 +672,30 @@ bool parseAttributes(BodyReader &r,RequestAttrs &attrs){
     if(!readU16(r,nameLen)) return false;
     String name;
     for(uint16_t i=0;i<nameLen;++i){ uint8_t b=0; if(!r.readByte(b)) return false; name+=(char)b; }
-    if(nameLen) currentName=name;
     if(!readU16(r,valueLen)) return false;
 
-    // Only a named attribute can carry the values we keep; collection members
-    // have a zero-length name and must not overwrite the last named attribute.
-    const bool named = nameLen > 0;
-    const bool keepFormat = named && currentName=="document-format";
-    const bool keepJobId = named && currentName=="job-id" && valueLen==4;
-    const bool keepJobUri = named && currentName=="job-uri" && valueLen<256;
-    const bool keepJobName = named && currentName=="job-name" && valueLen<128;
-    const bool keepRequested = named && currentName=="requested-attributes" && valueLen>0 && valueLen<64;
-    const bool keepLastDoc = named && currentName=="last-document" && valueLen==1;
+    // Collection framing (0x34 / 0x37) and member names (0x4A) are not
+    // attributes and must not touch currentName.  Their payload still has to
+    // be consumed or the stream desynchronises.
+    if(tag==0x4A || tag==0x34 || tag==0x37){
+      if(tag==0x34) ++collectionDepth;
+      else if(tag==0x37 && collectionDepth) --collectionDepth;
+      for(uint16_t i=0;i<valueLen;++i){ uint8_t b=0; if(!r.readByte(b)) return false; }
+      continue;
+    }
+
+    if(nameLen) currentName=name;
+
+    // A multi-valued attribute repeats with a zero-length name, so the last
+    // named attribute still applies.  Only the first value used to be kept,
+    // which silently dropped every name after the first in requested-attributes.
+    const bool topLevel = (collectionDepth == 0);
+    const bool keepFormat = topLevel && currentName=="document-format";
+    const bool keepJobId = topLevel && currentName=="job-id" && valueLen==4;
+    const bool keepJobUri = topLevel && currentName=="job-uri" && valueLen<256;
+    const bool keepJobName = topLevel && currentName=="job-name" && valueLen<128;
+    const bool keepRequested = topLevel && currentName=="requested-attributes" && valueLen>0 && valueLen<64;
+    const bool keepLastDoc = topLevel && currentName=="last-document" && valueLen==1;
     const bool keep = keepFormat||keepJobId||keepJobUri||keepJobName||keepRequested||keepLastDoc;
     String value;
     if(keep && valueLen<256) value.reserve(valueLen);

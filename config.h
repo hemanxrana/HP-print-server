@@ -42,7 +42,7 @@
 // PCLm on the host, and HP's own firmware accepts it, but we do not know yet
 // whether the Smart Tank accepts PCLm over its USB transport.  We only forward
 // the IPP body verbatim, exactly like PCL3GUI.  Set to 0 to go back to PCL only.
-#define PRINTER_PCLM_PASSTHROUGH 1
+#define PRINTER_PCLM_PASSTHROUGH 0
 #define PRINTER_PCLM_MIME        "application/PCLm"  // casing from a real HP dump
 // MIME types are case-insensitive; the printer-device-id CMD token is the
 // HP-specific capability hint a print app is most likely to key on.
@@ -67,10 +67,10 @@
 // --- USB Bulk Out Settings ---
 // ESP32-S3 has USB 2.0 Full Speed only (12 Mbps), so ~1 MB/s is the bus ceiling.
 // 16KB transfers amortise per-transfer overhead without wasting internal DMA RAM.
-#define BULK_OUT_CHUNK_SIZE       (16 * 1024)   // transfer size, no MPS alignment
+#define BULK_OUT_CHUNK_SIZE       (1 * 1024)   // transfer size, no MPS alignment
 #define PSRAM_RING_BUFFER_SIZE    (64 * 1024)   // RAW 9100 staging ring in PSRAM
 #define USB_BUFFER_SIZE           PSRAM_RING_BUFFER_SIZE   // Full PSRAM ring buffer
-#define USB_BULK_PIPELINE_DEPTH   3             // outstanding bulk-out transfers
+#define USB_BULK_PIPELINE_DEPTH   2             // outstanding bulk-out transfers
 // Post-job settle: the printer reports "selected" while its own buffer drains,
 // so a short guard is enough. The long outer bound still covers slow prints.
 #define POST_JOB_MIN_GUARD_MS   1500
@@ -88,10 +88,31 @@
 // --- IPP Streaming Settings ---
 #define IPP_BODY_BUFFER_SIZE      USB_BUFFER_SIZE   // document streaming buffer
 #define IPP_CLIENT_TIMEOUT_MS     30000             // < WDT (60 s) so a stalled client disconnects
+// A client that connects but never sends a request (Android print services
+// sometimes probe the port first) used to block the single-threaded IPP loop
+// for up to 10 s per byte.  Bound the whole header read instead.
+#define IPP_HEADER_TIMEOUT_MS      5000
 // A full Get-Printer-Attributes response (all media collections + the HP
 // plugin's ~68 requested names) exceeds 8 KB.  16 KB leaves headroom without
 // eating into the 300 KB internal-heap budget.
 #define IPP_RESPONSE_MAX          16384             // single IPP response buffer (one client at a time)
+// Whole-document staging.  The IPP body is received in full *before* the first
+// byte reaches USB, so a client abort or a short body can never truncate a
+// page mid-raster, and the printer receives the document as one continuous
+// burst.  The buffer starts small and grows in PSRAM on demand; documents
+// larger than the cap fall back to streaming.  One slot, one client at a time.
+#define IPP_DOCUMENT_BUFFER_MIN   (512 * 1024)
+#define IPP_DOCUMENT_BUFFER_MAX   (4 * 1024 * 1024)
+// Safe hybrid: below this many staged bytes the document is received in full
+// before the first USB byte is sent (atomic abort guarantee, which covers the
+// common single-page Android job).  Above it the document streams while the
+// remaining body is still arriving.
+#define IPP_STREAM_THRESHOLD_BYTES (512 * 1024)
+// Cooperative pump budgets.  Each poll() call of the IPP document state
+// machine moves at most this much data so USB status polling, mDNS, the
+// dashboard and RAW accept keep running during a print job.
+#define IPP_PUMP_READ_BYTES       (16 * 1024)
+#define IPP_PUMP_SEND_BYTES       (16 * 1024)
 #define IPP_JOB_DEADLINE_MS       600000UL          // hard cap on one document body
 
 // --- Watchdog ---

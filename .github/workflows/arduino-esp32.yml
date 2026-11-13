@@ -14,12 +14,11 @@ jobs:
       - name: Install Arduino CLI
         uses: arduino/setup-arduino-cli@v2
 
-      - name: Install ESP32 core 3.3.10
+      - name: Install ESP32 core 3.3.12
         run: |
           arduino-cli config init
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32@3.3.10
-          arduino-cli lib install "NimBLE-Arduino@2.5.1"
+          arduino-cli core install esp32:esp32@3.3.12
 
       - name: Compile ESP32-S3 N16R8 firmware
         run: |

@@ -133,9 +133,11 @@ bool UsbStream::copyOut(uint8_t *dst, size_t max, size_t &taken) {
   taken = 0;
   size_t tail = 0;
   size_t avail = 0;
+  uint32_t gen = 0;
   portENTER_CRITICAL(&mux_);
   tail = tail_;
   avail = used_;
+  gen = generation_;
   portEXIT_CRITICAL(&mux_);
 
   if (avail == 0) return false;
@@ -146,6 +148,15 @@ bool UsbStream::copyOut(uint8_t *dst, size_t max, size_t &taken) {
   if (taken > first) memcpy(dst + first, ring_, taken - first);
 
   portENTER_CRITICAL(&mux_);
+  // reset() can run while the copy above is outside the lock (it only waits
+  // RESET_BUSY_WAIT_MS for busy_ to clear).  If it did, the bytes just copied
+  // are from the abandoned job: drop them instead of subtracting from a ring
+  // that was already cleared (which would underflow used_).
+  if (generation_ != gen || used_ < taken) {
+    taken = 0;
+    portEXIT_CRITICAL(&mux_);
+    return false;
+  }
   tail_ = (tail + taken) % capacity_;
   used_ -= taken;
   portEXIT_CRITICAL(&mux_);
@@ -186,6 +197,13 @@ void UsbStream::taskEntry(void *arg) {
   static_cast<UsbStream *>(arg)->run();
 }
 
+bool UsbStream::idle() const {
+  portENTER_CRITICAL(&mux_);
+  const bool idleNow = (used_ == 0) && !busy_;
+  portEXIT_CRITICAL(&mux_);
+  return idleNow;
+}
+
 bool UsbStream::flush(uint32_t timeoutMs, String &error) {
   const unsigned long start = millis();
 
@@ -219,6 +237,7 @@ void UsbStream::reset() {
   }
 
   portENTER_CRITICAL(&mux_);
+  generation_ = generation_ + 1;
   head_ = 0;
   tail_ = 0;
   used_ = 0;

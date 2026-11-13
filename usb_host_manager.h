@@ -29,7 +29,14 @@ public:
   // into BULK_OUT_CHUNK_SIZE transfers. Returns true only when every byte was
   // accepted by the USB host driver.
   bool bulkWriteAll(const uint8_t *data, size_t length, uint32_t timeoutMs, String &error);
+  // Send a Printer Class SOFT_RESET (control request 0x02) to flush the
+  // printer's buffers and clear any error state between jobs. Non-fatal.
+  bool softReset(uint32_t timeoutMs, String &error);
   bool waitForBulkOut(uint32_t timeoutMs, String &error);
+
+  // Non-blocking check used by the cooperative IPP finalizer: true when no
+  // Bulk OUT transfer is still in flight.
+  bool bulkOutIdle() const;
 
   bool portStatusValid() const { return device_.portStatus.valid; }
   uint8_t portStatusValue() const { return device_.portStatus.value; }

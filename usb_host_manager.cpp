@@ -67,6 +67,12 @@ struct Runtime {
 
 UsbHostManager *manager = nullptr;
 
+static SemaphoreHandle_t s_softResetDone = nullptr;
+static usb_transfer_t *s_softResetTransfer = nullptr;
+static void softResetCallback(usb_transfer_t *t) {
+  if (s_softResetDone) xSemaphoreGive(s_softResetDone);
+}
+
 #if defined(CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK)
 static bool enumFilter(const usb_device_desc_t *, uint8_t *) { return true; }
 #endif
@@ -86,6 +92,21 @@ static String usbString(const usb_str_desc_t *d) {
 
 static bool bulk(const usb_ep_desc_t *e) {
   return e && ((e->bmAttributes & 0x03) == USB_ENDPOINT_XFER_BULK_CODE);
+}
+
+static bool interruptIn(const usb_ep_desc_t *e) {
+  return e && ((e->bmAttributes & 0x03) == 3) && (e->bEndpointAddress & 0x80);
+}
+
+static const char *endpointTypeText(const usb_ep_desc_t *e) {
+  if (!e) return "?";
+  switch (e->bmAttributes & 0x03) {
+    case 0: return "control";
+    case 1: return "isochronous";
+    case 2: return "bulk";
+    case 3: return "interrupt";
+    default: return "reserved";
+  }
 }
 
 static void storeEndpoint(UsbEndpointInfo &slot, const usb_ep_desc_t *ept) {
@@ -275,15 +296,18 @@ static bool claimInterfaces(UsbDeviceInfo &d, String &error) {
 
   if (!d.statusInterfaceSeparate) d.statusInterface = d.printer;
 
-  Log.printf("[USB] Selected Printer Class IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X\n",
+  Log.printf("[USB] Selected Printer Class IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X IRQ=0x%02X\n",
                 d.printer.interfaceNumber, d.printer.alternateSetting,
                 d.printer.protocol, d.printer.bulkOut.address,
-                d.printer.bulkIn.address);
+                d.printer.bulkIn.address, d.printer.interruptIn.address);
   if (d.statusInterfaceSeparate) {
-    Log.printf("[USB] Status IF=%u ALT=%u protocol=0x%02X (separate)\n",
+    Log.printf("[USB] Status IF=%u ALT=%u protocol=0x%02X (separate) OUT=0x%02X IN=0x%02X IRQ=0x%02X\n",
                   d.statusInterface.interfaceNumber,
                   d.statusInterface.alternateSetting,
-                  d.statusInterface.protocol);
+                  d.statusInterface.protocol,
+                  d.statusInterface.bulkOut.address,
+                  d.statusInterface.bulkIn.address,
+                  d.statusInterface.interruptIn.address);
   }
   return true;
 }
@@ -340,6 +364,10 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
     if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
       const usb_intf_desc_t *i = (const usb_intf_desc_t *)d;
       printerCurrent = nullptr;
+      Log.printf("[USB] Interface IF=%u ALT=%u class=0x%02X subclass=0x%02X protocol=0x%02X endpoints=%u\n",
+                 i->bInterfaceNumber, i->bAlternateSetting,
+                 i->bInterfaceClass, i->bInterfaceSubClass,
+                 i->bInterfaceProtocol, i->bNumEndpoints);
 
       if (i->bInterfaceClass == USB_PRINTER_CLASS_CODE &&
           i->bInterfaceSubClass == USB_PRINTER_SUBCLASS_CODE) {
@@ -361,9 +389,17 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
       }
     } else if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
       const usb_ep_desc_t *ept = (const usb_ep_desc_t *)d;
-      if (printerCurrent && bulk(ept)) {
-        if ((ept->bEndpointAddress & 0x80) != 0) storeEndpoint(printerCurrent->bulkIn, ept);
-        else storeEndpoint(printerCurrent->bulkOut, ept);
+      Log.printf("[USB]   Endpoint 0x%02X %s %s mps=%u interval=%u\n",
+                 ept->bEndpointAddress,
+                 (ept->bEndpointAddress & 0x80) ? "IN " : "OUT",
+                 endpointTypeText(ept), ept->wMaxPacketSize, ept->bInterval);
+      if (printerCurrent) {
+        if (bulk(ept)) {
+          if ((ept->bEndpointAddress & 0x80) != 0) storeEndpoint(printerCurrent->bulkIn, ept);
+          else storeEndpoint(printerCurrent->bulkOut, ept);
+        } else if (interruptIn(ept)) {
+          storeEndpoint(printerCurrent->interruptIn, ept);
+        }
       }
     }
     d = usb_parse_next_descriptor((const usb_standard_desc_t *)d, total, &offset);
@@ -377,9 +413,10 @@ static bool enumerateDevice(uint8_t address, UsbDeviceInfo &out, String &error) 
 
   for (uint8_t i = 0; i < out.printerInterfaceCount; ++i) {
     const auto &p = out.printerInterfaces[i];
-    Log.printf("[USB] RAW candidate %u: IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X score=%d\n",
+    Log.printf("[USB] RAW candidate %u: IF=%u ALT=%u protocol=0x%02X OUT=0x%02X IN=0x%02X IRQ=0x%02X score=%d\n",
                   i, p.interfaceNumber, p.alternateSetting, p.protocol,
-                  p.bulkOut.address, p.bulkIn.address, printScore(p));
+                  p.bulkOut.address, p.bulkIn.address, p.interruptIn.address,
+                  printScore(p));
   }
 
   if (!claimInterfaces(out, error)) {
@@ -652,7 +689,7 @@ static bool waitSlotDone(BulkOutSlot &s, usb_transfer_t *t, uint32_t timeoutMs,
 bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accepted,
                                uint32_t timeoutMs, String &error) {
   accepted = 0;
-  if (!data || !length) { error = "empty USB transfer"; return false; }
+  if (length && (!data)) { error = "empty USB transfer"; return false; }
   if (!g.deviceOpen || !g.printInterfaceClaimed || !device_.printer.usableForRawPrint()) {
     error = "USB printer interface is not claimed/ready"; return false;
   }
@@ -664,24 +701,33 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
   if (!ensureBulkOutResources(error)) return false;
 
   const int mine = g.bulkOutNext;
-  const int previous = (mine + USB_BULK_PIPELINE_DEPTH - 1) % USB_BULK_PIPELINE_DEPTH;
-  BulkOutSlot &prev = g.bulkOut[previous];
+  BulkOutSlot &slot = g.bulkOut[mine];
 
-  // Reap the previous in-flight transfer here, AFTER submitting the next one,
-  // so multiple chunks are always in flight back-to-back on the bus.
-  if (prev.inFlight && !waitSlotDone(prev, prev.transfer, timeoutMs, "pipelined", error)) {
-    prev.inFlight = false;
-    if (g.bulkOutWedged) { g.bulkOutNext = mine; return false; }
+  // Reap this slot's previous transfer before overwriting its buffer.  It was
+  // submitted USB_BULK_PIPELINE_DEPTH calls ago, so the other slots stay in
+  // flight while we wait; that is what keeps the bus busy.  Reaping the
+  // *previous* slot instead (the old order) serialised every transfer:
+  // submit -> wait -> submit -> wait, so only one chunk was ever in flight.
+  if (slot.inFlight) {
+    const bool reaped = waitSlotDone(slot, slot.transfer, timeoutMs, "pipelined", error);
+    slot.inFlight = false;
+    if (!reaped && g.bulkOutWedged) { g.bulkOutNext = mine; return false; }
   }
 
-  BulkOutSlot &slot = g.bulkOut[mine];
   while (xSemaphoreTake(slot.done, 0) == pdTRUE) {}
   slot.status = USB_TRANSFER_STATUS_NO_DEVICE;
   slot.accepted = 0;
 
   usb_transfer_t *t = slot.transfer;
-  assert(t && !slot.inFlight);
-  memcpy(t->data_buffer, data, length);
+  // A bookkeeping slip must fail this transfer, not panic the firmware: the
+  // default Arduino build keeps assert() enabled.  The caller's retry/wedge
+  // path then recovers normally.
+  if (!t || slot.inFlight) {
+    error = t ? "USB bulk slot still in flight" : "USB bulk slot has no transfer buffer";
+    g.bulkOutNext = mine;
+    return false;
+  }
+  if (length) memcpy(t->data_buffer, data, length);
   t->num_bytes = length;
   t->device_handle = g.device;
   t->bEndpointAddress = device_.printer.bulkOut.address;
@@ -701,7 +747,7 @@ bool UsbHostManager::bulkWrite(const uint8_t *data, size_t length, size_t &accep
   g.bulkOutNext = (uint8_t)((mine + 1) % USB_BULK_PIPELINE_DEPTH);
 
   // The submission is the acceptance point: bytes handed to the USB host
-  // driver are transmitted even if this call detects a failed predecessor.
+  // driver are transmitted even if a later call detects a failed transfer.
   accepted = length;
   return true;
 }
@@ -728,6 +774,75 @@ bool UsbHostManager::bulkWriteAll(const uint8_t *data, size_t length,
     offset += accepted;
     retries = 0;
     yield();
+  }
+  return true;
+}
+
+bool UsbHostManager::softReset(uint32_t timeoutMs, String &error) {
+  if (!g.deviceOpen || !g.printInterfaceClaimed) {
+    error = "USB printer not ready";
+    return false;
+  }
+  // Don't collide with an in-flight GET_PORT_STATUS control transfer on EP0.
+  if (g.statusTransfer) {
+    error = "status transfer in flight; soft reset skipped";
+    return false;
+  }
+  if (!s_softResetDone) {
+    s_softResetDone = xSemaphoreCreateBinary();
+    if (!s_softResetDone) { error = "soft reset semaphore alloc failed"; return false; }
+  }
+  while (xSemaphoreTake(s_softResetDone, 0) == pdTRUE) {}
+
+  usb_transfer_t *t = nullptr;
+  const esp_err_t ae = usb_host_transfer_alloc(8, 0, &t);
+  if (ae != ESP_OK || !t) {
+    error = String("soft reset alloc failed: ") + esp_err_to_name(ae);
+    return false;
+  }
+
+  usb_setup_packet_t *setup = reinterpret_cast<usb_setup_packet_t *>(t->data_buffer);
+  setup->bmRequestType = 0x21;   // host-to-device, class, interface
+  setup->bRequest = 0x02;        // SOFT_RESET
+  setup->wValue = 0;
+  setup->wIndex = device_.printer.interfaceNumber;
+  setup->wLength = 0;
+
+  t->num_bytes = 8;
+  t->device_handle = g.device;
+  t->callback = softResetCallback;
+  t->context = nullptr;
+  t->timeout_ms = timeoutMs ? timeoutMs : 1000;
+
+  const esp_err_t se = usb_host_transfer_submit_control(g.client, t);
+  if (se != ESP_OK) {
+    usb_host_transfer_free(t);
+    error = String("soft reset submit failed: ") + esp_err_to_name(se);
+    return false;
+  }
+  s_softResetTransfer = t;
+
+  const TickType_t wait = timeoutMs ? pdMS_TO_TICKS(timeoutMs + 250) : pdMS_TO_TICKS(1250);
+  if (xSemaphoreTake(s_softResetDone, wait) != pdTRUE) {
+    usb_host_transfer_free(t);
+    s_softResetTransfer = nullptr;
+    error = "soft reset timeout";
+    return false;
+  }
+
+  const usb_transfer_status_t status = t->status;
+  usb_host_transfer_free(t);
+  s_softResetTransfer = nullptr;
+  if (status != USB_TRANSFER_STATUS_COMPLETED) {
+    error = String("soft reset failed status=") + String((int)status);
+    return false;
+  }
+  return true;
+}
+
+bool UsbHostManager::bulkOutIdle() const {
+  for (int i = 0; i < USB_BULK_PIPELINE_DEPTH; ++i) {
+    if (g.bulkOut[i].inFlight) return false;
   }
   return true;
 }

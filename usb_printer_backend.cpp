@@ -1,8 +1,10 @@
 #include "usb_printer_backend.h"
 #include "logger.h"
 #include "status_led.h"
+#include "job_log.h"
 #include <WiFi.h>
 #include <errno.h>
+#include <string.h>
 #include <lwip/sockets.h>
 #include "esp_heap_caps.h"
 #include "esp_task_wdt.h"
@@ -25,58 +27,41 @@ constexpr uint32_t RAW_PROBE_IDLE_TIMEOUT_MS = 30000;
 constexpr uint32_t RAW_IDLE_TIMEOUT_MS = 60000;
 constexpr bool RAW_APPEND_JOB_TERMINATOR = false;
 constexpr char RAW_JOB_TERMINATOR[] = "\x1b%-12345X@PJL EOJ\r\n\x0c";
-// PJL EOJ detector: looks for "@PJL EOJ" sequence followed by optional CR/LF or form feed
-constexpr const char *PJL_EOJ = "@PJL EOJ";
-constexpr size_t PJL_EOJ_LEN = 8;
+constexpr bool RAW_APPEND_FORM_FEED = false;
+constexpr char RAW_FORM_FEED[] = "\x0c";
+// RAW job terminator: Universal Exit Language immediately followed by
+// "@PJL EOJ".  Matching a bare "@PJL EOJ" anywhere in the stream risked
+// truncating a PCL raster that happened to contain those ASCII bytes.  A real
+// terminator always starts with UEL (ESC %-12345X); if a driver omits it the
+// job still finishes when the TCP client closes, so a missed match is safe
+// where a false positive is not.
+constexpr uint8_t PJL_EOJ_PATTERN[] = {
+  0x1B, '%', '-', '1', '2', '3', '4', '5', 'X', '@', 'P', 'J', 'L', ' ', 'E', 'O', 'J'
+};
+constexpr size_t PJL_EOJ_PATTERN_LEN = sizeof(PJL_EOJ_PATTERN);
+
 struct PjlDetector {
-  enum State : uint8_t { IDLE, AT_SEEN, AT_P_SEEN, AT_PJ_SEEN, AT_PJL_SEEN, AT_PJL_SPACE_SEEN, AT_PJL_E_SEEN, AT_PJL_EO_SEEN, AT_PJL_EOJ_SEEN };
-  State state = IDLE;
-  size_t matchPos = 0;
+  uint8_t window[PJL_EOJ_PATTERN_LEN] = {0};
+  size_t pos = 0;
+  bool filled = false;
 
   bool feed(uint8_t b) {
-    char c = (char)b;
-    switch (state) {
-      case IDLE:
-        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
-        return false;
-      case AT_SEEN:
-        if (c == 'P') { state = AT_P_SEEN; matchPos = 2; return false; }
-        // Resync: a partial match ending in '@' (e.g. "@P@PJL EOJ") must not
-        // lose the new '@' or the detector would never recover.
-        if (c == '@') { matchPos = 1; return false; }
-        state = IDLE; return false;
-      case AT_P_SEEN:
-        if (c == 'J') { state = AT_PJ_SEEN; matchPos = 3; return false; }
-        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
-        state = IDLE; return false;
-      case AT_PJ_SEEN:
-        if (c == 'L') { state = AT_PJL_SEEN; matchPos = 4; return false; }
-        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
-        state = IDLE; return false;
-      case AT_PJL_SEEN:
-        if (c == ' ') { state = AT_PJL_SPACE_SEEN; matchPos = 5; return false; }
-        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
-        state = IDLE; return false;
-      case AT_PJL_SPACE_SEEN:
-        if (c == 'E') { state = AT_PJL_E_SEEN; matchPos = 6; return false; }
-        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
-        state = IDLE; return false;
-      case AT_PJL_E_SEEN:
-        if (c == 'O') { state = AT_PJL_EO_SEEN; matchPos = 7; return false; }
-        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
-        state = IDLE; return false;
-      case AT_PJL_EO_SEEN:
-        if (c == 'J') { state = AT_PJL_EOJ_SEEN; matchPos = 8; return true; }  // EOJ detected!
-        if (c == '@') { state = AT_SEEN; matchPos = 1; return false; }
-        state = IDLE; return false;
-      case AT_PJL_EOJ_SEEN:
-        if (c == '@') { state = AT_SEEN; matchPos = 1; }  // next EOJ may follow immediately
-        else state = IDLE;
-        return false;
+    window[pos] = b;
+    pos = (pos + 1) % PJL_EOJ_PATTERN_LEN;
+    if (pos == 0) filled = true;
+    // Compare only when the newest byte is the pattern's last byte, so the
+    // steady-state cost is one compare per received byte.
+    if (!filled || b != 'J') return false;
+    for (size_t i = 0; i < PJL_EOJ_PATTERN_LEN; ++i) {
+      if (window[(pos + i) % PJL_EOJ_PATTERN_LEN] != PJL_EOJ_PATTERN[i]) return false;
     }
-    return false;
+    return true;
   }
-  void reset() { state = IDLE; matchPos = 0; }
+  void reset() {
+    pos = 0;
+    filled = false;
+    memset(window, 0, sizeof(window));
+  }
 };
 
 WiFiServer rawServer(RAW_PORT);
@@ -86,6 +71,9 @@ unsigned long rawLastDataMs = 0;
 uint64_t rawBytesReceived = 0;
 uint32_t rawJobSequence = 0;
 uint32_t rawActiveJobId = 0;
+unsigned long rawJobStartedMs = 0;
+String rawClientIp;
+bool rawJobLogged = false;
 bool rawTransportClosing = false;
 bool rawCloseGuardStarted = false;
 unsigned long rawTransportCloseAtMs = 0;
@@ -181,6 +169,9 @@ void resetRawTransportState() {
   rawClient = WiFiClient();
   rawBytesReceived = 0;
   rawActiveJobId = 0;
+  rawJobStartedMs = 0;
+  rawClientIp = "";
+  rawJobLogged = false;
   rawTransportClosing = false;
   rawCloseGuardStarted = false;
   rawTransportCloseAtMs = 0;
@@ -200,6 +191,12 @@ void abortRawConnection(UsbPrinterBackend *backend, const String &reason) {
   Log.printf("[RAW] Job #%lu INCOMPLETE after %llu USB-confirmed bytes: %s\n",
                 (unsigned long)jobId, (unsigned long long)bytes,
                 reason.length() ? reason.c_str() : "unknown transport failure");
+  if (bytes > 0) {
+    JobLog::record(JobLog::RAW, jobId, 8, reason.c_str(),
+                   "raw-9100-aborted", (uint32_t)bytes,
+                   rawJobStartedMs ? (uint32_t)(millis() - rawJobStartedMs) : 0,
+                   rawClientIp.c_str(), "raw");
+  }
   resetRawTransportState();
 }
 
@@ -218,6 +215,13 @@ void finishRawConnection(UsbPrinterBackend *backend, const char *reason) {
     String terminatorError;
     if (!backend->sendDirect((const uint8_t *)RAW_JOB_TERMINATOR, strlen(RAW_JOB_TERMINATOR), terminatorError)) {
       abortRawConnection(backend, String("job terminator failed: ") + terminatorError);
+      return;
+    }
+  }
+  if (RAW_APPEND_FORM_FEED && backend) {
+    String ffError;
+    if (!backend->sendDirect((const uint8_t *)RAW_FORM_FEED, strlen(RAW_FORM_FEED), ffError)) {
+      abortRawConnection(backend, String("form-feed failed: ") + ffError);
       return;
     }
   }
@@ -252,6 +256,10 @@ void serviceRawTransportClose(UsbPrinterBackend *backend) {
 
   Log.printf("[RAW] Job #%lu COMPLETE: %llu bytes received and accepted by USB\n",
                 (unsigned long)jobId, (unsigned long long)bytes);
+  JobLog::record(JobLog::RAW, jobId, 9, "job-completed-successfully",
+                 "usb-hand-off-drained", (uint32_t)bytes,
+                 rawJobStartedMs ? (uint32_t)(millis() - rawJobStartedMs) : 0,
+                 rawClientIp.c_str(), "raw");
   resetRawTransportState();
 }
 
@@ -296,6 +304,14 @@ void handleRawServer(UsbPrinterBackend *backend) {
   if (!rawClientAllocated()) {
     WiFiClient incoming = rawServer.accept();
     if (incoming.fd() >= 0) {
+      if (backend->ippDocumentActive()) {
+        // An IPP document is still uploading.  The printer can still be IDLE
+        // here, so the state check below would not reject this client; without
+        // this guard both sources would share the Bulk OUT pipe.
+        Log.println("[RAW] Refusing TCP 9100 connection: IPP document is in progress");
+        incoming.stop();
+        return;
+      }
       if (!backend->online()) {
         Log.printf("[RAW] Printer not ready; rejecting TCP 9100 connection: %s\n",
                       backend->statusReason().c_str());
@@ -308,6 +324,8 @@ void handleRawServer(UsbPrinterBackend *backend) {
       rawLastDataMs = millis();
       rawBytesReceived = 0;
       rawActiveJobId = ++rawJobSequence;
+      rawJobStartedMs = rawLastDataMs;
+      rawClientIp = incoming.remoteIP().toString();
       pjlDetector.reset();
       Log.printf("[RAW] Job #%lu TCP 9100 client connected; transparent USB pass-through\n",
                     (unsigned long)rawActiveJobId);
@@ -333,6 +351,15 @@ void handleRawServer(UsbPrinterBackend *backend) {
     }
     const int got = rawClient.read(rawChunk + ringWritePos, firstPart);
     if (got <= 0) break;
+
+    // Log the job only once real print data arrives: clients and network
+    // scanners probe TCP 9100 by opening and closing it with no payload, and
+    // those probes must not fill the persisted job ring.
+    if (!rawJobLogged) {
+      rawJobLogged = true;
+      JobLog::record(JobLog::RAW, rawActiveJobId, 3, "job-incoming", "raw-9100",
+                     0, 0, rawClientIp.c_str(), "raw");
+    }
 
     // Publish the bytes we just read before looking for PJL EOJ: the EOJ chunk
     // is the last part of the job, so dropping it would truncate the page.
@@ -565,7 +592,13 @@ void UsbPrinterBackend::completeDrainIfReady() {
   state_ = IDLE;
   reason_ = freshStatus ? "usb-printer-ready-after-post-job-guard"
                         : "printer-ready-after-post-job-guard";
-  jobsCompleted_++;
+  if (sourceAborted_) {
+    jobsFailed_++;
+    lastError_ = "source-ended-early";
+  } else {
+    jobsCompleted_++;
+  }
+  sourceAborted_ = false;
   if (age > maxDrainMs_) maxDrainMs_ = age;
   StatusLed::set(StatusLed::PRINTER_READY);
   Log.printf("[PRINT][FINALIZE] transport complete: %llu bytes; waited=%lu ms; status=%s fresh=%s value=0x%02X\n",
@@ -578,6 +611,17 @@ void UsbPrinterBackend::completeDrainIfReady() {
 
 void UsbPrinterBackend::poll() {
   startRawServerIfNeeded();
+
+  // A detach while a job is active must fail it now.  Otherwise the PRINTING
+  // early-return below keeps completeDrainIfReady() waiting out the post-job
+  // timeout against a printer that no longer exists, and new IPP jobs keep
+  // being refused as "still printing".
+  if (state_ == PRINTING && !host_.device().attached) {
+    abortRawJob("USB printer disconnected");
+    StatusLed::update();
+    return;
+  }
+
   completeDrainIfReady();
   handleRawServer(this);
 
@@ -645,6 +689,7 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
     jobStartedMs_ = millis();
     nextHealthLogAt_ = HEALTH_LOG_INTERVAL_BYTES;
     drainPending_ = false;
+    sourceAborted_ = false;
     stream_.reset();
   }
   state_ = PRINTING;
@@ -671,6 +716,28 @@ bool UsbPrinterBackend::sendDirect(const uint8_t *data, size_t length, String &e
   return false;
 }
 
+bool UsbPrinterBackend::finishRawJobStep() {
+  if (state_ != PRINTING) return true;
+  if (drainPending_) return true;
+
+  if (stream_.ready()) {
+    String failure;
+    if (stream_.failed(failure)) {
+      abortRawJob(failure);
+      return true;
+    }
+    if (!stream_.idle()) return false;
+  }
+  // The writer task may be idle while a pipelined transfer is still completing.
+  if (!host_.bulkOutIdle()) return false;
+
+  // Everything the document produced has been accepted by the USB host driver.
+  // finishRawJob() is now cheap: its flush/wait calls return immediately, and
+  // it arms the existing poll-driven post-job guard.
+  finishRawJob();
+  return true;
+}
+
 void UsbPrinterBackend::finishRawJob() {
   if (state_ != PRINTING || drainPending_) return;
   String flushError;
@@ -682,6 +749,33 @@ void UsbPrinterBackend::finishRawJob() {
                (unsigned)jobBytes_, flushError.c_str());
     abortRawJob(flushError);
     return;
+  }
+  // Terminate the bulk stream with a zero-length packet.  ESP-IDF does not
+  // send one automatically when the final transfer is an exact multiple of
+  // the endpoint MPS (64 bytes), so without this the printer's USB stack can
+  // hold the last full packet and never flush the tail of the document: the
+  // symptom is a partial page followed by an error/eject.  A ZLP failure is
+  // non-fatal because the data has already been handed off.
+  {
+    size_t zlpAccepted = 0;
+    String zlpError;
+    if (!host_.bulkWrite(nullptr, 0, zlpAccepted, RAW_USB_TIMEOUT_MS, zlpError)) {
+      Log.printf("[PRINT][FINALIZE] trailing ZLP failed: %s (non-fatal)\n",
+                 zlpError.c_str());
+    } else {
+      Log.println("[PRINT][FINALIZE] trailing ZLP sent");
+    }
+  }
+  // Flush the printer's buffers and clear any error state before the next job.
+  // Non-fatal: a printer that doesn't support SOFT_RESET just ignores it.
+  {
+    String softResetError;
+    if (host_.softReset(RAW_USB_TIMEOUT_MS, softResetError)) {
+      Log.println("[PRINT][FINALIZE] soft reset OK");
+    } else {
+      Log.printf("[PRINT][FINALIZE] soft reset skipped/failed: %s (non-fatal)\n",
+                 softResetError.c_str());
+    }
   }
   const uint32_t handoffMs = (uint32_t)(millis() - jobStartedMs_);
   const double kb = jobBytes_ / 1024.0;
@@ -708,5 +802,23 @@ void UsbPrinterBackend::abortRawJob(const String &reason) {
   jobBytes_ = 0;
   state_ = ERROR;
   reason_ = reason.length() ? reason : "raw-job-aborted";
+  // Drop anything still queued for the failed job so the next document cannot
+  // inherit its tail.  In-flight transfers are allowed to finish: cancelling
+  // them would require halting the endpoint, which turns a cancelled job into
+  // a USB recovery cycle.  reset() clears everything not yet handed off.
+  stream_.reset();
   StatusLed::set(StatusLed::ERROR);
+}
+
+void UsbPrinterBackend::endRawJobOnSourceAbort(const String &reason) {
+  if (state_ != PRINTING) return;
+  // The USB link is healthy; only the document source ended early.  Finish the
+  // hand-off and terminate the stream the same way a normal job ends (flush,
+  // ZLP, SOFT_RESET, post-job drain).  This lets the printer finish or eject
+  // the partial page cleanly instead of being abandoned mid-raster, which is
+  // what made the printer retry / eject extra sheets.
+  sourceAborted_ = true;
+  Log.printf("[PRINT][ABORT] source ended early (%s) after %llu USB-confirmed bytes; terminating stream cleanly\n",
+             reason.c_str(), (unsigned long long)jobBytes_);
+  finishRawJob();
 }

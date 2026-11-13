@@ -20,6 +20,9 @@ struct UsbPrinterInterfaceInfo {
   uint8_t protocol = 0;
   UsbEndpointInfo bulkOut;
   UsbEndpointInfo bulkIn;
+  // Printer Class status notification endpoint (interrupt IN), when present.
+  // Recorded for diagnostics; GET_PORT_STATUS stays on the control endpoint.
+  UsbEndpointInfo interruptIn;
 
   bool usableForRawPrint() const {
     return found &&

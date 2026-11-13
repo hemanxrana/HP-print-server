@@ -16,7 +16,7 @@ print client (Android HP Print Service, Windows, Linux, CUPS)
         v
 ESP32-S3 Wi-Fi servers
         |
-        | pipelined USB Bulk OUT (2x8KB transfers in flight, 8KB chunks)
+        | pipelined USB Bulk OUT (2x1KB transfers in flight, 1KB chunks)
         v
 classic USB Printer Class interface
         |
@@ -25,14 +25,16 @@ HP printer (PCL3GUI via CMD: in the 1284.4 device-id)
 ```
 
 - No document conversion, no spool, no PJL/UEL/form-feed injection by default.
-- IPP accepts `application/vnd.hp-pcl` (case-insensitive) and, while
-  `PRINTER_PCLM_PASSTHROUGH` is enabled, `application/PCLm`; both are forwarded
-  to USB unchanged. Any other `document-format` is rejected with IPP status
-  `0x040A` so the client is told clearly and quickly.
-- PCLm support is a **temporary experiment**: the host rasterises PCLm and HP
-  firmware consumes it, but whether this printer accepts PCLm over USB is
-  unproven. Set `PRINTER_PCLM_PASSTHROUGH 0` in `config.h` to withdraw the
-  claim without touching the service logic.
+- IPP accepts `application/vnd.hp-pcl` (case-insensitive) and forwards it to USB
+  unchanged. `application/octet-stream` is also accepted as an explicit raw
+  passthrough for clients that do not name a PCL MIME type. Any other
+  `document-format` is rejected with IPP status `0x040A` so the client is told
+  clearly and quickly.
+- PCLm passthrough was a temporary experiment and has been withdrawn: the
+  Smart Tank 520/540 does not accept PCLm over its USB transport (the
+  printer printed a partial page and faulted). `PRINTER_PCLM_PASSTHROUGH` is
+  now 0 in `config.h`; the service logic is unchanged and the claim is simply
+  no longer advertised.
 - Emulated printer identity lives in `config.h` as the single source of truth
   (`PRINTER_INSTANCE_NAME`, `PRINTER_MAKE_MODEL`, `PRINTER_DEVICE_ID`,
   `PRINTER_DOCUMENT_FORMAT`) and is mirrored into both mDNS TXT records and
@@ -52,8 +54,8 @@ When Wi-Fi is up the device advertises `printer.local` with two services:
 
 | service | port | TXT records |
 |---|---|---|
-| `_ipp._tcp` | 631 | `rp=ipp/print`, `txtvers=1`, `qtotal=1`, `device-id` (MFG/MDL/`CMD:PCL3GUI[,PCLM]` 1284.4 string), `pdl=application/vnd.hp-PCL[,application/PCLm]`, `product`, `ty`, `Color=T`, `Duplex=T[,F]`, `note`, `UUID`, `priority=0`, `air=none`, `adminurl=http://<ip>/` |
-| `_pdl-datastream._tcp` | 9100 | `pdl=application/vnd.hp-PCL[,application/PCLm]` |
+| `_ipp._tcp` | 631 | `rp=ipp/print`, `txtvers=1`, `qtotal=1`, `device-id` (MFG/MDL/`CMD:PCL3GUI` 1284.4 string), `pdl=application/vnd.hp-PCL`, `product`, `ty`, `Color=T`, `Duplex=T[,F]`, `note`, `UUID`, `priority=0`, `air=none`, `adminurl=http://<ip>/` |
+| `_pdl-datastream._tcp` | 9100 | `pdl=application/vnd.hp-PCL` |
 
 The AirPrint `_universal` subtype is deliberately **not** advertised: a
 `URF`/universal claim would advertise a raster format this bridge cannot
@@ -61,11 +63,8 @@ print. The Android HP Print Service Plugin browses plain `_ipp._tcp` and
 vendor-checks the `device-id` TXT, which is fully covered.
 
 NetPrinter (and some other Android apps) display only the single PDL they
-auto-select for a discovered printer, not the full `pdl` list. Its
-preference order puts PCLm above PCL 3 GUI, so while
-`PRINTER_PCLM_PASSTHROUGH` is enabled the discovery card shows `PCLm` even
-though both formats are advertised. The format is only a hint: edit the
-saved printer and choose `PCL 3 GUI` when you need the native path.
+auto-select for a discovered printer. With PCLm withdrawn, only PCL 3 GUI is
+advertised, so the discovery card shows the native dialect directly.
 
 ## Configuration
 
@@ -85,8 +84,7 @@ http://192.168.4.1/
 The dashboard provides:
 
 - printer connection and readiness, human-readable USB status
-- Wi-Fi scan / connect, and DHCP vs static IP configuration
-  (/IP, gateway, subnet persisted and applied before association)
+- Wi-Fi scan / connect (DHCP only; credentials persisted in NVS)
 - RAW 9100 and IPP 631 status, job counters, last error
 - `http://printer.local/` when mDNS started successfully
 
@@ -105,9 +103,12 @@ The dashboard provides:
 - USB Printer Class interfaces are discovered from descriptors
   (protocols 0x01/0x02/0x03 are accepted, 0x02 preferred; 0x04 IPP-over-USB
   and vendor-specific 0xFF are ignored)
+- every interface and endpoint is logged at enumeration (class/subclass/
+  protocol, endpoint type, direction, packet size); interrupt-IN status
+  notification endpoints are recorded for diagnostics
 - automatic selection of the best RAW-compatible interface and, when separate,
   a suitable status interface for `GET_PORT_STATUS`
-- pipelined bulk-out: up to two 8 KB transfers are always in flight; a job
+- pipelined bulk-out: up to two 1 KB transfers are always in flight; a job
   tail is drained exactly once before the post-job guard starts
 - timeout recovery (halt/flush/clear) and, for unrecoverable wedges,
   automatic USB re-enumeration
@@ -117,8 +118,50 @@ The dashboard provides:
 ## RAW job handling
 
 - one TCP 9100 client at a time; bounded chunk size keeps the loop responsive
-- stalled clients are disconnected after 30 s without progress
+- stalled clients are disconnected after 60 s without progress (a connection
+  that sends no print data at all is closed after 30 s)
 - post-job guard waits for the printer's port status to settle
+
+## IPP job handling
+
+- the document body is consumed by a cooperative state machine driven from
+  `loop()` (`pumpDocument`), not inside a blocking request handler. USB status
+  polling, mDNS, the dashboard, Wi-Fi maintenance and TCP 9100 accept keep
+  running while an IPP job is transferring or printing.
+- safe hybrid: below 512 KB the body is staged in PSRAM **in full** before the
+  first byte is handed to USB, so a client that aborts, sends a short body or
+  breaks chunk framing never reaches the printer (the job fails with `0x0500`
+  and nothing is printed). Above 512 KB the document streams while the
+  remaining body is still arriving, which keeps large jobs latency-free.
+- the staging buffer grows on demand to 4 MB; once full, receive pauses until
+  the USB side drains it (bounded backpressure instead of unbounded memory).
+- if the source ends early *after* bytes have already reached USB (only
+  possible for streamed documents), the stream is terminated cleanly with the
+  normal ZLP/SOFT_RESET instead of dropping the queued tail mid-raster. A real
+  USB failure still goes through the abort/recovery path.
+- one IPP document at a time; a second IPP connection waits in the listen backlog
+  until the active job has been answered. `Cancel-Job` for the active job is
+  therefore handled after the document finishes.
+- while an IPP document is uploading or printing, RAW 9100 connections are
+  refused and IPP `Create-Job`/`Send-Document` are refused while a RAW client
+  owns the pipe, so the two sources can never interleave on USB.
+- the post-job guard keeps the following job at `0x0503` until the printer has
+  finished the previous one.
+- `GET_PORT_STATUS` continues to use the separate Printer Class status
+  interface when the device exposes one, so status requests never share the
+  Bulk OUT pipe used for print data.
+
+## Job history
+
+- the last 8 RAW/IPP jobs are stored in NVS (`joblog` namespace) and survive
+  reboot. Each entry records source, job id, state, bytes handed to USB,
+  duration, terminal reason, transport detail, client IP and document format.
+- a job is written as `job-incoming` when it starts and folded into the final
+  state when it finishes, so a crash/reboot in the middle of a print still
+  leaves evidence.
+- inspect it at `GET /jobs.json` (newest first); `/status.json` also carries
+  `jobLogCount` and a one-line `lastJobLog`. The newest entry is logged on the
+  serial console at boot.
 
 ## Wi-Fi behavior
 
@@ -132,7 +175,7 @@ The dashboard provides:
 
 ## Building
 
-- Arduino IDE / arduino-cli, **arduino-esp32 core 3.3.10**
+- Arduino IDE / arduino-cli, **arduino-esp32 core 3.3.12**
 - Board: ESP32-S3 N16R8 (16 MB flash, 8 MB octal PSRAM)
 - CI flags: `esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi`
 - Serial monitor: **115200 baud**

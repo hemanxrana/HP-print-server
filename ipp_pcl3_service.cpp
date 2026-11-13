@@ -1,6 +1,7 @@
 #include "ipp_pcl3_service.h"
 #include "logger.h"
 #include "config.h"
+#include "job_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,9 +22,15 @@ constexpr const char *PCL3_MIME = PRINTER_DOCUMENT_FORMAT;
 
 WiFiServer ippServer(IPP_PORT);
 static uint8_t *bodyBuffer = nullptr;
+// Whole-document staging buffer.  A document is read here in full and only
+// then handed to the USB backend, so a client abort (short body, dropped
+// socket, chunk framing error) leaves the printer completely untouched.
+static uint8_t *documentBuffer = nullptr;
+static size_t documentCapacity = 0;
 // One request is handled at a time, so a single shared response buffer is
-// enough and keeps 8 KB off the loop task's stack.
-static uint8_t responseBuffer[IPP_RESPONSE_MAX];
+// enough.  begin() allocates it in PSRAM (internal-heap fallback) because
+// keeping 16 KB out of .bss leaves that DRAM for Wi-Fi/lwIP and the USB stack.
+static uint8_t *responseBuffer = nullptr;
 
 bool readClientByte(WiFiClient &client, uint8_t &out, uint32_t timeoutMs) {
   const uint32_t started = millis();
@@ -57,9 +64,12 @@ size_t readClientBlock(WiFiClient &client, uint8_t *dst, size_t capacity, uint32
 bool readHttpHeader(WiFiClient &client, String &header) {
   header = "";
   header.reserve(1024);
+  const uint32_t started = millis();
   uint8_t b = 0;
   while (header.length() < HTTP_HEADER_LIMIT) {
-    if (!readClientByte(client, b, 10000)) return false;
+    const uint32_t elapsed = millis() - started;
+    if (elapsed >= IPP_HEADER_TIMEOUT_MS) return false;
+    if (!readClientByte(client, b, IPP_HEADER_TIMEOUT_MS - elapsed)) return false;
     header += (char)b;
     if (header.endsWith("\r\n\r\n")) return true;
   }
@@ -109,37 +119,112 @@ struct BodyReader {
   bool framingError = false;
   bool peerClosed = false;
 
+  // Cooperative mode used by the IPP document pump: reads only bytes that are
+  // already buffered and never waits.  A not-yet-arrived byte sets
+  // awaitingData; the partial chunk-size line / trailer is retained so the
+  // next pump can continue exactly where this one stopped.
+  bool nonBlocking = false;
+  bool awaitingData = false;
+  bool trailerPending = false;
+  bool consumingTrailers = false;
+  uint8_t crlfGot = 0;
+  String partialLine;
+
   explicit BodyReader(WiFiClient &c) : client(c) {}
 
-  bool rawByte(uint8_t &b) {
-    if (readClientByte(client, b, CLIENT_TIMEOUT_MS)) return true;
-    if (!client.connected() && client.available() == 0) peerClosed = true;
-    return false;
+  bool readAvailable(uint8_t *dst, size_t want, size_t &got) {
+    got = 0;
+    if (!dst || !want) return false;
+    if (nonBlocking) {
+      const int avail = client.available();
+      if (avail > 0) {
+        const int n = client.read(dst, min(want, (size_t)avail));
+        if (n > 0) { got = (size_t)n; return true; }
+      }
+      if (!client.connected() && client.available() == 0) peerClosed = true;
+      else awaitingData = true;
+      return false;
+    }
+    got = readClientBlock(client, dst, want, CLIENT_TIMEOUT_MS);
+    if (!got) {
+      if (!client.connected() && client.available() == 0) peerClosed = true;
+      return false;
+    }
+    return true;
   }
 
+  bool rawByte(uint8_t &b) {
+    size_t got = 0;
+    return readAvailable(&b, 1, got) && got == 1;
+  }
+
+  // Persistent partial-line buffer: a chunk header split across two pump calls
+  // must not be re-parsed from scratch, and a timeout must not be mistaken for
+  // a framing error.
   bool rawLine(String &line) {
-    line = "";
-    uint8_t b = 0;
-    while (line.length() < 128) {
+    for (;;) {
+      uint8_t b = 0;
       if (!rawByte(b)) return false;
       if (b == '\n') {
+        line = partialLine;
+        partialLine = "";
         if (line.endsWith("\r")) line.remove(line.length() - 1);
         return true;
       }
-      line += (char)b;
+      if (partialLine.length() >= 128) {
+        partialLine = "";
+        framingError = true;
+        return false;
+      }
+      partialLine += (char)b;
     }
-    return false;
+  }
+
+  // Consume the CRLF that follows a data chunk.  Split-safe: crlfGot remembers
+  // whether \r or \n was already consumed.
+  bool ensureTrailer() {
+    while (crlfGot < 2) {
+      uint8_t b = 0;
+      if (!rawByte(b)) {
+        if (peerClosed) framingError = true;
+        return false;
+      }
+      const uint8_t want = (crlfGot == 0) ? (uint8_t)'\r' : (uint8_t)'\n';
+      if (b != want) { framingError = true; return false; }
+      ++crlfGot;
+    }
+    crlfGot = 0;
+    trailerPending = false;
+    return true;
   }
 
   bool nextChunk() {
     String line;
+
+    // Resume an interrupted zero-chunk trailer block: these lines must never be
+    // interpreted as a chunk-size line.
+    if (consumingTrailers) {
+      do {
+        if (!rawLine(line)) {
+          if (awaitingData) return false;
+          break;
+        }
+      } while (line.length() != 0);
+      consumingTrailers = false;
+      done = true;
+      return false;
+    }
+
     do {
       if (!rawLine(line)) {
-        // A peer that closes exactly at a chunk boundary without sending the
-        // terminating 0-chunk has still delivered every byte it produced; leave
-        // framingError clear so the caller may accept the document.  A partial
-        // size line, or a timeout while still connected, is a real error.
-        if (!(peerClosed && line.length() == 0)) framingError = true;
+        // Waiting for more bytes is not an error.  A peer that closes exactly
+        // at a chunk boundary without sending the terminating 0-chunk has
+        // still delivered every byte it produced; leave framingError clear so
+        // the caller may accept the document.  A partial size line, or a
+        // timeout while still connected, is a real error.
+        if (awaitingData) return false;
+        if (peerClosed && partialLine.length() == 0) return false;
+        framingError = true;
         return false;
       }
     } while (line.length() == 0);
@@ -152,9 +237,14 @@ struct BodyReader {
     if (!endp || *endp != 0) { framingError = true; return false; }
 
     if (n == 0) {
+      consumingTrailers = true;
       do {
-        if (!rawLine(line)) break;
+        if (!rawLine(line)) {
+          if (awaitingData) return false;
+          break;
+        }
       } while (line.length() != 0);
+      consumingTrailers = false;
       done = true;
       return false;
     }
@@ -173,16 +263,13 @@ struct BodyReader {
       return true;
     }
 
-    if (chunkRemaining == 0 && !nextChunk()) return false;
+    if (chunkRemaining == 0) {
+      if (trailerPending && !ensureTrailer()) return false;
+      if (!nextChunk()) return false;
+    }
     if (!rawByte(b)) return false;
     --chunkRemaining;
-    if (chunkRemaining == 0) {
-      uint8_t cr = 0, lf = 0;
-      if (!rawByte(cr) || !rawByte(lf) || cr != '\r' || lf != '\n') {
-        framingError = true;
-        return false;
-      }
-    }
+    if (chunkRemaining == 0) trailerPending = true;
     return true;
   }
 
@@ -195,24 +282,23 @@ struct BodyReader {
   // without sending the terminating zero-length chunk. Some Android clients
   // close the socket instead of terminating the chunked body.
   bool atChunkBoundary() const {
-    return chunked && !framingError && !done && chunkRemaining == 0;
+    return chunked && !framingError && !done && chunkRemaining == 0 &&
+           !trailerPending && crlfGot == 0;
   }
 
   // Fast document path. IPP headers/attributes are still parsed byte-wise, but
   // after the end-of-attributes tag the document is dechunked into large blocks.
   size_t readBlock(uint8_t *dst, size_t capacity) {
     if (!dst || !capacity || done || framingError) return 0;
+    awaitingData = false;
 
     if (!chunked) {
       if (remaining == 0) { done = true; return 0; }
       size_t want = capacity;
       if (remaining > 0) want = min(want, (size_t)remaining);
-      const size_t got = readClientBlock(client, dst, want, CLIENT_TIMEOUT_MS);
-      if (!got) {
-        if (!client.connected() && client.available() == 0) {
-          peerClosed = true;
-          if (remaining < 0) done = true;
-        }
+      size_t got = 0;
+      if (!readAvailable(dst, want, got)) {
+        if (peerClosed && remaining < 0) done = true;
         return 0;
       }
       if (remaining > 0) {
@@ -225,6 +311,8 @@ struct BodyReader {
     size_t total = 0;
     while (total < capacity && !done && !framingError) {
       if (chunkRemaining == 0) {
+        if (trailerPending && !ensureTrailer()) break;
+        if (done || framingError) break;
         if (!nextChunk()) break;
       }
       const size_t room = capacity - total;
@@ -232,22 +320,13 @@ struct BodyReader {
       const size_t want = (chunkRemaining < room) ? chunkRemaining : room;
       if (want == 0) break;
 
-      const size_t got = readClientBlock(client, dst + total, want, CLIENT_TIMEOUT_MS);
-      if (!got) {
-        if (!client.connected() && client.available() == 0) peerClosed = true;
-        break;
-      }
+      size_t got = 0;
+      if (!readAvailable(dst + total, want, got)) break;
 
       total += got;
       chunkRemaining -= got;
 
-      if (chunkRemaining == 0) {
-        uint8_t cr = 0, lf = 0;
-        if (!rawByte(cr) || !rawByte(lf) || cr != '\r' || lf != '\n') {
-          framingError = true;
-          break;
-        }
-      }
+      if (chunkRemaining == 0) trailerPending = true;
     }
     return total;
   }
@@ -265,6 +344,8 @@ bool supportedDocumentFormat(const String &format) {
 #endif
   return format.equalsIgnoreCase("application/octet-stream");
 }
+
+
 
 struct IppWriter {
   uint8_t *data = responseBuffer;
@@ -509,13 +590,12 @@ void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32
     w.str(0x44,nullptr,"photo");
   }
   if (f.want("printer-icons")) {
-    const String icons = httpBaseUri();
-    const String small = icons + "/icon-48.png";
-    const String medium = icons + "/icon-128.png";
-    const String large = icons + "/icon-512.png";
-    w.str(0x45,"printer-icons",small.c_str());
-    w.str(0x45,nullptr,medium.c_str());
-    w.str(0x45,nullptr,large.c_str());
+    // The firmware ships exactly one 64x64 PNG.  Previously 48/128/512 URLs
+    // were advertised while all three returned that same image, so clients
+    // cached a mislabelled size.  Advertise the real icon and let the client
+    // scale it; /icon-48.png, -128 and -512 remain as aliases for cached URLs.
+    const String icon = httpBaseUri() + "/icon-64.png";
+    w.str(0x45,"printer-icons",icon.c_str());
   }
   if (f.want("printer-strings-uri")) {
     // We do not ship a localisation catalogue; advertise nothing rather than a
@@ -618,7 +698,11 @@ void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32
 #endif
 
   if (f.want("printer-resolution-supported",true)) {
+    // The PCLm source block below advertises 300/600, and the Smart Tank class
+    // prints 600x600 PCL3GUI, so keep the two claims consistent.  The default
+    // stays at 300 dpi for driver compatibility.
     w.resolution("printer-resolution-supported",300);
+    w.resolution(nullptr,600);
   }
   if (f.want("printer-resolution-default",true)) {
     w.resolution("printer-resolution-default",300);
@@ -631,8 +715,12 @@ void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32
   if (f.want("print-quality-default",true)) w.integer(0x23,"print-quality-default",4);
 
   if (f.want("media-supported",true)) {
+    // RFC 8010 3.5.5: the name may be omitted only on *subsequent* values of
+    // the same attribute.  The first value must carry it, otherwise a strict
+    // parser treats it as another value of the preceding attribute (here
+    // print-quality-default, an enum) and rejects the response.
     for(size_t i=0;i<MEDIA_COUNT;++i)
-      w.str(0x44,i?"media-supported":nullptr,MEDIA_DEFS[i].name);
+      w.str(0x44,i==0?"media-supported":nullptr,MEDIA_DEFS[i].name);
   }
   if (f.want("media-default",true)) w.str(0x44,"media-default","iso_a4_210x297mm");
   if (f.want("media-ready",true)) {
@@ -645,7 +733,7 @@ void sendPrinterAttributes(WiFiClient &client,uint8_t major,uint8_t minor,uint32
   }
   if (f.want("media-size-supported",true)) {
     for(size_t i=0;i<MEDIA_COUNT;++i)
-      writeMediaSize(w,i?"media-size-supported":nullptr,MEDIA_DEFS[i].x,MEDIA_DEFS[i].y);
+      writeMediaSize(w,i==0?"media-size-supported":nullptr,MEDIA_DEFS[i].x,MEDIA_DEFS[i].y);
   }
   if (f.want("media-col-default",true)) {
     writeMediaCol(w,"media-col-default",MEDIA_DEFS[0],PRINTER_PAPER_MARGIN);
@@ -822,6 +910,49 @@ bool parseAttributes(BodyReader &r,RequestAttrs &attrs){
 }
 } // namespace
 
+// One IPP document being received/sent cooperatively across poll() calls.
+// Owned by IppPcl3Service::documentJob_; heap-allocated because the socket and
+// the body parser must outlive handleClient().
+struct IppPcl3Service::DocumentJob {
+  enum Phase : uint8_t { RECEIVE, FINALIZE, RESPOND };
+
+  Phase phase = RECEIVE;
+  WiFiClient *client = nullptr;
+  // BodyReader lives in the anonymous namespace; store it untyped so the
+  // DocumentJob type does not acquire an internal-linkage subobject.
+  void *body = nullptr;
+  uint32_t jobId = 0;
+  uint32_t requestId = 0;
+  uint8_t major = 0;
+  uint8_t minor = 0;
+  uint8_t sourceKind = JobLog::IPP_PRINT;
+  String clientIp;
+  String format;
+
+  unsigned long startedMs = 0;
+  unsigned long deadlineMs = 0;
+  unsigned long lastProgressMs = 0;
+
+  // Safe-hybrid staging ring.  head/tail/used index documentBuffer.
+  bool staging = false;
+  size_t head = 0;
+  size_t tail = 0;
+  size_t used = 0;
+  size_t capacityAtStart = 0;
+
+  uint64_t received = 0;
+  uint64_t accepted = 0;
+  uint32_t networkReadMs = 0;
+  uint32_t usbSendMs = 0;
+
+  bool sendEnabled = false;
+  bool earlyStream = false;
+  bool bodyComplete = false;
+  bool handedOff = false;
+  bool startLogged = false;
+  String error;
+};
+
 
 String IppPcl3Service::printerUuidBare() {
   static String cached;
@@ -852,11 +983,33 @@ String printerUuid() {
   return String("urn:uuid:") + IppPcl3Service::printerUuidBare();
 }
 
+void IppPcl3Service::recordJob(uint8_t state, const String &reason) {
+  if (lastJobId_ == 0 || jobRecorded_) return;
+  JobRecord &r = jobHistory_[jobHistoryHead_];
+  r.id = lastJobId_;
+  r.state = state;
+  r.completedUpTime = upTimeSeconds();
+  strncpy(r.name, lastJobName_.c_str(), sizeof(r.name) - 1);
+  r.name[sizeof(r.name) - 1] = 0;
+  strncpy(r.reason, reason.c_str(), sizeof(r.reason) - 1);
+  r.reason[sizeof(r.reason) - 1] = 0;
+  jobHistoryHead_ = (uint8_t)((jobHistoryHead_ + 1) % JOB_HISTORY_SIZE);
+  if (jobHistoryCount_ < JOB_HISTORY_SIZE) ++jobHistoryCount_;
+  jobRecorded_ = true;
+}
+
 void IppPcl3Service::refreshJobState(){
   if (lastJobId_ == 0) return;
   // A Create-Job'd job stays pending until its first document byte arrives.
   if (lastJobState_ == 3 && !jobStartedProcessing_) return;
   if (lastJobState_ != 3 && lastJobState_ != 4) return;
+
+  auto logTerminal = [&](uint8_t state, const String &why) {
+    if (lastJobSource_ == 0xFF) return;  // job never reached a document pump
+    JobLog::record((JobLog::Source)lastJobSource_, lastJobId_, state, why.c_str(),
+                   printer_.statusReason().c_str(), (uint32_t)lastJobBytes_, 0,
+                   "", "");
+  };
 
   const auto state = printer_.state();
   if (state == UsbPrinterBackend::IDLE) {
@@ -864,17 +1017,23 @@ void IppPcl3Service::refreshJobState(){
     lastJobReason_ = "job-completed-successfully";
     jobCompletedUpTime_ = upTimeSeconds();
     pendingJob_ = false;
+    recordJob(lastJobState_, lastJobReason_);
+    logTerminal(lastJobState_, lastJobReason_);
     Log.printf("[IPP] Job %lu state -> 9 completed\n", (unsigned long)lastJobId_);
   } else if (state == UsbPrinterBackend::ERROR) {
     lastJobState_ = 8;
     lastJobReason_ = "aborted-by-system";
     pendingJob_ = false;
+    recordJob(lastJobState_, lastJobReason_);
+    logTerminal(lastJobState_, lastJobReason_);
     Log.printf("[IPP] Job %lu state -> 8 aborted: %s\n",
                (unsigned long)lastJobId_, printer_.statusReason().c_str());
   } else if (state == UsbPrinterBackend::OFFLINE) {
     lastJobState_ = 6;
     lastJobReason_ = "printer-stopped";
     pendingJob_ = false;
+    recordJob(lastJobState_, lastJobReason_);
+    logTerminal(lastJobState_, lastJobReason_);
     Log.printf("[IPP] Job %lu state -> 6 stopped: %s\n",
                (unsigned long)lastJobId_, printer_.statusReason().c_str());
   }
@@ -894,6 +1053,24 @@ void IppPcl3Service::begin(){
     if(!bodyBuffer){ Log.println("[IPP] PSRAM alloc failed for IPP document buffer, using heap"); bodyBuffer=(uint8_t*)malloc(BODY_BUFFER); }
     if(!bodyBuffer){ Log.println("[IPP] Failed to allocate IPP document buffer; IPP disabled"); return; }
     Log.printf("[IPP] Allocated %u byte IPP document buffer\n",(unsigned)BODY_BUFFER);
+  }
+  if(!documentBuffer){
+    // Whole-document staging: PSRAM only.  If it cannot be allocated the IPP
+    // path still works, but each document falls back to streaming.
+    documentBuffer=(uint8_t*)heap_caps_malloc(IPP_DOCUMENT_BUFFER_MIN,MALLOC_CAP_SPIRAM);
+    if(!documentBuffer){
+      Log.println("[IPP] PSRAM whole-document buffer unavailable; documents will stream");
+    }else{
+      documentCapacity=IPP_DOCUMENT_BUFFER_MIN;
+      Log.printf("[IPP] Allocated %u byte whole-document buffer in PSRAM (grows to %u)\n",
+                 (unsigned)documentCapacity,(unsigned)IPP_DOCUMENT_BUFFER_MAX);
+    }
+  }
+  if(!responseBuffer){
+    responseBuffer=(uint8_t*)heap_caps_malloc(IPP_RESPONSE_MAX,MALLOC_CAP_SPIRAM);
+    if(!responseBuffer){ Log.println("[IPP] PSRAM alloc failed for IPP response buffer, using heap"); responseBuffer=(uint8_t*)malloc(IPP_RESPONSE_MAX); }
+    if(!responseBuffer){ Log.println("[IPP] Failed to allocate IPP response buffer; IPP disabled"); return; }
+    Log.printf("[IPP] Allocated %u byte IPP response buffer\n",(unsigned)IPP_RESPONSE_MAX);
   }
   if (observedPrinterState_ == 0xFF) {
     stateChangeUpTime_ = upTimeSeconds();
@@ -916,13 +1093,379 @@ void IppPcl3Service::poll(){
   refreshJobState();
   trackPrinterState();
 
+  // A document is in flight: service it cooperatively and do not accept a
+  // second connection.  This keeps USB status, mDNS, the dashboard and RAW
+  // 9100 responsive while the printer is printing.
+  if (documentJob_) { pumpDocument(); return; }
+
   WiFiClient client=ippServer.accept();
   if(client) handleClient(client);
 }
 
+bool IppPcl3Service::startDocument(WiFiClient &client, bool chunked,
+                                   int64_t remaining, size_t chunkRemaining,
+                                   bool trailerPending, uint8_t crlfGot,
+                                   const String &partialLine, uint8_t major,
+                                   uint8_t minor, uint32_t requestId,
+                                   uint32_t jobId, uint8_t sourceKind,
+                                   const String &format){
+  if (documentJob_) {
+    lastError_ = "IPP document pump already active";
+    return false;
+  }
+
+  DocumentJob *job = new DocumentJob();
+  WiFiClient *held = new WiFiClient(client);
+  BodyReader *body = new BodyReader(*held);
+  if (!job || !held || !body) {
+    delete body;
+    delete held;
+    delete job;
+    lastError_ = "insufficient memory for IPP document job";
+    return false;
+  }
+
+  body->chunked = chunked;
+  body->remaining = remaining;
+  body->chunkRemaining = chunkRemaining;
+  body->trailerPending = trailerPending;
+  body->crlfGot = crlfGot;
+  body->partialLine = partialLine;
+  body->nonBlocking = true;
+
+  job->client = held;
+  job->body = body;
+  job->jobId = jobId;
+  job->requestId = requestId;
+  job->major = major;
+  job->minor = minor;
+  job->sourceKind = sourceKind;
+  job->clientIp = held->remoteIP().toString();
+  job->format = format;
+  job->startedMs = millis();
+  job->deadlineMs = job->startedMs + IPP_JOB_DEADLINE_MS;
+  job->lastProgressMs = job->startedMs;
+  job->staging = (documentBuffer != nullptr && documentCapacity > 0);
+  job->capacityAtStart = documentCapacity;
+
+  documentJob_ = job;
+  lastJobSource_ = sourceKind;
+  printer_.setIppDocumentActive(true);
+
+  JobLog::record((JobLog::Source)sourceKind, jobId, 3, "job-incoming",
+                 job->staging ? "cooperative pump (staged)" : "cooperative pump (streamed)",
+                 0, 0, job->clientIp.c_str(), job->format.c_str());
+  job->startLogged = true;
+
+  Log.printf("[IPP] job=%lu pump started: staging=%s capacity=%u threshold=%u chunked=%s client=%s format=%s\n",
+             (unsigned long)jobId, job->staging ? "psram" : "direct",
+             (unsigned)(job->staging ? documentCapacity : BODY_BUFFER),
+             (unsigned)IPP_STREAM_THRESHOLD_BYTES,
+             chunked ? "yes" : "no", job->clientIp.c_str(),
+             format.length() ? format.c_str() : "(none)");
+  return true;
+}
+
+void IppPcl3Service::closeDocumentJob(){
+  DocumentJob *job = documentJob_;
+  if (!job) return;
+  documentJob_ = nullptr;
+  printer_.setIppDocumentActive(false);
+  if (job->client) job->client->stop();
+  delete static_cast<BodyReader *>(job->body);
+  delete job->client;
+  delete job;
+  clientActive_ = false;
+}
+
+void IppPcl3Service::failDocumentJob(const String &reason){
+  DocumentJob *job = documentJob_;
+  if (!job) return;
+  BodyReader *body = static_cast<BodyReader *>(job->body);
+
+  lastError_ = reason;
+  lastJobBytes_ = job->accepted;
+
+  const bool alreadyTerminal = (lastJobState_ == 6 || lastJobState_ == 8);
+  if (!alreadyTerminal) {
+    Log.printf("[IPP] document failed: job=%lu received=%llu accepted=%llu done=%s peer-closed=%s framing-error=%s source=%s reason=%s\n",
+               (unsigned long)job->jobId,
+               (unsigned long long)job->received,
+               (unsigned long long)job->accepted,
+               body && body->done ? "yes" : "no",
+               body && body->peerClosed ? "yes" : "no",
+               body && body->framingError ? "yes" : "no",
+               job->earlyStream ? "streamed" : "psram",
+               reason.c_str());
+
+    // Abort semantics:
+    //  * Nothing reached USB: the printer never saw this job.  Leave the
+    //    backend alone; do not reset or truncate anything.
+    //  * Bytes reached USB and the backend is still healthy: the *client*
+    //    ended the document early.  Flush the accepted bytes and terminate the
+    //    stream with the normal ZLP/SOFT_RESET so the printer is not abandoned
+    //    mid-raster.  This is not a USB failure.
+    //  * Backend ERROR: sendDirect() already aborted the job.
+    if (printer_.state() == UsbPrinterBackend::ERROR) {
+      // Real USB failure, already handled.
+    } else if (job->handedOff && printer_.state() == UsbPrinterBackend::PRINTING) {
+      printer_.endRawJobOnSourceAbort(reason);
+    }
+
+    lastJobState_ = 8;
+    lastJobReason_ = "aborted-by-system";
+    recordJob(lastJobState_, lastJobReason_);
+  }
+
+  JobLog::record((JobLog::Source)job->sourceKind, job->jobId, lastJobState_,
+                 lastJobReason_.c_str(), reason.c_str(),
+                 (uint32_t)job->accepted,
+                 (uint32_t)(millis() - job->startedMs),
+                 job->clientIp.c_str(), job->format.c_str());
+
+  if (job->client) {
+    sendJobResponse(*job->client, job->major, job->minor, 0x0500,
+                    job->requestId, job->jobId, lastJobState_,
+                    lastJobReason_, lastJobName_, upTimeSeconds(),
+                    jobProcessingUpTime_, jobCompletedUpTime_, false);
+  }
+  closeDocumentJob();
+}
+
+void IppPcl3Service::pumpDocument(){
+  DocumentJob *job = documentJob_;
+  if (!job) return;
+  BodyReader *body = static_cast<BodyReader *>(job->body);
+
+  esp_task_wdt_reset();
+  refreshJobState();
+
+  if (lastJobState_ == 8) {
+    failDocumentJob(lastError_.length() ? lastError_ : "printer aborted the job");
+    return;
+  }
+
+  const unsigned long now = millis();
+  if ((long)(now - job->deadlineMs) >= 0) {
+    failDocumentJob("job exceeded the document deadline");
+    return;
+  }
+
+  auto pushToPrinter = [&](const uint8_t *data, size_t length) -> bool {
+    const uint32_t started = millis();
+    const bool sent = printer_.sendDirect(data, length, job->error);
+    job->usbSendMs += millis() - started;
+    if (!sent) return false;
+    if (!job->handedOff) {
+      job->handedOff = true;
+      jobStartedProcessing_ = true;
+      lastJobState_ = 4;
+      lastJobReason_ = "job-printing";
+      jobProcessingUpTime_ = upTimeSeconds();
+    }
+    job->accepted += length;
+    lastJobBytes_ = job->accepted;
+    job->lastProgressMs = millis();
+    return true;
+  };
+
+  if (job->phase == DocumentJob::RECEIVE) {
+    // A declared Content-Length of zero never produces readable bytes, so the
+    // loop below would sit until the client timeout.  Finish it immediately.
+    if (!body->chunked && body->remaining == 0) body->done = true;
+
+    // --- receive, bounded per poll -------------------------------------
+    size_t readBudget = IPP_PUMP_READ_BYTES;
+    while (readBudget > 0) {
+      if (job->client->available() <= 0) break;
+
+      if (job->staging) {
+        // Grow the PSRAM ring on demand before declaring backpressure.  Only
+        // a genuinely full ring stalls the receive side; the send side drains
+        // it on this and following polls.
+        if (job->used == documentCapacity &&
+            documentCapacity < (size_t)IPP_DOCUMENT_BUFFER_MAX) {
+          size_t next = documentCapacity * 2;
+          if (next > (size_t)IPP_DOCUMENT_BUFFER_MAX) next = IPP_DOCUMENT_BUFFER_MAX;
+          uint8_t *grown = (uint8_t *)heap_caps_realloc(documentBuffer, next, MALLOC_CAP_SPIRAM);
+          if (grown) {
+            // Only a full ring causes growth, so head == tail and the bytes
+            // after head wrap to zero: linearise them just past the old end.
+            const size_t wrapped = job->head;
+            if (wrapped) memmove(grown + documentCapacity, grown, wrapped);
+            job->head = documentCapacity + wrapped;
+            documentBuffer = grown;
+            documentCapacity = next;
+            Log.printf("[IPP] whole-document buffer grown to %u bytes\n",
+                       (unsigned)documentCapacity);
+          }
+        }
+
+        const size_t freeSpace = documentCapacity - job->used;
+        if (!freeSpace) break;  // USB backpressure; send side catches up
+
+        if (job->head >= documentCapacity) job->head = 0;
+        const size_t contiguous = documentCapacity - job->head;
+        size_t want = contiguous < freeSpace ? contiguous : freeSpace;
+        if (want > readBudget) want = readBudget;
+        if (!want) break;
+
+        const uint32_t readStarted = millis();
+        const size_t got = body->readBlock(documentBuffer + job->head, want);
+        job->networkReadMs += millis() - readStarted;
+        if (!got) break;
+
+        job->head = (job->head + got) % documentCapacity;
+        job->used += got;
+        job->received += got;
+        readBudget -= got;
+        job->lastProgressMs = millis();
+      } else {
+        const size_t want = readBudget < BODY_BUFFER ? readBudget : BODY_BUFFER;
+        const uint32_t readStarted = millis();
+        const size_t got = body->readBlock(bodyBuffer, want);
+        job->networkReadMs += millis() - readStarted;
+        if (!got) break;
+
+        job->received += got;
+        readBudget -= got;
+        if (!pushToPrinter(bodyBuffer, got)) {
+          failDocumentJob(job->error.length() ? job->error : "USB send failed");
+          return;
+        }
+      }
+    }
+
+    // If the peer closed with nothing buffered, run one read so the body
+    // reader records peerClosed and finishes any pending chunk trailer state.
+    // Without this a clean FIN at a chunk boundary would be reported as a
+    // truncated body.
+    if (job->client->available() <= 0 && !job->client->connected()) {
+      body->readBlock(bodyBuffer, 1);
+    }
+
+    if (body->framingError) {
+      failDocumentJob("HTTP chunk framing error");
+      return;
+    }
+
+    job->bodyComplete = body->done ||
+                        (body->peerClosed && body->atChunkBoundary());
+    const bool linkDown = !job->client->connected() && job->client->available() == 0;
+
+    if (!job->bodyComplete && (body->peerClosed || linkDown)) {
+      failDocumentJob("IPP client disconnected before the complete document was received");
+      return;
+    }
+    if (!job->bodyComplete &&
+        (millis() - job->lastProgressMs) >= IPP_CLIENT_TIMEOUT_MS) {
+      failDocumentJob("IPP client stalled");
+      return;
+    }
+
+    // --- safe hybrid: start the USB hand-off -----------------------------
+    // Below the threshold the body is complete first, so an abort leaves the
+    // printer untouched.  Above it the document streams while the rest of the
+    // body is still arriving.
+    if (!job->sendEnabled) {
+      if (!job->staging || job->bodyComplete ||
+          job->used >= (size_t)IPP_STREAM_THRESHOLD_BYTES) {
+        job->sendEnabled = true;
+        job->earlyStream = !job->bodyComplete;
+        if (job->earlyStream) {
+          Log.printf("[IPP] job=%lu streaming after %u staged bytes (threshold=%u)\n",
+                     (unsigned long)job->jobId, (unsigned)job->used,
+                     (unsigned)IPP_STREAM_THRESHOLD_BYTES);
+        }
+      }
+    }
+
+    if (job->staging && job->sendEnabled) {
+      size_t sendBudget = IPP_PUMP_SEND_BYTES;
+      while (sendBudget > 0 && job->used > 0) {
+        if (job->tail >= documentCapacity) job->tail = 0;
+        size_t contiguous = documentCapacity - job->tail;
+        if (contiguous > job->used) contiguous = job->used;
+        size_t part = contiguous < sendBudget ? contiguous : sendBudget;
+        if (!pushToPrinter(documentBuffer + job->tail, part)) {
+          failDocumentJob(job->error.length() ? job->error : "USB send failed");
+          return;
+        }
+        job->tail = (job->tail + part) % documentCapacity;
+        job->used -= part;
+        sendBudget -= part;
+        esp_task_wdt_reset();
+        if ((long)(millis() - job->deadlineMs) >= 0) {
+          failDocumentJob("job exceeded the document deadline");
+          return;
+        }
+      }
+    }
+
+    if (job->bodyComplete && (!job->staging || job->used == 0)) {
+      if (job->received == 0 || job->accepted == 0) {
+        failDocumentJob("document was empty");
+        return;
+      }
+      job->phase = DocumentJob::FINALIZE;
+    }
+  }
+
+  if (job->phase == DocumentJob::FINALIZE) {
+    if (printer_.state() != UsbPrinterBackend::PRINTING) {
+      failDocumentJob(printer_.statusReason().length()
+                          ? printer_.statusReason()
+                          : "printer is not printing");
+      return;
+    }
+    if (!printer_.finishRawJobStep()) {
+      if ((millis() - job->lastProgressMs) >= IPP_CLIENT_TIMEOUT_MS) {
+        failDocumentJob("USB hand-off did not drain");
+      }
+      return;
+    }
+    if (printer_.state() == UsbPrinterBackend::ERROR) {
+      failDocumentJob(printer_.lastError().length()
+                          ? printer_.lastError()
+                          : "USB failure during finalize");
+      return;
+    }
+    job->phase = DocumentJob::RESPOND;
+  }
+
+  if (job->phase == DocumentJob::RESPOND) {
+    lastJobBytes_ = job->accepted;
+    const uint32_t totalMs = (uint32_t)(millis() - job->startedMs);
+    const uint64_t kibPerSecond =
+        totalMs ? ((job->accepted * 1000ULL) / 1024ULL / totalMs) : 0;
+    Log.printf("[IPP][PERF] job=%lu received=%llu accepted=%llu source=%s total=%lu ms net-read=%lu ms usb-send=%lu ms avg=%llu KiB/s staging=%u\n",
+               (unsigned long)job->jobId,
+               (unsigned long long)job->received,
+               (unsigned long long)job->accepted,
+               job->earlyStream ? "streamed" : "psram",
+               (unsigned long)totalMs,
+               (unsigned long)job->networkReadMs,
+               (unsigned long)job->usbSendMs,
+               (unsigned long long)kibPerSecond,
+               (unsigned)(job->staging ? documentCapacity : BODY_BUFFER));
+    if (!body->done) {
+      Log.printf("[IPP] job=%lu: client closed at a chunk boundary without the terminating 0-chunk; accepting the document\n",
+                 (unsigned long)job->jobId);
+    }
+    Log.printf("[IPP] %s accepted: job=%lu %llu bytes\n",
+               job->sourceKind == JobLog::IPP_SEND ? "Send-Document" : "Print-Job",
+               (unsigned long)job->jobId, (unsigned long long)job->accepted);
+    sendJobResponse(*job->client, job->major, job->minor, 0x0000,
+                    job->requestId, job->jobId, lastJobState_,
+                    lastJobReason_, lastJobName_, upTimeSeconds(),
+                    jobProcessingUpTime_, jobCompletedUpTime_, false);
+    closeDocumentJob();
+  }
+}
+
 void IppPcl3Service::handleClient(WiFiClient &client){
-  if(!bodyBuffer){
-    lastError_="IPP document buffer unavailable";
+  if(!bodyBuffer || !responseBuffer){
+    lastError_="IPP buffer unavailable";
     client.stop();
     return;
   }
@@ -983,7 +1526,7 @@ void IppPcl3Service::handleClient(WiFiClient &client){
 
   // Consume the (normally empty) remainder of a non-document request so the
   // socket is closed with a clean FIN instead of an RST from unread data.
-  // Document ops consume their own body inside streamDocument().
+  // Document ops consume their own body inside the cooperative pump.
   if (!documentOp && (body.chunked || body.remaining > 0)) {
     uint8_t scratch[64];
     const unsigned long drainStart = millis();
@@ -993,76 +1536,6 @@ void IppPcl3Service::handleClient(WiFiClient &client){
       esp_task_wdt_reset();
     }
   }
-
-  auto streamDocument = [&](BodyReader &b, uint32_t jobId) -> bool {
-    String error;
-    const uint32_t streamStarted = millis();
-    uint32_t networkReadMs = 0, usbSendMs = 0;
-    const unsigned long deadline = millis() + IPP_JOB_DEADLINE_MS;
-    bool ok = true;
-
-    while (true) {
-      esp_task_wdt_reset();
-      if ((long)(millis() - deadline) >= 0) {
-        lastError_ = "job exceeded the document deadline";
-        ok = false;
-        break;
-      }
-      const uint32_t readStarted = millis();
-      const size_t n = b.readBlock(bodyBuffer, BODY_BUFFER);
-      networkReadMs += millis() - readStarted;
-      if (!n) break;
-
-      const uint32_t usbStarted = millis();
-      const bool sent = printer_.sendDirect(bodyBuffer, n, error);
-      usbSendMs += millis() - usbStarted;
-      if (!sent) { lastError_ = error; ok = false; break; }
-
-      if (!jobStartedProcessing_) {
-        jobStartedProcessing_ = true;
-        lastJobState_ = 4;
-        lastJobReason_ = "job-printing";
-        jobProcessingUpTime_ = upTimeSeconds();
-      }
-      lastJobBytes_ += n;
-      yield();
-    }
-
-    const uint32_t totalMs = millis() - streamStarted;
-    const uint64_t kibPerSecond = totalMs ? ((lastJobBytes_ * 1000ULL) / 1024ULL / totalMs) : 0;
-    Log.printf("[IPP][PERF] job=%lu bytes=%llu total=%lu ms net-read=%lu ms usb-send=%lu ms avg=%llu KiB/s buffer=%u\n",
-                  (unsigned long)jobId,
-                  (unsigned long long)lastJobBytes_,
-                  (unsigned long)totalMs,
-                  (unsigned long)networkReadMs,
-                  (unsigned long)usbSendMs,
-                  (unsigned long long)kibPerSecond,
-                  (unsigned)BODY_BUFFER);
-
-    const bool complete = b.done || (b.peerClosed && b.atChunkBoundary());
-    if (ok && complete && !b.framingError && lastJobBytes_ > 0) {
-      if (!b.done) {
-        Log.printf("[IPP] job=%lu: client closed at a chunk boundary without the terminating 0-chunk; accepting the document\n",
-                   (unsigned long)jobId);
-      }
-      return true;
-    }
-
-    if (lastError_.isEmpty()) {
-      if (b.framingError) lastError_="HTTP chunk framing error";
-      else if (b.peerClosed) lastError_="IPP client disconnected before the complete document was received";
-      else if (lastJobBytes_ == 0) lastError_="document was empty";
-      else lastError_="document body ended unexpectedly";
-    }
-    Log.printf("[IPP] document failed: job=%lu bytes=%llu done=%s peer-closed=%s framing-error=%s reason=%s\n",
-                  (unsigned long)jobId,(unsigned long long)lastJobBytes_,
-                  b.done?"yes":"no",b.peerClosed?"yes":"no",b.framingError?"yes":"no",
-                  lastError_.c_str());
-    if (jobStartedProcessing_ || lastJobBytes_ > 0) printer_.abortRawJob(lastError_);
-    lastJobState_ = 8;
-    lastJobReason_ = "aborted-by-system";
-    return false;
-  };
 
   if(op==0x000B){
     // --- Get-Printer-Attributes ---
@@ -1141,22 +1614,27 @@ void IppPcl3Service::handleClient(WiFiClient &client){
     } else {
       const uint32_t jobId = nextJobId_++;
       lastJobId_=jobId; lastJobState_=3; lastJobReason_="job-incoming";
-      lastJobBytes_=0; jobStartedProcessing_=false; lastJobName_=attrs.jobName;
+      lastJobBytes_=0; jobStartedProcessing_=false; jobRecorded_=false; lastJobName_=attrs.jobName;
       jobProcessingUpTime_=0; jobCompletedUpTime_=0; pendingJob_=false;
+      lastJobSource_ = JobLog::IPP_PRINT;
 
-      const bool ok = streamDocument(body,jobId);
-      sendJobResponse(client,major,minor,ok?0x0000:0x0500,requestId,jobId,
-                      lastJobState_,lastJobReason_,lastJobName_,upTimeSeconds(),
-                      jobProcessingUpTime_,jobCompletedUpTime_,false);
-      if(ok){
-        printer_.finishRawJob();
-        Log.printf("[IPP] Print-Job accepted: job=%lu %llu bytes\n",
-                      (unsigned long)jobId,(unsigned long long)lastJobBytes_);
+      if(!startDocument(client,body.chunked,body.remaining,body.chunkRemaining,
+                        body.trailerPending,body.crlfGot,body.partialLine,
+                        major,minor,requestId,jobId,JobLog::IPP_PRINT,format)){
+        lastJobState_=8; lastJobReason_="aborted-by-system";
+        recordJob(lastJobState_, lastJobReason_);
+        JobLog::record(JobLog::IPP_PRINT,jobId,lastJobState_,lastJobReason_.c_str(),
+                       lastError_.c_str(),0,0,client.remoteIP().toString().c_str(),
+                       format.c_str());
+        sendSimple(client,major,minor,0x0500,requestId,false);
       }
     }
   } else if(op==0x0005){
     // --- Create-Job: allocate the job, the document follows in Send-Document ---
-    if(printer_.state()==UsbPrinterBackend::PRINTING){
+    if(printer_.rawClientConnected()){
+      lastError_="Create-Job refused: RAW 9100 client holds the USB stream";
+      sendSimple(client,major,minor,0x0503,requestId,false);
+    } else if(printer_.state()==UsbPrinterBackend::PRINTING){
       lastError_="Create-Job refused: printer is still printing the previous job";
       sendSimple(client,major,minor,0x0503,requestId,false);
     } else if(!printer_.online()){
@@ -1165,7 +1643,7 @@ void IppPcl3Service::handleClient(WiFiClient &client){
     } else {
       const uint32_t jobId = nextJobId_++;
       lastJobId_=jobId; lastJobState_=3; lastJobReason_="job-incoming";
-      lastJobBytes_=0; jobStartedProcessing_=false; lastJobName_=attrs.jobName;
+      lastJobBytes_=0; jobStartedProcessing_=false; jobRecorded_=false; lastJobName_=attrs.jobName;
       jobProcessingUpTime_=0; jobCompletedUpTime_=0; pendingJob_=true;
       Log.printf("[IPP] Create-Job: job=%lu awaiting Send-Document\n",(unsigned long)jobId);
       sendJobResponse(client,major,minor,0x0000,requestId,jobId,lastJobState_,lastJobReason_,
@@ -1180,6 +1658,11 @@ void IppPcl3Service::handleClient(WiFiClient &client){
     if(!pendingJob_ || lastJobId_==0){
       lastError_="Send-Document: no job awaiting a document";
       sendSimple(client,major,minor,0x0406,requestId,false);
+    } else if(printer_.rawClientConnected()){
+      // A RAW 9100 client started after Create-Job; do not let both sources
+      // write to the USB pipe.  Keep the job pending so the client can retry.
+      lastError_="Send-Document refused: RAW 9100 client holds the USB stream";
+      sendSimple(client,major,minor,0x0503,requestId,false);
     } else if(attrs.hasJobId && (uint32_t)attrs.jobId != lastJobId_){
       lastError_="Send-Document: job-id does not match";
       sendSimple(client,major,minor,0x0406,requestId,false);
@@ -1190,16 +1673,18 @@ void IppPcl3Service::handleClient(WiFiClient &client){
       lastError_="Send-Document rejected: unsupported document-format";
       sendSimple(client,major,minor,0x040A,requestId,false);
     } else {
-      lastJobBytes_=0; jobStartedProcessing_=false;
-      const bool ok = streamDocument(body,lastJobId_);
+      lastJobBytes_=0; jobStartedProcessing_=false; jobRecorded_=false;
+      lastJobSource_ = JobLog::IPP_SEND;
       pendingJob_=false;
-      sendJobResponse(client,major,minor,ok?0x0000:0x0500,requestId,lastJobId_,
-                      lastJobState_,lastJobReason_,lastJobName_,upTimeSeconds(),
-                      jobProcessingUpTime_,jobCompletedUpTime_,false);
-      if(ok){
-        printer_.finishRawJob();
-        Log.printf("[IPP] Send-Document accepted: job=%lu %llu bytes\n",
-                      (unsigned long)lastJobId_,(unsigned long long)lastJobBytes_);
+      if(!startDocument(client,body.chunked,body.remaining,body.chunkRemaining,
+                        body.trailerPending,body.crlfGot,body.partialLine,
+                        major,minor,requestId,lastJobId_,JobLog::IPP_SEND,format)){
+        lastJobState_=8; lastJobReason_="aborted-by-system";
+        recordJob(lastJobState_, lastJobReason_);
+        JobLog::record(JobLog::IPP_SEND,lastJobId_,lastJobState_,lastJobReason_.c_str(),
+                       lastError_.c_str(),0,0,client.remoteIP().toString().c_str(),
+                       format.c_str());
+        sendSimple(client,major,minor,0x0500,requestId,false);
       }
     }
   } else if(op==0x0008){
@@ -1215,6 +1700,7 @@ void IppPcl3Service::handleClient(WiFiClient &client){
       pendingJob_=false;
       lastJobState_=7;
       lastJobReason_="job-canceled-by-user";
+      recordJob(lastJobState_, lastJobReason_);
       Log.printf("[IPP] Job %lu canceled by client\n",(unsigned long)lastJobId_);
       sendJobResponse(client,major,minor,0x0000,requestId,lastJobId_,lastJobState_,lastJobReason_,
                       lastJobName_,upTimeSeconds(),jobProcessingUpTime_,jobCompletedUpTime_,keep);
@@ -1229,6 +1715,7 @@ void IppPcl3Service::handleClient(WiFiClient &client){
         lastJobState_=9;
         lastJobReason_="job-completed-successfully";
         jobCompletedUpTime_=upTimeSeconds();
+        recordJob(lastJobState_, lastJobReason_);
       }
       sendJobResponse(client,major,minor,0x0000,requestId,lastJobId_,lastJobState_,lastJobReason_,
                       lastJobName_,upTimeSeconds(),jobProcessingUpTime_,jobCompletedUpTime_,keep);
@@ -1238,17 +1725,38 @@ void IppPcl3Service::handleClient(WiFiClient &client){
     refreshJobState();
     if(attrs.hasJobId && lastJobId_ && (uint32_t)attrs.jobId != lastJobId_){
       sendSimple(client,major,minor,0x0406,requestId,keep);
-    } else if(lastJobId_){
-      Log.printf("[IPP] Job status: id=%lu state=%u reason=%s\n",
-                    (unsigned long)lastJobId_,lastJobState_,lastJobReason_.c_str());
-      sendJobResponse(client,major,minor,0x0000,requestId,lastJobId_,lastJobState_,lastJobReason_,
-                      lastJobName_,upTimeSeconds(),jobProcessingUpTime_,jobCompletedUpTime_,keep);
+    } else if(op==0x0009){
+      if(lastJobId_){
+        Log.printf("[IPP] Job status: id=%lu state=%u reason=%s\n",
+                      (unsigned long)lastJobId_,lastJobState_,lastJobReason_.c_str());
+        sendJobResponse(client,major,minor,0x0000,requestId,lastJobId_,lastJobState_,lastJobReason_,
+                        lastJobName_,upTimeSeconds(),jobProcessingUpTime_,jobCompletedUpTime_,keep);
+      } else {
+        sendSimple(client,major,minor,0x0000,requestId,keep);
+      }
     } else {
-      sendSimple(client,major,minor,0x0000,requestId,keep);
+      // Get-Jobs: the active job (while still pending/processing) followed by
+      // the terminal-state ring, newest first.
+      IppWriter w; beginResponse(w,major,minor,0x0000,requestId);
+      if(lastJobId_ && lastJobState_ != 6 && lastJobState_ != 7 &&
+         lastJobState_ != 8 && lastJobState_ != 9){
+        addJobAttributes(w,lastJobId_,lastJobState_,lastJobReason_,lastJobName_,
+                         upTimeSeconds(),jobProcessingUpTime_,0);
+      }
+      for(uint8_t i=0;i<jobHistoryCount_;++i){
+        const JobRecord &r = jobHistory_[(jobHistoryHead_ + JOB_HISTORY_SIZE - 1 - i) % JOB_HISTORY_SIZE];
+        addJobAttributes(w,r.id,r.state,String(r.reason),String(r.name),
+                         upTimeSeconds(),0,r.completedUpTime);
+      }
+      w.b(0x03); sendHttpIpp(client,w,keep);
     }
   } else {
     sendSimple(client,major,minor,0x0501,requestId,keep);
   }
+
+  // A document job handed the socket to the cooperative pump: it owns the
+  // client until the body has been consumed and the response has been sent.
+  if (documentJob_) return;
 
   client.stop();
   clientActive_=false;

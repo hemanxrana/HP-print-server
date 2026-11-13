@@ -6,6 +6,7 @@
 #include <ESPmDNS.h>
 #include "usb_printer_backend.h"
 #include "ipp_pcl3_service.h"
+#include "job_log.h"
 #include "ipp_icon.h"
 #include "system_diagnostics.h"
 #include <esp_heap_caps.h>
@@ -120,7 +121,41 @@ static int lastWifiStatus = -1;
 static unsigned long lastWifiAttemptMs = 0;
 static unsigned long lastDisconnectMs = 0;
 
-void sendJsonScan() { const int n = WiFi.scanNetworks(false, true); String out = "["; bool first = true; for (int i = 0; i < n; ++i) { String ssid = WiFi.SSID(i); if (ssid.isEmpty()) continue; if (!first) out += ","; first = false; out += String("{\"ssid\":\"") + jsonEsc(ssid) + "\",\"rssi\":" + String(WiFi.RSSI(i)) + ",\"channel\":" + String(WiFi.channel(i)) + "}"; } out += "]"; WiFi.scanDelete(); configServer.send(200, "application/json", out); }
+void sendJsonScan() {
+  // A synchronous scan blocks the Wi-Fi driver for several seconds, which
+  // froze printing, mDNS and status polling.  Run it asynchronously and let
+  // the dashboard poll: 202 means "still scanning", 200 carries the list.
+  int n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) {
+    configServer.send(202, "application/json", "{\"status\":\"scanning\"}");
+    return;
+  }
+  if (n == WIFI_SCAN_FAILED) {
+    if (WiFi.scanNetworks(true, true) == WIFI_SCAN_FAILED) {
+      configServer.send(500, "application/json", "{\"status\":\"error\"}");
+      return;
+    }
+    configServer.send(202, "application/json", "{\"status\":\"scanning\"}");
+    return;
+  }
+  String out = "[";
+  bool first = true;
+  for (int i = 0; i < n; ++i) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.isEmpty()) continue;
+    if (!first) out += ",";
+    first = false;
+    out += String("{\"ssid\":\"") + jsonEsc(ssid) + "\",\"rssi\":" + String(WiFi.RSSI(i)) +
+           ",\"channel\":" + String(WiFi.channel(i)) + "}";
+  }
+  out += "]";
+  WiFi.scanDelete();
+  configServer.send(200, "application/json", out);
+}
+
+void sendJsonJobs() {
+  configServer.send(200, "application/json", JobLog::toJson());
+}
 
 void sendJsonStatus() {
   const bool printerAttached = usbHost.device().attached;
@@ -140,6 +175,7 @@ void sendJsonStatus() {
   out += ",\"hostname\":\"" + String(mdnsReady ? "printer.local" : "") + "\"";
   out += ",\"jobsOk\":" + String(usbPrinterBackend.jobsCompleted()) + ",\"jobsFailed\":" + String(usbPrinterBackend.jobsFailed());
   out += ",\"maxDrainMs\":" + String(usbPrinterBackend.maxDrainMs()) + ",\"lastError\":\"" + jsonEsc(usbPrinterBackend.lastError()) + "\"";
+  out += ",\"jobLogCount\":" + String((unsigned)JobLog::count()) + ",\"lastJobLog\":\"" + jsonEsc(JobLog::lastSummary()) + "\"";
   out += ",\"freeHeap\":" + String(ESP.getFreeHeap()) + ",\"heapTotal\":" + String(ESP.getHeapSize()) + ",\"boots\":" + String(bootCount) + ",\"usbWedged\":" + String(usbHost.bulkOutWedged() ? "true" : "false");
   out += ",\"psramTotal\":" + String((unsigned)ESP.getPsramSize()) + ",\"psramFree\":" + String((unsigned)ESP.getFreePsram()) + "}";
   configServer.send(200, "application/json", out);
@@ -290,7 +326,7 @@ h2.sec{font-size:12px;font-weight:750;text-transform:uppercase;letter-spacing:.0
 <script>
 const $=id=>document.getElementById(id);
 function esc(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML}
-async function scanWifi(){const b=$('scanBtn'),m=$('wifiMsg');b.disabled=true;b.textContent='Scanning\u2026';try{const r=await fetch('/scan.json?ts='+Date.now());const a=await r.json();const sel=$('ssidSel');sel.innerHTML='<option value="">Select a network&hellip;</option>';a.sort((x,y)=>y.rssi-x.rssi);a.forEach(x=>{const o=document.createElement('option');o.value=esc(x.ssid);o.textContent=esc(x.ssid)+' ('+x.rssi+' dBm)';sel.appendChild(o);});m.textContent='Found '+a.length+' network'+(a.length===1?'':'s')+'.';}catch(e){m.textContent='Scan failed.';}finally{b.disabled=false;b.textContent='Scan networks';}}
+async function scanWifi(){const b=$('scanBtn'),m=$('wifiMsg');b.disabled=true;b.textContent='Scanning\u2026';try{let a=null;for(let i=0;i<40;++i){const r=await fetch('/scan.json?ts='+Date.now());if(r.status===202){await new Promise(x=>setTimeout(x,500));continue;}if(!r.ok)throw new Error('scan');a=await r.json();break;}if(!a)throw new Error('timeout');const sel=$('ssidSel');sel.innerHTML='<option value="">Select a network&hellip;</option>';a.sort((x,y)=>y.rssi-x.rssi);a.forEach(x=>{const o=document.createElement('option');o.value=esc(x.ssid);o.textContent=esc(x.ssid)+' ('+x.rssi+' dBm)';sel.appendChild(o);});m.textContent='Found '+a.length+' network'+(a.length===1?'':'s')+'.';}catch(e){m.textContent='Scan failed.';}finally{b.disabled=false;b.textContent='Scan networks';}}
 async function saveWifi(){const m=$('wifiMsg');const sel=$('ssidSel');if(!sel.value){m.textContent='Select a network first.';return;}m.textContent='Saving Wi-Fi settings\u2026';const f=new URLSearchParams();f.append('ssid',sel.value);f.append('password',$('passIn').value);try{const r=await fetch('/save?ts='+Date.now(),{method:'POST',body:f});m.textContent=await r.text();}catch(e){m.textContent='Save failed.';}}
 function bar(id,wrapId,frac,base){const w=$(wrapId);const p=Math.max(0,Math.min(100,frac*100));$(id).style.width=p+'%';w.className='bar'+(base>0&&frac<0.15?' low':'');}
 function dots(el,text,on,warn){el.innerHTML='<span class="dot '+(warn?'warn':(on?'on':'off'))+'"></span>'+text;}
@@ -360,6 +396,8 @@ void handleSave() {
 }
 
 void onWifiConnected() {
+  lastWifiAttemptMs = millis();
+  lastDisconnectMs = 0;
   if (configApActive) {
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_STA);
@@ -377,7 +415,8 @@ void serviceWifi() {
   // a reconnect, OOM, ...), retry periodically instead of staying permanently
   // undiscoverable. Healthy state is never churned.
   static unsigned long mdnsRetryDueMs = 0;
-  if (!mdnsReady && millis() - mdnsRetryDueMs >= 3600000UL) {
+  if (!mdnsReady && WiFi.status() == WL_CONNECTED &&
+      millis() - mdnsRetryDueMs >= 60000UL) {
     mdnsRetryDueMs = millis();
     Log.printf("[mDNS] responder down; retrying discovery (free heap %u)\n", (unsigned)ESP.getFreeHeap());
     startRawDiscovery();
@@ -388,19 +427,19 @@ void serviceWifi() {
   if (status == WL_CONNECTED && lastWifiStatus != WL_CONNECTED) {
     onWifiConnected();
   } else if (status != WL_CONNECTED && lastWifiStatus == WL_CONNECTED) {
+    lastDisconnectMs = millis();
     Log.println("[WiFi] Station link lost; retrying in background");
   }
 
-  if (status != WL_CONNECTED && !config.ssid.isEmpty() && millis() - lastWifiAttemptMs >= 30000UL) {
+  if (status != WL_CONNECTED && !config.ssid.isEmpty()) {
     const unsigned long now = millis();
-    const unsigned long timeSinceDisconnect = now - lastDisconnectMs;
-    // If WiFi disconnected recently (less than 10s ago), wait longer before retrying
-    if (timeSinceDisconnect < 10000UL) {
-      lastWifiAttemptMs = now + 10000UL - timeSinceDisconnect; // Adjust retry timer
-      Log.printf("[WiFi] Waiting for %lus after disconnect before retrying; next attempt at %lums\n",
-                 10000UL - timeSinceDisconnect,
-                 lastWifiAttemptMs);
-    } else {
+    // Give the station a short settle window after a disconnect, then retry
+    // every 30 s.  The old version stored a future timestamp here; unsigned
+    // millis() math then made the 30 s guard fire immediately, so the delay
+    // never applied.
+    const bool recentlyDisconnected =
+        lastDisconnectMs != 0 && (now - lastDisconnectMs) < 10000UL;
+    if (!recentlyDisconnected && (now - lastWifiAttemptMs) >= 30000UL) {
       lastWifiAttemptMs = now;
       Log.printf("[WiFi] Retrying saved network %s (status=%d)\n", config.ssid.c_str(), status);
       WiFi.disconnect(false, false);
@@ -467,6 +506,7 @@ void setup() {
     Log.printf("[CFG] NVS init error: %s\n", esp_err_to_name(nvsErr));
   }
   loadConfig(); 
+  JobLog::begin((uint16_t)(bootCount & 0xFFFF));
   bool wifiOk = false;
   if (!config.ssid.isEmpty()) {
     WiFi.mode(WIFI_STA);
@@ -488,16 +528,30 @@ void setup() {
   }
   if (!wifiOk) { startConfigAP(); }
   lastWifiStatus = (int)WiFi.status();
-  lastWifiAttemptMs = 0; // Initialize retry timer
+  lastWifiAttemptMs = millis();  // first saved-network retry is 30 s from now
+  lastDisconnectMs = 0;
   if (WiFi.status() == WL_CONNECTED) {
     startRawDiscovery();
     usbPrinterBackend.restartRawListener();
   }
   usbPrinterBackend.begin();
   ippService.begin();
+  // The [MEM] line at the top of setup() runs before these PSRAM-backed
+  // buffers exist.  Log again now so the real footprint (USB stream ring,
+  // IPP body/response buffers) is visible and leaks/drift can be spotted.
+  // The 24 KB dashboard buffer is allocated lazily on the first GET /.
+  Log.printf("[MEM] after-init internal-free=%lu internal-largest=%u psram-free=%u psram-largest=%u\n",
+             (unsigned long)ESP.getFreeHeap(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)ESP.getFreePsram(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
   configServer.on("/", HTTP_GET, handleRoot);
   configServer.on("/scan.json", HTTP_GET, sendJsonScan);
   configServer.on("/status.json", HTTP_GET, sendJsonStatus);
+  configServer.on("/jobs.json", HTTP_GET, sendJsonJobs);
+  // The firmware ships one 64x64 icon; printer-icons advertises this URL.
+  // The wider names remain as aliases so previously cached URLs still resolve.
+  configServer.on("/icon-64.png", HTTP_GET, handleIcon);
   configServer.on("/icon-48.png", HTTP_GET, handleIcon);
   configServer.on("/icon-128.png", HTTP_GET, handleIcon);
   configServer.on("/icon-512.png", HTTP_GET, handleIcon);

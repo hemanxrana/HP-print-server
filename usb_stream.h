@@ -25,6 +25,11 @@ public:
   // the job's last byte has been pushed.
   bool flush(uint32_t timeoutMs, String &error);
 
+  // True when the ring is empty and no copy/submit is in progress.  Used by the
+  // cooperative IPP finalizer so it can drain across several poll() calls
+  // instead of blocking the loop.
+  bool idle() const;
+
   // Drop queued data and clear the sticky transport error. Called when a new
   // job starts.
   void reset();
@@ -48,6 +53,9 @@ private:
   volatile size_t used_ = 0;   // bytes queued
   volatile bool busy_ = false; // consumer owns the USB pipeline
   volatile bool failed_ = false;
+  // Bumped by reset() so a copyOut() that overlapped the reset knows its bytes
+  // belong to the abandoned job and must not be committed to the counters.
+  volatile uint32_t generation_ = 0;
 
   char error_[96] = {0};
   TaskHandle_t task_ = nullptr;

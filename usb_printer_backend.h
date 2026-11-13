@@ -14,6 +14,11 @@ public:
   const String &statusReason() const { return reason_; }
   const UsbDeviceInfo &device() const { return host_.device(); }
   bool rawClientConnected() const;
+  // True while an IPP document pump owns the USB pipe for receiving/sending a
+  // job.  RAW 9100 accept is refused during that window so two sources can
+  // never write to the Bulk OUT pipe at the same time.
+  void setIppDocumentActive(bool active) { ippDocumentActive_ = active; }
+  bool ippDocumentActive() const { return ippDocumentActive_; }
   void restartRawListener();
   uint32_t jobsCompleted() const { return jobsCompleted_; }
   uint32_t jobsFailed() const { return jobsFailed_; }
@@ -29,7 +34,16 @@ public:
 
   bool sendDirect(const uint8_t *data, size_t length, String &error);
   void finishRawJob();
+  // Cooperative variant used by the IPP pump: returns false while queued bytes
+  // or in-flight transfers remain, and runs the normal finish (ZLP,
+  // SOFT_RESET, post-job guard) exactly once when the pipe is idle.
+  bool finishRawJobStep();
   void abortRawJob(const String &reason);
+  // The document source (HTTP body) ended early while the USB link itself is
+  // healthy.  Flush the bytes the printer already accepted and terminate the
+  // stream with the normal ZLP/SOFT_RESET instead of dropping the queued tail
+  // mid-raster.  A real USB failure must go through abortRawJob() instead.
+  void endRawJobOnSourceAbort(const String &reason);
 
 private:
   UsbPrinterBackend(const UsbPrinterBackend &) = delete;
@@ -52,4 +66,10 @@ private:
   unsigned long drainStartedMs_ = 0;
   unsigned long drainNextLogMs_ = 0;
   uint32_t drainStatusAtStart_ = 0;
+  // Set when a source-side abort (client disconnect / short body) terminated
+  // the stream early.  The post-job drain still needs to run, but the job is
+  // counted as failed rather than completed.
+  bool sourceAborted_ = false;
+  // Coarse ownership flag for the USB pipe while the IPP document pump runs.
+  bool ippDocumentActive_ = false;
 };
